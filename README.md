@@ -40,18 +40,30 @@ names); commit only the `*.example.json` templates.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
 
-## Deploy (Docker)
-On an always-on host with network access to the Actual server, put `.env`, `config.json`, and
-`cardmap.json` beside the repo, then:
+## Deploy
+On an always-on host with network access to the Actual server (e.g. a Proxmox LXC). The repo is
+public but `.env`, `config.json`, and `cardmap.json` are gitignored — copy those three in by hand
+(`scp` them beside the cloned repo). Run **one** instance per bot token — two pollers fight over
+`getUpdates` (Telegram 409). The Telegram relay is fully outbound; port `28455` only matters if
+something POSTs to `/ingest` directly.
+
+### Native (recommended for an LXC)
+Debian 12 LXC, then:
 ```bash
-docker compose up -d --build      # build + run, restarts on reboot
-docker compose logs -f            # watch
-docker compose down               # stop
+apt install -y nodejs npm git python3 make g++   # build tools for better-sqlite3
+git clone <repo> borton && cd borton
+# scp .env config.json cardmap.json in here
+npm ci
+cp receipt-bot.service /etc/systemd/system/      # edit WorkingDirectory if not /root/borton
+systemctl enable --now receipt-bot
+journalctl -u receipt-bot -f
 ```
-The image is just code + deps; secrets/config/cardmap are bind-mounted (not baked in) and the Actual
-cache lives in the `actual-data` named volume. Only run **one** instance per bot token — two pollers
-fight over `getUpdates` (Telegram 409). The Telegram relay is fully outbound; the published port
-(`28455`, see `docker-compose.yml`) is only needed if something POSTs to `/ingest` directly.
+
+### Docker (alternative)
+```bash
+docker compose up -d --build      # code-only image; secrets/config bind-mounted, cache in a volume
+docker compose logs -f
+```
 
 ## Notes
 - Self-signed Actual cert → `NODE_TLS_REJECT_UNAUTHORIZED=0` is set in code.

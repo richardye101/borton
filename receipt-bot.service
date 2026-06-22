@@ -1,0 +1,14 @@
+[Unit]
+Description=receipt-bot (Telegram -> Actual)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# adjust WorkingDirectory/User to where you cloned the repo
+WorkingDirectory=/root/borton
+ExecStart=/usr/bin/node bot.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
