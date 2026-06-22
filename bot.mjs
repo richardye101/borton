@@ -47,6 +47,13 @@ async function tg(method, params) {
   return r.json();
 }
 async function send(chatId, text) { await tg('sendMessage', { chat_id: chatId, text }); }
+// Reaction feedback: 👀 on receipt, 👍 when done. (Telegram's allowed reaction set
+// excludes ✅, so 👍 stands in for the "done" check.) Pass '' to clear. Errors ignored.
+const REACT_SEEN = '👀', REACT_DONE = '👍';
+async function react(chatId, messageId, emoji) {
+  if (!messageId) return;
+  await tg('setMessageReaction', { chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: 'emoji', emoji }] : [] }).catch(() => {});
+}
 async function downloadPhoto(fileId) {
   const f = await tg('getFile', { file_id: fileId });
   const filePath = f.result.file_path;
@@ -127,7 +134,50 @@ function parseFreeText(text) {
   const drop = new Set(['on', 'split', 'half', 'w', 'w/', 'tia', '#split']);
   if (alias) alias.split(/\s+/).forEach((x) => drop.add(x));
   const merchant = rest.split(/\s+/).filter((w) => !drop.has(w.toLowerCase())).join(' ').trim();
-  return { amount, split, cardAccount, merchant: merchant || 'Manual entry', notes: merchant };
+  return { amount, split, cardAccount, merchant: merchant || 'Manual entry', items: [], notes: '' };
+}
+
+// Regex handles the terse form ("12.50 starbucks on amex"); anything descriptive
+// (items, prose) escalates to Gemini so the store and items get separated.
+async function parseExpense(text) {
+  const ft = parseFreeText(text);
+  const descriptive = /[,]|\b(bought|and|for|with)\b/i.test(text) || text.trim().split(/\s+/).length > 5;
+  if (ft && !descriptive) return ft;
+  if (/\d/.test(text)) { const g = await geminiFreeText(text); if (g) return g; }
+  return ft; // Gemini unavailable -> fall back to the regex result
+}
+
+// Hybrid fallback: only when the regex can't structure the text (but a digit is present,
+// so it's plausibly an expense). Costs 1 Gemini call; clean inputs never reach here.
+const FREETEXT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    total: { type: 'NUMBER', description: 'amount spent' },
+    merchant: { type: 'STRING', description: 'the store / payee name ONLY (e.g. "No Frills"), not the items; empty string if not stated' },
+    items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'purchased items as short names (e.g. ["eggs","cheese","yogurt"]); empty if none mentioned' },
+    card: { type: 'STRING', description: 'card name/word the user mentioned (e.g. "amex"), empty string if none' },
+    split: { type: 'BOOLEAN', description: 'true if the user is splitting / paying half / with someone' },
+  },
+  required: ['total'],
+};
+async function geminiFreeText(text) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.gemini.model}:generateContent`;
+  const body = {
+    contents: [{ parts: [{ text: `Extract a single expense from this message into the schema. Put only the store/payee name in "merchant" and the purchased items in "items". Message: ${JSON.stringify(text)}` }] }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: FREETEXT_SCHEMA },
+  };
+  try {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
+    const d = await r.json();
+    const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!t) return null;
+    const o = JSON.parse(t);
+    const amount = Math.abs(Number(o.total));
+    if (!amount || !isFinite(amount)) return null;
+    const merchant = (o.merchant || '').trim() || 'Manual entry';
+    const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
+    return { amount, split: !!o.split, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
+  } catch { return null; }
 }
 
 // ---------- Category guess (light; user/Actual rules can refine) ----------
@@ -189,9 +239,12 @@ async function logExpense({ accountName, total, payee, notes, category, date, sp
 }
 
 // ---------- Main flow ----------
-const pending = {}; // chatId -> { receipt, parsed, last4 }  (awaiting a card answer)
-const lastTxn = {}; // chatId -> { id, ts }  (most recent logged txn, for follow-up edits)
+const pending = {}; // chatId -> { receipt, parsed, last4, confirm }  (awaiting a card answer)
+const confirming = {}; // chatId -> { receipt, parsed, account }  (awaiting yes/no before logging)
+const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
+const msgTxn = {}; // telegram message_id -> rec  (so a reply to that message edits its txn)
 const EDIT_WINDOW_MS = 60 * 60 * 1000; // a reply within an hour edits the last txn
+// A txn rec carries enough to rebuild it (needed for split-by-reply): { id, account, date, total, payee, category, notes, split, ts }
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
@@ -202,9 +255,11 @@ async function finalize(chatId, receipt, parsed, accountName) {
   let notes = [parsed.notes, items].filter(Boolean).join(' · ');
   if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
   const txnId = await logExpense({ accountName, total: receipt.total, payee: receipt.merchant, notes, category, date, split: parsed.split });
-  if (txnId) lastTxn[chatId] = { id: txnId, ts: Date.now() };
+  const rec = { id: txnId, account: accountName, date, total: Number(receipt.total), payee: receipt.merchant, category, notes, split: parsed.split, ts: Date.now() };
+  if (txnId) lastTxn[chatId] = rec;
   const splitLine = parsed.split ? `  ·  split w/ ${cfg.defaults.splitPerson} (your share $${(receipt.total / 2).toFixed(2)})` : '';
-  await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note text · "category X" · "delete")`);
+  await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note text · "category X" · "split" · "delete")`);
+  return rec;
 }
 
 async function handlePhoto(chatId, msg) {
@@ -227,15 +282,35 @@ async function handlePhoto(chatId, msg) {
   await finalize(chatId, receipt, parsed, account);
 }
 
-async function handleFreeText(chatId, ft) {
-  const receipt = { merchant: ft.merchant, total: ft.amount, card_last4: '', date: '', line_items: [] };
-  const parsed = { notes: ft.notes, split: ft.split };
-  const account = ft.cardAccount || null;
-  if (!account) {
-    pending[chatId] = { receipt, parsed, last4: null };
+// confirm=true (manual DM): preview + wait for yes. confirm=false (relay/poorton): log directly.
+async function handleFreeText(chatId, ft, confirm = true) {
+  const receipt = { merchant: ft.merchant, total: ft.amount, card_last4: '', date: '', line_items: ft.items || [] };
+  const parsed = { notes: ft.notes || '', split: ft.split };
+  if (!ft.cardAccount) {
+    if (!confirm) throw new Error(`couldn't match a card in "${ft.merchant}"`);
+    pending[chatId] = { receipt, parsed, last4: null, confirm: true };
     return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card did you use?`);
   }
-  await finalize(chatId, receipt, parsed, account);
+  if (confirm) return await askConfirm(chatId, receipt, parsed, ft.cardAccount);
+  return await finalize(chatId, receipt, parsed, ft.cardAccount);
+}
+
+// Preview the parsed transaction and wait for a yes/no before writing to Actual.
+async function askConfirm(chatId, receipt, parsed, account) {
+  confirming[chatId] = { receipt, parsed, account };
+  const cat = guessCategory(receipt, parsed.notes);
+  const splitLine = parsed.split ? `  ·  split w/ ${cfg.defaults.splitPerson}` : '';
+  const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
+  await send(chatId, `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}\nReply "yes" to log, "no" to cancel.`);
+}
+// Returns true if it consumed the text (a yes/no answer), false to fall through to normal handling.
+async function handleConfirm(chatId, text) {
+  const lc = text.trim().toLowerCase();
+  const c = confirming[chatId];
+  if (/^(y|yes|ok|okay|confirm|👍|yep|yeah)$/.test(lc)) { delete confirming[chatId]; await finalize(chatId, c.receipt, c.parsed, c.account); return true; }
+  if (/^(n|no|nope|cancel|nvm)$/.test(lc)) { delete confirming[chatId]; await send(chatId, '❌ Cancelled — nothing logged.'); return true; }
+  delete confirming[chatId]; // anything else: drop the stale prompt, reinterpret the new message
+  return false;
 }
 
 function resolveAccount(answer) {
@@ -253,16 +328,21 @@ async function handleCardAnswer(chatId, text) {
   if (!account) { await send(chatId, `Couldn't match "${text}" to an account. Try the exact card name.`); return; }
   if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
   delete pending[chatId];
+  if (p.confirm) return await askConfirm(chatId, p.receipt, p.parsed, account);
   await finalize(chatId, p.receipt, p.parsed, account);
 }
 
-async function editLast(chatId, text) {
-  const id = lastTxn[chatId].id;
+const editLast = (chatId, text) => editTxn(chatId, lastTxn[chatId], text);
+
+// Edit a specific transaction (by its rec): note text, "category X", "split", or "delete".
+async function editTxn(chatId, rec, text) {
+  if (!rec || !rec.id) return send(chatId, "I don't have that transaction on hand anymore.");
+  const id = rec.id;
   const raw = text.trim();
   const lc = raw.toLowerCase();
   if (['delete', 'undo', 'remove'].includes(lc)) {
     await api.deleteTransaction(id); await api.sync();
-    delete lastTxn[chatId];
+    if (lastTxn[chatId]?.id === id) delete lastTxn[chatId];
     return send(chatId, '🗑 Deleted that transaction.');
   }
   const m = lc.match(/^(?:category|cat)\s+(.+)$/);
@@ -271,11 +351,26 @@ async function editLast(chatId, text) {
     const name = Object.keys(CAT).find((c) => c.toLowerCase() === want);
     if (!name) return send(chatId, `No category named "${want}". Try the exact name.`);
     await api.updateTransaction(id, { category: CAT[name] }); await api.sync();
+    rec.category = name;
     return send(chatId, `✏️ Category → ${name}`);
+  }
+  if (/^(split|split w\/?\s*tia|half|\/2)$/.test(lc)) {
+    if (rec.split) return send(chatId, 'Already split.');
+    // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
+    await api.deleteTransaction(id);
+    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true });
+    rebindTxn(id, { ...rec, id: newId, split: true });
+    return send(chatId, `✂️ Split 50/50 w/ ${cfg.defaults.splitPerson} (your share $${(rec.total / 2).toFixed(2)}).`);
   }
   const note = raw.replace(/^note:?\s*/i, '').trim();
   await api.updateTransaction(id, { notes: note }); await api.sync();
+  rec.notes = note;
   return send(chatId, '📝 Note updated.');
+}
+// After a rebuild (split), point every reference to the old txn id at the new rec.
+function rebindTxn(oldId, newRec) {
+  for (const map of [lastTxn, msgTxn])
+    for (const k of Object.keys(map)) if (map[k].id === oldId) map[k] = newRec;
 }
 
 // Relay: a second "sender" bot posts JSON into a private channel; this bot (admin) reads it.
@@ -285,18 +380,30 @@ async function onRelayPost(post) {
     return;
   }
   if (post.chat.id !== cfg.telegram.relayChannelId) return;
-  const chat = cfg.telegram.allowedChatId;
+  const id = post.chat.id; // reply in the channel the post came from
   const text = (post.text || '').trim();
+  await react(id, post.message_id, REACT_SEEN);
   try {
-    if (text.startsWith('{')) {
-      await handleIngest(JSON.parse(text));
+    // A reply to a previously-logged post edits that transaction (note / category / split / delete).
+    const repliedTo = post.reply_to_message && msgTxn[post.reply_to_message.message_id];
+    if (repliedTo) {
+      await editTxn(id, repliedTo, text);
     } else {
-      const ft = parseFreeText(text);
-      if (!ft) throw new Error('not JSON and no amount found — try "12.50 merchant on amex"');
-      await handleFreeText(chat, ft);
+      // poorton's posts log directly — no confirmation step in the relay channel.
+      let rec;
+      if (text.startsWith('{')) {
+        rec = await handleIngest(JSON.parse(text));
+      } else {
+        const ft = await parseExpense(text);
+        if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
+        rec = await handleFreeText(id, ft, false);
+      }
+      if (rec?.id) msgTxn[post.message_id] = rec; // so replies to THIS post edit it
     }
+    await react(id, post.message_id, REACT_DONE);
   } catch (e) {
-    if (chat) await send(chat, '⚠️ relay error: ' + e.message).catch(() => {});
+    await react(id, post.message_id, '');
+    await send(id, '⚠️ relay error: ' + e.message).catch(() => {});
     console.error('relay', e);
   }
 }
@@ -307,19 +414,29 @@ async function onUpdate(u) {
   if (!msg) return;
   const chatId = msg.chat.id;
   if (cfg.telegram.allowedChatId && chatId !== cfg.telegram.allowedChatId) return; // ignore strangers
+  await react(chatId, msg.message_id, REACT_SEEN);
   try {
-    if (msg.photo) return await handlePhoto(chatId, msg);
-    if (msg.text && pending[chatId]) return await handleCardAnswer(chatId, msg.text);
-    if (msg.text) {
-      const ft = parseFreeText(msg.text);
-      if (ft) return await handleFreeText(chatId, ft);
-    }
-    if (msg.text && lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
-    if (msg.text) await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split w tia". After I log one, reply within the hour to edit it — free text = note, "category X", or "delete".');
+    await dispatch(chatId, msg);
+    await react(chatId, msg.message_id, REACT_DONE);
   } catch (e) {
+    await react(chatId, msg.message_id, '');
     await send(chatId, '⚠️ ' + (e.message || String(e)));
     console.error(e);
   }
+}
+
+async function dispatch(chatId, msg) {
+  if (msg.photo) return await handlePhoto(chatId, msg);
+  if (!msg.text) return;
+  // Reply to a previously-logged message edits that txn (channel uses this; DM falls back to the edit window).
+  const repliedTo = msg.reply_to_message && msgTxn[msg.reply_to_message.message_id];
+  if (repliedTo) return await editTxn(chatId, repliedTo, msg.text);
+  if (confirming[chatId] && await handleConfirm(chatId, msg.text)) return;
+  if (pending[chatId]) return await handleCardAnswer(chatId, msg.text);
+  const ft = await parseExpense(msg.text);
+  if (ft) return await handleFreeText(chatId, ft);
+  if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
+  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split w tia". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split", or "delete".');
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -337,9 +454,10 @@ async function handleIngest(d) {
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split });
-  if (id && chat) lastTxn[chat] = { id, ts: Date.now() };
-  if (chat) await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? '  · split' : ''}\n(reply to edit: note · "category X" · "delete")`);
-  return { account, category, amount };
+  const rec = { id, account, date, total: amount, payee: merchant, category, notes, split, ts: Date.now() };
+  if (id && chat) lastTxn[chat] = rec;
+  if (chat) await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? '  · split' : ''}\n(reply to edit: note · "category X" · "split" · "delete")`);
+  return rec;
 }
 function startIngest() {
   const port = cfg.ingest?.port || 8088;
