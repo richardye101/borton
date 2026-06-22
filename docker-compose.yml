@@ -1,0 +1,17 @@
+services:
+  receipt-bot:
+    build: .
+    container_name: receipt-bot
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env:ro                 # secrets (read by the bot's own .env loader)
+      - ./config.json:/app/config.json:ro   # non-secret settings
+      - ./cardmap.json:/app/cardmap.json    # self-building card map (writable)
+      - actual-data:/app/actual-data        # Actual local cache (regenerable)
+    ports:
+      # Ingest endpoint. ONLY needed if a client POSTs to /ingest directly.
+      # The Telegram relay is fully outbound — drop this line if you only use that.
+      - "28455:28455"
+
+volumes:
+  actual-data:

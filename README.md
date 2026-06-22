@@ -40,13 +40,21 @@ names); commit only the `*.example.json` templates.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
 
-## Deploy (later)
-Move this folder to an always-on host (the Proxmox box) with Node 18+ and network access to the
-Actual server. `node bot.mjs` under a process manager (systemd / pm2). Caption parsing + card routing
-are code-side, so the only network deps are Telegram + the extraction backend; the bot queues/retries
-on transient Gemini rate-limits.
+## Deploy (Docker)
+On an always-on host with network access to the Actual server, put `.env`, `config.json`, and
+`cardmap.json` beside the repo, then:
+```bash
+docker compose up -d --build      # build + run, restarts on reboot
+docker compose logs -f            # watch
+docker compose down               # stop
+```
+The image is just code + deps; secrets/config/cardmap are bind-mounted (not baked in) and the Actual
+cache lives in the `actual-data` named volume. Only run **one** instance per bot token — two pollers
+fight over `getUpdates` (Telegram 409). The Telegram relay is fully outbound; the published port
+(`28455`, see `docker-compose.yml`) is only needed if something POSTs to `/ingest` directly.
 
 ## Notes
 - Self-signed Actual cert → `NODE_TLS_REJECT_UNAUTHORIZED=0` is set in code.
-- Splits use a transfer subtransaction into the "Owed by Tia" account (set in config `defaults.splitAccount`).
+- Splits transfer half into an `Owed by {name}` account (format in config `defaults.owedAccountFormat`,
+  default person `defaults.splitPerson`); the account is matched or auto-created on first use.
 - Category is a light code-side guess; refine in Actual or via rules.

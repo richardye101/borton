@@ -46,13 +46,26 @@ async function tg(method, params) {
   });
   return r.json();
 }
-async function send(chatId, text) { const r = await tg('sendMessage', { chat_id: chatId, text }); return r?.result?.message_id; }
+async function send(chatId, text, reply_markup) {
+  const r = await tg('sendMessage', { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
+  return r?.result?.message_id;
+}
+// Inline-keyboard widgets (tappable buttons -> callback_query).
+const YESNO_KB = { inline_keyboard: [[{ text: '✅ Yes', callback_data: 'c:y' }, { text: '❌ No', callback_data: 'c:n' }]] };
+function cardKb() {
+  const accounts = [...new Set(Object.values(cardmap.aliases))].filter((a) => `card:${a}`.length <= 64);
+  const rows = [];
+  for (let i = 0; i < accounts.length; i += 2) rows.push(accounts.slice(i, i + 2).map((a) => ({ text: a, callback_data: `card:${a}` })));
+  return { inline_keyboard: rows };
+}
+const dropKb = (chatId, mid) => tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid }).catch(() => {});
 // Reaction feedback: 👀 on receipt, 👍 when done. (Telegram's allowed reaction set
-// excludes ✅, so 👍 stands in for the "done" check.) Pass '' to clear. Errors ignored.
+// excludes ✅, so 👍 stands in for the "done" check.) Pass '' to clear.
 const REACT_SEEN = '👀', REACT_DONE = '👍';
 async function react(chatId, messageId, emoji) {
   if (!messageId) return;
-  await tg('setMessageReaction', { chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: 'emoji', emoji }] : [] }).catch(() => {});
+  const r = await tg('setMessageReaction', { chat_id: chatId, message_id: messageId, reaction: emoji ? [{ type: 'emoji', emoji }] : [] }).catch((e) => ({ ok: false, description: e.message }));
+  if (r && r.ok === false) console.error('react failed:', r.description);
 }
 async function downloadPhoto(fileId) {
   const f = await tg('getFile', { file_id: fileId });
@@ -181,18 +194,22 @@ async function geminiFreeText(text) {
     contents: [{ parts: [{ text: `Extract a single expense from this message into the schema. Put only the store/payee name in "merchant" and the purchased items in "items". Message: ${JSON.stringify(text)}` }] }],
     generationConfig: { responseMimeType: 'application/json', responseSchema: FREETEXT_SCHEMA },
   };
-  try {
-    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
-    const d = await r.json();
-    const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!t) return null;
-    const o = JSON.parse(t);
-    const amount = Math.abs(Number(o.total));
-    if (!amount || !isFinite(amount)) return null;
-    const merchant = (o.merchant || '').trim() || 'Manual entry';
-    const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
-    return { amount, split: !!o.split, person: (o.person || '').trim() || null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
-  } catch { return null; }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
+      if (r.status === 429 || r.status >= 500) { await sleep(800 * (attempt + 1)); continue; } // transient (e.g. 503 overload)
+      const d = await r.json();
+      const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!t) return null;
+      const o = JSON.parse(t);
+      const amount = Math.abs(Number(o.total));
+      if (!amount || !isFinite(amount)) return null;
+      const merchant = (o.merchant || '').trim() || 'Manual entry';
+      const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
+      return { amount, split: !!o.split, person: (o.person || '').trim() || null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
+    } catch { await sleep(1000); }
+  }
+  return null; // gave up -> caller falls back to the regex parse
 }
 
 // ---------- Category guess (light; user/Actual rules can refine) ----------
@@ -286,7 +303,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
   const rec = { id: txnId, account: accountName, date, total: Number(receipt.total), payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
   if (txnId) lastTxn[chatId] = rec;
   const splitLine = parsed.split ? `  ·  split w/ ${person} (your share $${(receipt.total / 2).toFixed(2)})` : '  ·  not split';
-  const sentId = await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note · "category X" · "split [with NAME]" · "NAME paid" · "delete")`);
+  const sentId = await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note · "category X" · "split w/ NAME" · "NAME paid" · "delete")`);
   if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   return rec;
 }
@@ -301,10 +318,10 @@ async function handlePhoto(chatId, msg) {
   if (!account) {
     if (receipt.card_last4) {
       pending[chatId] = { receipt, parsed, last4: receipt.card_last4 };
-      await send(chatId, `New card ****${receipt.card_last4} ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich account is it? (reply with the card name)`);
+      await send(chatId, `New card ****${receipt.card_last4} ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich account is it?`, cardKb());
     } else {
       pending[chatId] = { receipt, parsed, last4: null };
-      await send(chatId, `No card number on the receipt ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich card did you use?`);
+      await send(chatId, `No card number on the receipt ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich card did you use?`, cardKb());
     }
     return;
   }
@@ -318,19 +335,19 @@ async function handleFreeText(chatId, ft, confirm = true) {
   if (!ft.cardAccount) {
     if (!confirm) throw new Error(`couldn't match a card in "${ft.merchant}"`);
     pending[chatId] = { receipt, parsed, last4: null, confirm: true };
-    return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card did you use?`);
+    return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card?`, cardKb());
   }
   if (confirm) return await askConfirm(chatId, receipt, parsed, ft.cardAccount);
   return await finalize(chatId, receipt, parsed, ft.cardAccount);
 }
 
-// Preview the parsed transaction and wait for a yes/no before writing to Actual.
+// Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
 async function askConfirm(chatId, receipt, parsed, account) {
-  confirming[chatId] = { receipt, parsed, account };
   const cat = guessCategory(receipt, parsed.notes);
   const splitLine = parsed.split ? `  ·  split w/ ${cap(parsed.person || cfg.defaults.splitPerson)}` : '  ·  not split';
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
-  await send(chatId, `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}\nReply "yes" to log, "no" to cancel.`);
+  const mid = await send(chatId, `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}`, YESNO_KB);
+  confirming[chatId] = { receipt, parsed, account, promptMid: mid };
 }
 // Returns true if it consumed the text (a yes/no answer), false to fall through to normal handling.
 async function handleConfirm(chatId, text) {
@@ -431,25 +448,24 @@ async function onRelayPost(post) {
   const text = (post.text || '').trim();
   await react(id, post.message_id, REACT_SEEN);
   try {
+    // Button taps come via callback_query, but accept typed yes/no & card answers too.
+    if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
+    if (pending[id]) { await handleCardAnswer(id, text); await react(id, post.message_id, REACT_DONE); return; }
     // A reply to a previously-logged post edits that transaction (note / category / split / delete).
     const repliedTo = post.reply_to_message && msgTxn[post.reply_to_message.message_id];
     if (repliedTo) {
       await editTxn(id, repliedTo, text);
+    } else if (text.startsWith('{')) {
+      // poorton's structured posts log directly — no confirmation. (iOS curls quotes; normalize.)
+      let json = null;
+      try { json = JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")); } catch { /* fall through */ }
+      if (json) { const rec = await handleIngest(json, id); if (rec?.id) msgTxn[post.message_id] = rec; }
+      else { const ft = await parseExpense(text); if (!ft) throw new Error('bad JSON and no amount found'); await handleFreeText(id, ft); }
     } else {
-      // poorton's posts log directly — no confirmation step in the relay channel.
-      let rec, json = null;
-      if (text.startsWith('{')) {
-        // iOS auto-curls quotes; normalize “ ” ‘ ’ back to straight before parsing.
-        try { json = JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")); } catch { /* malformed JSON -> fall back to the text parser below */ }
-      }
-      if (json) {
-        rec = await handleIngest(json, id);
-      } else {
-        const ft = await parseExpense(text);
-        if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
-        rec = await handleFreeText(id, ft, false);
-      }
-      if (rec?.id) msgTxn[post.message_id] = rec; // so replies to THIS post edit it
+      // free text = a human typing -> confirm with Yes/No buttons (also asks card via buttons)
+      const ft = await parseExpense(text);
+      if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
+      await handleFreeText(id, ft);
     }
     await react(id, post.message_id, REACT_DONE);
   } catch (e) {
@@ -459,7 +475,36 @@ async function onRelayPost(post) {
   }
 }
 
+// Inline-button taps arrive as callback_query (works in DMs and channels).
+async function onCallback(cq) {
+  const chatId = cq.message?.chat?.id;
+  const mid = cq.message?.message_id;
+  const data = cq.data || '';
+  await tg('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
+  if (!chatId) return;
+  try {
+    if (data === 'c:y') {
+      const c = confirming[chatId];
+      await dropKb(chatId, mid);
+      if (!c) return;
+      delete confirming[chatId];
+      await finalize(chatId, c.receipt, c.parsed, c.account);
+    } else if (data === 'c:n') {
+      delete confirming[chatId];
+      await dropKb(chatId, mid);
+      await send(chatId, '❌ Cancelled — nothing logged.');
+    } else if (data.startsWith('card:') && pending[chatId]) {
+      await dropKb(chatId, mid);
+      await handleCardAnswer(chatId, data.slice(5));
+    }
+  } catch (e) {
+    await send(chatId, '⚠️ ' + (e.message || String(e)));
+    console.error('callback', e);
+  }
+}
+
 async function onUpdate(u) {
+  if (u.callback_query) return await onCallback(u.callback_query);
   if (u.channel_post) return await onRelayPost(u.channel_post);
   const msg = u.message;
   if (!msg) return;
@@ -487,7 +532,7 @@ async function dispatch(chatId, msg) {
   const ft = await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
   if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
-  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split with ryan". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split [with NAME]", "NAME paid", or "delete".');
+  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split with ryan". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split w/ NAME", "NAME paid", or "delete".');
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -508,7 +553,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitAccountName, splitPersonName: person });
   const rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
   if (id && chat) lastTxn[chat] = rec;
-  const sentId = chat ? await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? `  ·  split w/ ${person}` : '  ·  not split'}\n(reply to edit: note · "category X" · "split [with NAME]" · "NAME paid" · "delete")`) : null;
+  const sentId = chat ? await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? `  ·  split w/ ${person}` : '  ·  not split'}\n(reply to edit: note · "category X" · "split w/ NAME" · "NAME paid" · "delete")`) : null;
   if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   return rec;
 }

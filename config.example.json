@@ -7,7 +7,7 @@
     "model": "gemini-flash-latest"
   },
   "ingest": {
-    "port": 8088
+    "port": 28455
   },
   "actual": {
     "serverURL": "https://YOUR_ACTUAL_SERVER:5006",

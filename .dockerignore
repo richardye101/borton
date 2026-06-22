@@ -1,0 +1,10 @@
+node_modules
+actual-data
+.git
+.env
+.env.*
+config.json
+cardmap.json
+*.log
+npm-debug.log*
+.DS_Store
