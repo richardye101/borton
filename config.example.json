@@ -1,0 +1,23 @@
+{
+  "telegram": {
+    "allowedChatId": 0,
+    "relayChannelId": 0
+  },
+  "gemini": {
+    "model": "gemini-flash-latest"
+  },
+  "ingest": {
+    "port": 8088
+  },
+  "actual": {
+    "serverURL": "https://YOUR_ACTUAL_SERVER:5006",
+    "syncId": "YOUR_BUDGET_SYNC_ID",
+    "dataDir": "./actual-data"
+  },
+  "defaults": {
+    "splitPerson": "Partner",
+    "splitAccount": "Owed by Partner",
+    "fallbackCategory": "General",
+    "currency": "CAD"
+  }
+}

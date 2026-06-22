@@ -16,13 +16,16 @@ Then:
 ```bash
 cd ~/receipt-bot
 chmod 600 .env                 # contains secrets
+cp config.example.json config.json     # then edit with your chat id, Actual server, syncId
+cp cardmap.example.json cardmap.json   # your card aliases (self-builds over time)
 npm install
 # 1. open Telegram, message your bot (anything)
 npm run chatid                 # prints your chat_id
 # 2. put that number in config.json -> telegram.allowedChatId
 npm start
 ```
-`config.json` holds only non-secret settings (model, Actual URL/syncId, defaults).
+`config.json` and `cardmap.json` are gitignored (they hold your chat ids, server, and account
+names); commit only the `*.example.json` templates.
 
 ## Use
 - Send a **photo** of a receipt. Optional caption, e.g.:
