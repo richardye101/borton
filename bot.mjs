@@ -126,7 +126,7 @@ function extractPerson(text) {
   const m = (text || '').match(/\bsplit\s+(?:with|w\/?)\s+([a-z][\w'-]*)/i);
   return m ? m[1] : null;
 }
-const SPLIT_RE = /\bsplit\b|\bhalf\b|\/2\b|#split/i;
+const SPLIT_RE = /\bsplit\b|\bhalf\b|\bhalves\b|\/2\b|#split/i;
 
 // ---------- Caption parsing (code-side, deterministic) ----------
 function parseCaption(caption) {
@@ -181,10 +181,11 @@ const FREETEXT_SCHEMA = {
   properties: {
     total: { type: 'NUMBER', description: 'amount spent' },
     merchant: { type: 'STRING', description: 'the store / payee name ONLY (e.g. "No Frills"), not the items; empty string if not stated' },
-    items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'purchased items as short names (e.g. ["eggs","cheese","yogurt"]); empty if none mentioned' },
+    items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'distinct purchased products as short names (e.g. groceries ["eggs","cheese"]). Leave EMPTY for a restaurant meal or single service — that context goes in note, not items.' },
+    note: { type: 'STRING', description: 'free-text context that is not the store or items (e.g. "dinner with Tia", "birthday gift"); empty string if none' },
     card: { type: 'STRING', description: 'card name/word the user mentioned (e.g. "amex"), empty string if none' },
-    split: { type: 'BOOLEAN', description: 'true if the user is splitting / paying half / with someone' },
-    person: { type: 'STRING', description: 'name of the person the expense is split with, if stated (e.g. "Ryan"); empty string if none' },
+    split: { type: 'BOOLEAN', description: 'true ONLY if the user explicitly says to split or go halves (e.g. "split", "split with X", "go halves", "my half"). Merely mentioning a person (e.g. "dinner with Tia") is NOT a split.' },
+    person: { type: 'STRING', description: 'who to split WITH — only when split is true; empty string otherwise' },
   },
   required: ['total'],
 };
@@ -206,7 +207,8 @@ async function geminiFreeText(text) {
       if (!amount || !isFinite(amount)) return null;
       const merchant = (o.merchant || '').trim() || 'Manual entry';
       const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
-      return { amount, split: !!o.split, person: (o.person || '').trim() || null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
+      const split = !!o.split && SPLIT_RE.test(text); // guard: never split just because a name was mentioned
+      return { amount, split, person: split ? (o.person || '').trim() || null : null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
     } catch { await sleep(1000); }
   }
   return null; // gave up -> caller falls back to the regex parse

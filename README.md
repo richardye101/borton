@@ -53,34 +53,20 @@ install Node 22 from NodeSource, *not* Debian's old `nodejs`.
 
 On the LXC (`pct enter <CTID>` or the console):
 ```bash
-# 1. Node 22 + build tools for better-sqlite3
-apt update && apt install -y git curl python3 make g++
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt install -y nodejs
-node -v                                              # expect v22.x
-
-# 2. Code
-git clone https://github.com/richardye101/borton.git /root/borton
-cd /root/borton
+apt update && apt install -y git
+git clone https://github.com/richardye101/borton.git /root/borton && cd /root/borton
 ```
 
-From your workstation, copy the three gitignored private files in (clone doesn't include them):
+Copy the three gitignored private files in (clone doesn't include them) — from your workstation:
 ```bash
 scp .env config.json cardmap.json root@<LXC-IP>:/root/borton/
 ```
 
-Back on the LXC:
+Then run the deploy script (installs Node 22 + build tools, `npm ci`, installs & enables the
+systemd service):
 ```bash
-# 3. Deps (compiles better-sqlite3 for this Node's ABI)
-cd /root/borton && npm ci && chmod 600 .env
-
-# 4. systemd service (ships in the repo; WorkingDirectory defaults to /root/borton)
-cp receipt-bot.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now receipt-bot                   # enable = also starts on host reboot
-
-# 5. Verify
-systemctl is-enabled receipt-bot                     # -> enabled
-journalctl -u receipt-bot -f                         # -> "Bot running. Long-polling Telegram…"
+./deploy.sh
+journalctl -u receipt-bot -f          # -> "Bot running. Long-polling Telegram…"
 ```
 
 Update after code changes:
