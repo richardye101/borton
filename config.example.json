@@ -16,7 +16,7 @@
   },
   "defaults": {
     "splitPerson": "Partner",
-    "splitAccount": "Owed by Partner",
+    "owedAccountFormat": "Owed by {name}",
     "fallbackCategory": "General",
     "currency": "CAD"
   }

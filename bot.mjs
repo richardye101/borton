@@ -46,7 +46,7 @@ async function tg(method, params) {
   });
   return r.json();
 }
-async function send(chatId, text) { await tg('sendMessage', { chat_id: chatId, text }); }
+async function send(chatId, text) { const r = await tg('sendMessage', { chat_id: chatId, text }); return r?.result?.message_id; }
 // Reaction feedback: 👀 on receipt, 👍 when done. (Telegram's allowed reaction set
 // excludes ✅, so 👍 stands in for the "done" check.) Pass '' to clear. Errors ignored.
 const REACT_SEEN = '👀', REACT_DONE = '👍';
@@ -104,19 +104,31 @@ async function extractReceipt(buf, mime) {
 }
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+// ---------- Split helpers (person -> "Owed by {name}" account) ----------
+const OWED_FMT = cfg.defaults.owedAccountFormat || 'Owed by {name}';
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+const owedAccountFor = (person) => OWED_FMT.replace('{name}', cap(String(person).trim()));
+// "split with Ryan" / "split w ryan" -> "Ryan"; bare "split" -> null (caller uses the default person)
+function extractPerson(text) {
+  const m = (text || '').match(/\bsplit\s+(?:with|w\/?)\s+([a-z][\w'-]*)/i);
+  return m ? m[1] : null;
+}
+const SPLIT_RE = /\bsplit\b|\bhalf\b|\/2\b|#split/i;
+
 // ---------- Caption parsing (code-side, deterministic) ----------
 function parseCaption(caption) {
   const text = (caption || '').trim();
   const lc = text.toLowerCase();
-  const split = /\bsplit\b|\bhalf\b|\/2\b|#split/.test(lc) || /\bw\/?\s*tia\b/.test(lc);
+  const split = SPLIT_RE.test(lc);
+  const person = extractPerson(text);
   let cardAccount = null;
   for (const [alias, acct] of Object.entries(cardmap.aliases).sort((a, b) => b[0].length - a[0].length)) {
     if (lc.includes(alias)) { cardAccount = acct; break; }
   }
-  return { notes: text, split, cardAccount };
+  return { notes: text, split, person, cardAccount };
 }
 
-// Free-text expense, e.g. "12.50 starbucks on amex split w tia" — needs a leading
+// Free-text expense, e.g. "12.50 starbucks on amex split w ryan" — needs a leading
 // number or a $amount. Returns null if no amount, so non-expense text falls through.
 function parseFreeText(text) {
   const t = (text || '').trim();
@@ -126,15 +138,17 @@ function parseFreeText(text) {
   if (!amount || !isFinite(amount)) return null;
   const rest = (t.slice(0, m.index) + ' ' + t.slice(m.index + m[0].length)).trim();
   const lc = rest.toLowerCase();
-  const split = /\bsplit\b|\bhalf\b|\/2\b|#split/.test(lc) || /\bw\/?\s*tia\b/.test(lc);
+  const split = SPLIT_RE.test(lc);
+  const person = extractPerson(rest);
   let cardAccount = null, alias = null;
   for (const [a, acct] of Object.entries(cardmap.aliases).sort((x, y) => y[0].length - x[0].length))
     if (lc.includes(a)) { cardAccount = acct; alias = a; break; }
-  // clean payee: tokens minus the card alias, a leading "on", and split words
-  const drop = new Set(['on', 'split', 'half', 'w', 'w/', 'tia', '#split']);
+  // clean payee: tokens minus the card alias, a leading "on", split words, and the person's name
+  const drop = new Set(['on', 'split', 'half', 'with', 'w', 'w/', '#split']);
   if (alias) alias.split(/\s+/).forEach((x) => drop.add(x));
+  if (person) drop.add(person.toLowerCase());
   const merchant = rest.split(/\s+/).filter((w) => !drop.has(w.toLowerCase())).join(' ').trim();
-  return { amount, split, cardAccount, merchant: merchant || 'Manual entry', items: [], notes: '' };
+  return { amount, split, person, cardAccount, merchant: merchant || 'Manual entry', items: [], notes: '' };
 }
 
 // Regex handles the terse form ("12.50 starbucks on amex"); anything descriptive
@@ -157,6 +171,7 @@ const FREETEXT_SCHEMA = {
     items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'purchased items as short names (e.g. ["eggs","cheese","yogurt"]); empty if none mentioned' },
     card: { type: 'STRING', description: 'card name/word the user mentioned (e.g. "amex"), empty string if none' },
     split: { type: 'BOOLEAN', description: 'true if the user is splitting / paying half / with someone' },
+    person: { type: 'STRING', description: 'name of the person the expense is split with, if stated (e.g. "Ryan"); empty string if none' },
   },
   required: ['total'],
 };
@@ -176,7 +191,7 @@ async function geminiFreeText(text) {
     if (!amount || !isFinite(amount)) return null;
     const merchant = (o.merchant || '').trim() || 'Manual entry';
     const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
-    return { amount, split: !!o.split, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
+    return { amount, split: !!o.split, person: (o.person || '').trim() || null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: '' };
   } catch { return null; }
 }
 
@@ -208,7 +223,18 @@ async function refreshActualMaps() {
   CAT = Object.fromEntries((await api.getCategories()).map((c) => [c.name, c.id]));
   for (const p of await api.getPayees()) if (p.transfer_acct) TRANSFER_PAYEE[p.transfer_acct] = p.id;
 }
-async function logExpense({ accountName, total, payee, notes, category, date, split }) {
+// Match an "Owed by {name}" account (case-insensitive) or create it on-budget.
+async function resolveOwedAccount(person) {
+  const want = owedAccountFor(person);
+  const existing = Object.keys(ACCT).find((n) => n.toLowerCase() === want.toLowerCase());
+  if (existing) return existing;
+  const newId = await api.createAccount({ name: want, offbudget: false }, 0);
+  await api.sync();
+  await refreshActualMaps(); // pick up the account + its transfer payee
+  ACCT[want] = ACCT[want] || newId;
+  return want;
+}
+async function logExpense({ accountName, total, payee, notes, category, date, split, splitAccountName, splitPersonName }) {
   const acctId = ACCT[accountName];
   if (!acctId) throw new Error(`No account named "${accountName}" in Actual`);
   const cents = Math.round(Number(total) * 100);
@@ -216,16 +242,16 @@ async function logExpense({ accountName, total, payee, notes, category, date, sp
   const txn = { account: acctId, date, amount: -cents, payee_name: payee, notes, cleared: false };
   if (split) {
     const half = Math.round(cents / 2);
-    const owedAcct = ACCT[cfg.defaults.splitAccount];
+    const owedAcct = ACCT[splitAccountName];
     const transferPayee = owedAcct ? TRANSFER_PAYEE[owedAcct] : null;
     if (transferPayee) {
       txn.subtransactions = [
         { amount: -half, category: catId, notes: 'your share' },
-        { amount: -(cents - half), payee: transferPayee, notes: `owed by ${cfg.defaults.splitPerson}` },
+        { amount: -(cents - half), payee: transferPayee, notes: `owed by ${splitPersonName}` },
       ];
     } else {
       txn.category = catId; // fallback: no transfer payee found, log whole + tag
-      txn.notes = `${notes} [SPLIT w/ ${cfg.defaults.splitPerson} — settle manually]`;
+      txn.notes = `${notes} [SPLIT w/ ${splitPersonName} — settle manually]`;
     }
   } else {
     txn.category = catId;
@@ -254,11 +280,14 @@ async function finalize(chatId, receipt, parsed, accountName) {
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   let notes = [parsed.notes, items].filter(Boolean).join(' · ');
   if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
-  const txnId = await logExpense({ accountName, total: receipt.total, payee: receipt.merchant, notes, category, date, split: parsed.split });
-  const rec = { id: txnId, account: accountName, date, total: Number(receipt.total), payee: receipt.merchant, category, notes, split: parsed.split, ts: Date.now() };
+  const person = cap(parsed.person || cfg.defaults.splitPerson);
+  const splitAccountName = parsed.split ? await resolveOwedAccount(person) : null;
+  const txnId = await logExpense({ accountName, total: receipt.total, payee: receipt.merchant, notes, category, date, split: parsed.split, splitAccountName, splitPersonName: person });
+  const rec = { id: txnId, account: accountName, date, total: Number(receipt.total), payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
   if (txnId) lastTxn[chatId] = rec;
-  const splitLine = parsed.split ? `  ·  split w/ ${cfg.defaults.splitPerson} (your share $${(receipt.total / 2).toFixed(2)})` : '';
-  await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note text · "category X" · "split" · "delete")`);
+  const splitLine = parsed.split ? `  ·  split w/ ${person} (your share $${(receipt.total / 2).toFixed(2)})` : '  ·  not split';
+  const sentId = await send(chatId, `✅ $${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}\n(reply to edit: note · "category X" · "split [with NAME]" · "NAME paid" · "delete")`);
+  if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   return rec;
 }
 
@@ -299,7 +328,7 @@ async function handleFreeText(chatId, ft, confirm = true) {
 async function askConfirm(chatId, receipt, parsed, account) {
   confirming[chatId] = { receipt, parsed, account };
   const cat = guessCategory(receipt, parsed.notes);
-  const splitLine = parsed.split ? `  ·  split w/ ${cfg.defaults.splitPerson}` : '';
+  const splitLine = parsed.split ? `  ·  split w/ ${cap(parsed.person || cfg.defaults.splitPerson)}` : '  ·  not split';
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   await send(chatId, `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}\nReply "yes" to log, "no" to cancel.`);
 }
@@ -354,18 +383,36 @@ async function editTxn(chatId, rec, text) {
     rec.category = name;
     return send(chatId, `✏️ Category → ${name}`);
   }
-  if (/^(split|split w\/?\s*tia|half|\/2)$/.test(lc)) {
+  // Forward split: you paid, they owe you half. "split" or "split with NAME".
+  const sp = lc.match(/^(?:split|half|\/2)(?:\s+(?:with|w\/?)\s+(.+))?$/);
+  if (sp) {
     if (rec.split) return send(chatId, 'Already split.');
+    const person = cap((sp[1] || rec.person || cfg.defaults.splitPerson).trim());
+    const splitAccountName = await resolveOwedAccount(person);
     // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
     await api.deleteTransaction(id);
-    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true });
-    rebindTxn(id, { ...rec, id: newId, split: true });
-    return send(chatId, `✂️ Split 50/50 w/ ${cfg.defaults.splitPerson} (your share $${(rec.total / 2).toFixed(2)}).`);
+    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true, splitAccountName, splitPersonName: person });
+    rebindTxn(id, { ...rec, id: newId, split: true, person });
+    return send(chatId, `✂️ Split 50/50 w/ ${person} (your share $${(rec.total / 2).toFixed(2)}).`);
   }
-  const note = raw.replace(/^note:?\s*/i, '').trim();
-  await api.updateTransaction(id, { notes: note }); await api.sync();
-  rec.notes = note;
-  return send(chatId, '📝 Note updated.');
+  // Reverse direction: they paid a shared expense, you owe your half. "NAME paid",
+  // "paid by NAME", "owe NAME", or bare "owe". One categorized txn for your half in
+  // their (on-budget) Owed-by account: category shows your share, balance goes negative.
+  const rev = lc.match(/^(?:([\w'-]+)\s+paid|paid by\s+([\w'-]+)|i\s+owe(?:\s+([\w'-]+))?|owe(?:\s+([\w'-]+))?)$/);
+  if (rev) {
+    const person = cap((rev[1] || rev[2] || rev[3] || rev[4] || rec.person || cfg.defaults.splitPerson).trim());
+    const owedName = await resolveOwedAccount(person);
+    const half = rec.total / 2;
+    await api.deleteTransaction(id);
+    const newId = await logExpense({ accountName: owedName, total: half, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: false });
+    rebindTxn(id, { ...rec, id: newId, account: owedName, total: half, split: false, person });
+    return send(chatId, `🔁 ${person} paid — your half $${half.toFixed(2)} → ${rec.category}, logged to "${owedName}" (you owe it).`);
+  }
+  const add = raw.replace(/^note:?\s*/i, '').trim();
+  const notes = [rec.notes, add].filter(Boolean).join(' · ');
+  await api.updateTransaction(id, { notes }); await api.sync();
+  rec.notes = notes;
+  return send(chatId, '📝 Note added.');
 }
 // After a rebuild (split), point every reference to the old txn id at the new rec.
 function rebindTxn(oldId, newRec) {
@@ -390,10 +437,13 @@ async function onRelayPost(post) {
       await editTxn(id, repliedTo, text);
     } else {
       // poorton's posts log directly — no confirmation step in the relay channel.
-      let rec;
+      let rec, json = null;
       if (text.startsWith('{')) {
         // iOS auto-curls quotes; normalize “ ” ‘ ’ back to straight before parsing.
-        rec = await handleIngest(JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")), id);
+        try { json = JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")); } catch { /* malformed JSON -> fall back to the text parser below */ }
+      }
+      if (json) {
+        rec = await handleIngest(json, id);
       } else {
         const ft = await parseExpense(text);
         if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
@@ -437,7 +487,7 @@ async function dispatch(chatId, msg) {
   const ft = await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
   if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
-  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split w tia". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split", or "delete".');
+  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split with ryan". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split [with NAME]", "NAME paid", or "delete".');
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -453,10 +503,13 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   if (d.last4) notes += (notes ? ' ' : '') + `[card ****${d.last4}]`;
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
-  const id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split });
-  const rec = { id, account, date, total: amount, payee: merchant, category, notes, split, ts: Date.now() };
+  const person = cap((d.with || d.person || cfg.defaults.splitPerson));
+  const splitAccountName = split ? await resolveOwedAccount(person) : null;
+  const id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitAccountName, splitPersonName: person });
+  const rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
   if (id && chat) lastTxn[chat] = rec;
-  if (chat) await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? '  · split' : ''}\n(reply to edit: note · "category X" · "split" · "delete")`);
+  const sentId = chat ? await send(chat, `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? `  ·  split w/ ${person}` : '  ·  not split'}\n(reply to edit: note · "category X" · "split [with NAME]" · "NAME paid" · "delete")`) : null;
+  if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   return rec;
 }
 function startIngest() {
@@ -505,11 +558,13 @@ function selftest() {
   const assert = (c, m) => { if (!c) { console.error('FAIL:', m); process.exit(1); } };
   assert(parseFreeText('hello there') === null, 'no amount -> null');
   assert(parseFreeText('category Dining') === null, 'no amount -> null (edit-like)');
-  const a = parseFreeText('12.50 starbucks on amex split w tia');
+  const a = parseFreeText('12.50 starbucks on amex split with ryan');
   assert(a && a.amount === 12.5 && a.split === true, 'amount+split parsed');
-  assert(a.merchant === 'starbucks', 'merchant cleaned of card/split words: ' + a.merchant);
+  assert(a.person === 'ryan', 'person extracted: ' + a.person);
+  assert(a.merchant === 'starbucks', 'merchant cleaned of card/split/person words: ' + a.merchant);
+  assert(owedAccountFor('ryan') === 'Owed by Ryan', 'owed account name: ' + owedAccountFor('ryan'));
   const b = parseFreeText('paid $7 for coffee');
-  assert(b && b.amount === 7, '$amount mid-string parsed');
+  assert(b && b.amount === 7 && b.split === false, '$amount mid-string, no split');
   console.log('selftest OK');
 }
 if (process.argv[2] === 'selftest') selftest();
