@@ -48,9 +48,11 @@ public but `.env`, `config.json`, and `cardmap.json` are gitignored — copy tho
 something POSTs to `/ingest` directly.
 
 ### Native (recommended for an LXC)
-Debian 12 LXC, then:
+Debian 12 LXC. **Node 21+ is required** (`@actual-app/api` uses the global `navigator`, absent in
+Node ≤20) — install Node 22 from NodeSource, not Debian's old `nodejs`:
 ```bash
-apt install -y nodejs npm git python3 make g++   # build tools for better-sqlite3
+apt install -y git python3 make g++ curl              # build tools for better-sqlite3
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt install -y nodejs
 git clone <repo> borton && cd borton
 # scp .env config.json cardmap.json in here
 npm ci
