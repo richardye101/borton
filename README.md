@@ -47,19 +47,47 @@ public but `.env`, `config.json`, and `cardmap.json` are gitignored — copy tho
 `getUpdates` (Telegram 409). The Telegram relay is fully outbound; port `28455` only matters if
 something POSTs to `/ingest` directly.
 
-### Native (recommended for an LXC)
-Debian 12 LXC. **Node 21+ is required** (`@actual-app/api` uses the global `navigator`, absent in
-Node ≤20) — install Node 22 from NodeSource, not Debian's old `nodejs`:
+### Native on a Debian 12 LXC (recommended)
+**Node 21+ is required** — `@actual-app/api` uses the global `navigator`, absent in Node ≤20, so
+install Node 22 from NodeSource, *not* Debian's old `nodejs`.
+
+On the LXC (`pct enter <CTID>` or the console):
 ```bash
-apt install -y git python3 make g++ curl              # build tools for better-sqlite3
+# 1. Node 22 + build tools for better-sqlite3
+apt update && apt install -y git curl python3 make g++
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt install -y nodejs
-git clone <repo> borton && cd borton
-# scp .env config.json cardmap.json in here
-npm ci
-cp receipt-bot.service /etc/systemd/system/      # edit WorkingDirectory if not /root/borton
-systemctl enable --now receipt-bot
-journalctl -u receipt-bot -f
+node -v                                              # expect v22.x
+
+# 2. Code
+git clone https://github.com/richardye101/borton.git /root/borton
+cd /root/borton
 ```
+
+From your workstation, copy the three gitignored private files in (clone doesn't include them):
+```bash
+scp .env config.json cardmap.json root@<LXC-IP>:/root/borton/
+```
+
+Back on the LXC:
+```bash
+# 3. Deps (compiles better-sqlite3 for this Node's ABI)
+cd /root/borton && npm ci && chmod 600 .env
+
+# 4. systemd service (ships in the repo; WorkingDirectory defaults to /root/borton)
+cp receipt-bot.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now receipt-bot                   # enable = also starts on host reboot
+
+# 5. Verify
+systemctl is-enabled receipt-bot                     # -> enabled
+journalctl -u receipt-bot -f                         # -> "Bot running. Long-polling Telegram…"
+```
+
+Update after code changes:
+```bash
+git -C /root/borton pull && cd /root/borton && npm ci && systemctl restart receipt-bot
+```
+Re-run `npm ci` after any Node version change too (rebuilds the native module).
 
 ### Docker (alternative)
 ```bash
