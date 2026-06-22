@@ -1,0 +1,14 @@
+{
+  "name": "receipt-bot",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Telegram receipt logger -> Actual Budget (Gemini vision extraction, code-side caption parsing, self-building card map)",
+  "scripts": {
+    "start": "node bot.mjs",
+    "chatid": "node tools/get-chat-id.mjs"
+  },
+  "dependencies": {
+    "@actual-app/api": "26.6.0"
+  }
+}
