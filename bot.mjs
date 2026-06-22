@@ -392,7 +392,8 @@ async function onRelayPost(post) {
       // poorton's posts log directly — no confirmation step in the relay channel.
       let rec;
       if (text.startsWith('{')) {
-        rec = await handleIngest(JSON.parse(text));
+        // iOS auto-curls quotes; normalize “ ” ‘ ’ back to straight before parsing.
+        rec = await handleIngest(JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")), id);
       } else {
         const ft = await parseExpense(text);
         if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
@@ -440,8 +441,7 @@ async function dispatch(chatId, msg) {
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
-async function handleIngest(d) {
-  const chat = cfg.telegram.allowedChatId;
+async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const amount = Math.abs(Number(d.amount));
   if (!amount || !isFinite(amount)) throw new Error('missing/invalid amount');
   const merchant = (d.merchant || 'Apple Pay').toString().trim() || 'Apple Pay';
