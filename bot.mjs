@@ -277,7 +277,7 @@ async function logExpense({ accountName, total, payee, notes, category, date, sp
   }
   const importedId = 'bot-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
   txn.imported_id = importedId;
-  await api.addTransactions(acctId, [txn]);
+  await api.addTransactions(acctId, [txn], { runTransfers: true });
   await api.sync();
   const created = (await api.getTransactions(acctId, txn.date, txn.date)).find((t) => t.imported_id === importedId);
   return created ? created.id : null;
