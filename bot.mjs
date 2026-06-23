@@ -229,6 +229,15 @@ function guessCategory(receipt, caption) {
   return cfg.defaults.fallbackCategory;
 }
 
+// Auto-split configured payees (e.g. a recurring shared bill). config.defaults.autoSplit = { "beanfield": "Tia" }
+function maybeAutoSplit(receipt, parsed) {
+  if (parsed.split) return parsed;
+  const ms = (receipt.merchant || '').toLowerCase();
+  for (const [kw, who] of Object.entries(cfg.defaults.autoSplit || {}))
+    if (kw && ms.includes(kw.toLowerCase())) return { ...parsed, split: true, person: parsed.person || who };
+  return parsed;
+}
+
 // ---------- Actual ----------
 let ACCT = {}, CAT = {}, TRANSFER_PAYEE = {};
 async function initActual() {
@@ -294,6 +303,7 @@ const EDIT_WINDOW_MS = 60 * 60 * 1000; // a reply within an hour edits the last 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
 async function finalize(chatId, receipt, parsed, accountName) {
+  parsed = maybeAutoSplit(receipt, parsed);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
   const category = guessCategory(receipt, parsed.notes);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
@@ -345,6 +355,7 @@ async function handleFreeText(chatId, ft, confirm = true) {
 
 // Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
 async function askConfirm(chatId, receipt, parsed, account) {
+  parsed = maybeAutoSplit(receipt, parsed);
   const cat = guessCategory(receipt, parsed.notes);
   const splitLine = parsed.split ? `  ·  split w/ ${cap(parsed.person || cfg.defaults.splitPerson)}` : '  ·  not split';
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
