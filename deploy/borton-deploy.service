@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull borton main and redeploy if changed (with health-check rollback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/borton-deploy.sh
