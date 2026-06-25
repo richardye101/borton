@@ -90,32 +90,35 @@ const RECEIPT_SCHEMA = {
   },
   required: ['merchant', 'total'],
 };
-async function extractReceipt(buf, mime) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.gemini.model}:generateContent`;
-  const body = {
-    contents: [{
-      parts: [
-        { text: 'Extract the receipt into the schema. Use the printed grand total for "total". List each purchased item in line_items using short names (condense long descriptions, drop prices/quantities). If the card last-4 is not printed, return an empty string for card_last4.' },
-        { inlineData: { mimeType: mime, data: buf.toString('base64') } },
-      ],
-    }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: RECEIPT_SCHEMA },
-  };
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY },
-      body: JSON.stringify(body),
-    });
-    if (r.status === 429 || r.status >= 500) { await sleep(2000 * (attempt + 1)); continue; }
-    const d = await r.json();
-    const text = d?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error('Gemini: no content — ' + JSON.stringify(d).slice(0, 300));
-    return JSON.parse(text);
-  }
-  throw new Error('Gemini: rate-limited/unavailable after retries');
-}
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+// Try the primary model, then fall back to other flash models on transient 429/5xx (e.g. 503 overload).
+// Fall back to lighter, less-contended models (lite variants rarely 503) rather than other popular flash models.
+const GEMINI_MODELS = [cfg.gemini.model, ...(cfg.gemini.fallbackModels || ['gemini-2.0-flash-lite', 'gemini-flash-lite-latest', 'gemini-2.0-flash'])]
+  .filter((m, i, a) => m && a.indexOf(m) === i);
+async function geminiGenerate(parts, schema) {
+  const body = { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', responseSchema: schema } };
+  let lastErr = 'unknown';
+  for (const model of GEMINI_MODELS) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
+        if (r.status === 429 || r.status >= 500) { lastErr = `${model} HTTP ${r.status}`; await sleep(700 * (attempt + 1)); continue; }
+        const d = await r.json();
+        const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!t) { lastErr = `${model}: ${JSON.stringify(d).slice(0, 150)}`; break; } // bad response -> try next model
+        return JSON.parse(t);
+      } catch (e) { lastErr = `${model}: ${e.message}`; await sleep(700); }
+    }
+  }
+  throw new Error('Gemini unavailable (' + lastErr + ')');
+}
+async function extractReceipt(buf, mime) {
+  return geminiGenerate(
+    [{ text: 'Extract the receipt into the schema. Use the printed grand total for "total". List each purchased item in line_items using short names (condense long descriptions, drop prices/quantities). If the card last-4 is not printed, return an empty string for card_last4.' },
+     { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
+    RECEIPT_SCHEMA);
+}
 
 // ---------- Split helpers (person -> "Owed by {name}" account) ----------
 const OWED_FMT = cfg.defaults.owedAccountFormat || 'Owed by {name}';
@@ -156,12 +159,17 @@ function parseFreeText(text) {
   let cardAccount = null, alias = null;
   for (const [a, acct] of Object.entries(cardmap.aliases).sort((x, y) => y[0].length - x[0].length))
     if (lc.includes(a)) { cardAccount = acct; alias = a; break; }
-  // clean payee: tokens minus the card alias, a leading "on", split words, and the person's name
-  const drop = new Set(['on', 'split', 'half', 'with', 'w', 'w/', '#split']);
+  // clean payee: drop connectors ("at"/"on"/"used"...), card words (alias AND full account name, e.g. "scotiabank" AND "vi"), split words, person
+  const drop = new Set(['on', 'at', 'used', 'use', 'using', 'via', 'paid', 'for', 'the', 'split', 'half', 'halves', 'with', 'w', 'w/', '#split']);
   if (alias) alias.split(/\s+/).forEach((x) => drop.add(x));
+  if (cardAccount) cardAccount.toLowerCase().split(/\s+/).forEach((x) => drop.add(x));
   if (person) drop.add(person.toLowerCase());
-  const merchant = rest.split(/\s+/).filter((w) => !drop.has(w.toLowerCase())).join(' ').trim();
-  return { amount, split, person, cardAccount, merchant: merchant || 'Manual entry', items: [], notes: '' };
+  const clean = (s) => s.split(/\s+/).filter((w) => w && !drop.has(w.toLowerCase().replace(/^[.,]+|[.,]+$/g, ''))).join(' ').trim();
+  // merchant = text before the first comma (the rest is usually items/context -> notes)
+  const seg = rest.split(',');
+  const merchant = clean(seg[0]) || clean(rest) || 'Manual entry';
+  const notes = seg.length > 1 ? clean(seg.slice(1).join(', ')) : '';
+  return { amount, split, person, cardAccount, merchant, items: [], notes };
 }
 
 // Regex handles the terse form ("12.50 starbucks on amex"); anything descriptive
@@ -190,28 +198,16 @@ const FREETEXT_SCHEMA = {
   required: ['total'],
 };
 async function geminiFreeText(text) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${cfg.gemini.model}:generateContent`;
-  const body = {
-    contents: [{ parts: [{ text: `Extract a single expense from this message into the schema. Put only the store/payee name in "merchant" and the purchased items in "items". Message: ${JSON.stringify(text)}` }] }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: FREETEXT_SCHEMA },
-  };
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
-      if (r.status === 429 || r.status >= 500) { await sleep(800 * (attempt + 1)); continue; } // transient (e.g. 503 overload)
-      const d = await r.json();
-      const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!t) return null;
-      const o = JSON.parse(t);
-      const amount = Math.abs(Number(o.total));
-      if (!amount || !isFinite(amount)) return null;
-      const merchant = (o.merchant || '').trim() || 'Manual entry';
-      const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
-      const split = !!o.split && SPLIT_RE.test(text); // guard: never split just because a name was mentioned
-      return { amount, split, person: split ? (o.person || '').trim() || null : null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
-    } catch { await sleep(1000); }
-  }
-  return null; // gave up -> caller falls back to the regex parse
+  let o;
+  try {
+    o = await geminiGenerate([{ text: `Extract a single expense from this message into the schema. Put only the store/payee name in "merchant" and the purchased items in "items". Message: ${JSON.stringify(text)}` }], FREETEXT_SCHEMA);
+  } catch { return null; } // Gemini down across all models -> caller falls back to the regex parse
+  const amount = Math.abs(Number(o.total));
+  if (!amount || !isFinite(amount)) return null;
+  const merchant = (o.merchant || '').trim() || 'Manual entry';
+  const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
+  const split = !!o.split && SPLIT_RE.test(text); // guard: never split just because a name was mentioned
+  return { amount, split, person: split ? (o.person || '').trim() || null : null, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
 }
 
 // ---------- Category guess (light; user/Actual rules can refine) ----------
@@ -461,6 +457,7 @@ async function onRelayPost(post) {
   const text = (post.text || '').trim();
   await react(id, post.message_id, REACT_SEEN);
   try {
+    if (post.photo) { await handlePhoto(id, post); await react(id, post.message_id, REACT_DONE); return; } // receipt posted in the channel
     // Button taps come via callback_query, but accept typed yes/no & card answers too.
     if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
     if (pending[id]) { await handleCardAnswer(id, text); await react(id, post.message_id, REACT_DONE); return; }
