@@ -227,7 +227,7 @@ function guessCategory(receipt, caption) {
 
 // Auto-split configured payees (e.g. a recurring shared bill). config.defaults.autoSplit = { "beanfield": "Tia" }
 function maybeAutoSplit(receipt, parsed) {
-  if (parsed.split) return parsed;
+  if (parsed.split || parsed.splitDecided) return parsed; // already split, or the user explicitly chose at confirm
   const ms = (receipt.merchant || '').toLowerCase();
   for (const [kw, who] of Object.entries(cfg.defaults.autoSplit || {}))
     if (kw && ms.includes(kw.toLowerCase())) return { ...parsed, split: true, person: parsed.person || who };
@@ -306,6 +306,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
   let notes = [parsed.notes, items].filter(Boolean).join(' · ');
   if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
   const person = cap(parsed.person || cfg.defaults.splitPerson);
+  if (parsed.split) rememberSplitPerson(person);
   const splitAccountName = parsed.split ? await resolveOwedAccount(person) : null;
   const txnId = await logExpense({ accountName, total: receipt.total, payee: receipt.merchant, notes, category, date, split: parsed.split, splitAccountName, splitPersonName: person });
   const rec = { id: txnId, account: accountName, date, total: Number(receipt.total), payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
@@ -349,19 +350,61 @@ async function handleFreeText(chatId, ft, confirm = true) {
   return await finalize(chatId, receipt, parsed, ft.cardAccount);
 }
 
-// Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
-async function askConfirm(chatId, receipt, parsed, account) {
-  parsed = maybeAutoSplit(receipt, parsed);
+// Persisted "most recent split partner" (in cardmap.json) so the confirm step can offer a one-tap suggestion.
+function lastSplitPerson() { return cap(cardmap.lastSplitPerson || cfg.defaults.splitPerson || '') || null; }
+function rememberSplitPerson(person) {
+  const p = cap(String(person || '').trim());
+  if (!p || cardmap.lastSplitPerson === p) return;
+  cardmap.lastSplitPerson = p; saveCardmap();
+}
+
+function confirmText(receipt, parsed, account) {
   const cat = guessCategory(receipt, parsed.notes);
   const splitLine = parsed.split ? `  ·  split w/ ${cap(parsed.person || cfg.defaults.splitPerson)}` : '  ·  not split';
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
-  const mid = await send(chatId, `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}`, YESNO_KB);
+  return `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}`;
+}
+// Yes/No plus split controls: one-tap "Split w/ <recent>", "Split w/ …" (type any name), or undo.
+function confirmKb(parsed) {
+  const rows = [[{ text: '✅ Yes', callback_data: 'c:y' }, { text: '❌ No', callback_data: 'c:n' }]];
+  if (parsed.split) {
+    rows.push([{ text: "↩️ Don't split", callback_data: 'sp:off' }]);
+  } else {
+    const r = [];
+    const last = lastSplitPerson();
+    if (last) r.push({ text: `➗ Split w/ ${last}`, callback_data: 'sp:last' });
+    r.push({ text: '➗ Split w/ …', callback_data: 'sp:ask' });
+    rows.push(r);
+  }
+  return { inline_keyboard: rows };
+}
+
+// Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
+async function askConfirm(chatId, receipt, parsed, account) {
+  parsed = maybeAutoSplit(receipt, parsed);
+  const mid = await send(chatId, confirmText(receipt, parsed, account), confirmKb(parsed));
   confirming[chatId] = { receipt, parsed, account, promptMid: mid };
 }
-// Returns true if it consumed the text (a yes/no answer), false to fall through to normal handling.
-async function handleConfirm(chatId, text) {
-  const lc = text.trim().toLowerCase();
+// Re-draw the live preview in place after a split toggle.
+async function rerenderConfirm(chatId) {
   const c = confirming[chatId];
+  if (!c || !c.promptMid) return;
+  await tg('editMessageText', { chat_id: chatId, message_id: c.promptMid, text: confirmText(c.receipt, c.parsed, c.account), reply_markup: confirmKb(c.parsed) }).catch(() => {});
+}
+// Returns true if it consumed the text (yes/no, or a split-partner name we asked for), false to fall through.
+async function handleConfirm(chatId, text) {
+  const c = confirming[chatId];
+  if (!c) return false;
+  const lc = text.trim().toLowerCase();
+  if (c.awaitSplitName) { // we asked "who did you split with?" — this reply is the name
+    const person = cap(text.trim().replace(/^split\s+(?:with|w\/?)\s+/i, '').trim());
+    if (!person) { await send(chatId, "Didn't catch a name — try again, or tap ✅/❌."); return true; }
+    c.awaitSplitName = false;
+    c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
+    rememberSplitPerson(person);
+    await rerenderConfirm(chatId);
+    return true;
+  }
   if (/^(y|yes|ok|okay|confirm|👍|yep|yeah)$/.test(lc)) { delete confirming[chatId]; await finalize(chatId, c.receipt, c.parsed, c.account); return true; }
   if (/^(n|no|nope|cancel|nvm)$/.test(lc)) { delete confirming[chatId]; await send(chatId, '❌ Cancelled — nothing logged.'); return true; }
   delete confirming[chatId]; // anything else: drop the stale prompt, reinterpret the new message
@@ -414,6 +457,7 @@ async function editTxn(chatId, rec, text) {
   if (sp) {
     if (rec.split) return send(chatId, 'Already split.');
     const person = cap((sp[1] || rec.person || cfg.defaults.splitPerson).trim());
+    rememberSplitPerson(person);
     const splitAccountName = await resolveOwedAccount(person);
     // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
     await api.deleteTransaction(id);
@@ -427,6 +471,7 @@ async function editTxn(chatId, rec, text) {
   const rev = lc.match(/^(?:([\w'-]+)\s+paid|paid by\s+([\w'-]+)|i\s+owe(?:\s+([\w'-]+))?|owe(?:\s+([\w'-]+))?)$/);
   if (rev) {
     const person = cap((rev[1] || rev[2] || rev[3] || rev[4] || rec.person || cfg.defaults.splitPerson).trim());
+    rememberSplitPerson(person);
     const owedName = await resolveOwedAccount(person);
     const half = rec.total / 2;
     await api.deleteTransaction(id);
@@ -506,6 +551,11 @@ async function onCallback(cq) {
     } else if (data.startsWith('card:') && pending[chatId]) {
       await dropKb(chatId, mid);
       await handleCardAnswer(chatId, data.slice(5));
+    } else if (data.startsWith('sp:') && confirming[chatId]) {
+      const c = confirming[chatId];
+      if (data === 'sp:last') { c.parsed = { ...c.parsed, split: true, splitDecided: true, person: lastSplitPerson() }; await rerenderConfirm(chatId); }
+      else if (data === 'sp:off') { c.parsed = { ...c.parsed, split: false, splitDecided: true }; await rerenderConfirm(chatId); }
+      else if (data === 'sp:ask') { c.awaitSplitName = true; await send(chatId, 'Who did you split with? Type a name.'); }
     }
   } catch (e) {
     await send(chatId, '⚠️ ' + (e.message || String(e)));
@@ -559,6 +609,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const person = cap((d.with || d.person || cfg.defaults.splitPerson));
+  if (split) rememberSplitPerson(person);
   const splitAccountName = split ? await resolveOwedAccount(person) : null;
   const id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitAccountName, splitPersonName: person });
   const rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
