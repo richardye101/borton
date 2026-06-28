@@ -56,6 +56,7 @@ function cardKb() {
   const accounts = [...new Set(Object.values(cardmap.aliases))].filter((a) => `card:${a}`.length <= 64);
   const rows = [];
   for (let i = 0; i < accounts.length; i += 2) rows.push(accounts.slice(i, i + 2).map((a) => ({ text: a, callback_data: `card:${a}` })));
+  rows.push([{ text: '➕ Other (new account)', callback_data: 'card:__new__' }]);
   return { inline_keyboard: rows };
 }
 const dropKb = (chatId, mid) => tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid }).catch(() => {});
@@ -318,6 +319,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
 }
 
 async function handlePhoto(chatId, msg) {
+  delete pending[chatId]; delete confirming[chatId]; // a fresh receipt supersedes any unanswered card/confirm prompt
   const fileId = msg.photo[msg.photo.length - 1].file_id; // largest
   await send(chatId, '📸 reading receipt…');
   const { buf, mime } = await downloadPhoto(fileId);
@@ -419,15 +421,42 @@ function resolveAccount(answer) {
   const partial = Object.keys(ACCT).find((n) => n.toLowerCase().includes(lc));
   return partial || null;
 }
+// Create an on-budget account by name (or return the existing one if the name already exists).
+async function createNamedAccount(name) {
+  const clean = name.trim();
+  if (!clean) throw new Error('empty account name');
+  const existing = Object.keys(ACCT).find((n) => n.toLowerCase() === clean.toLowerCase());
+  if (existing) return existing;
+  const id = await api.createAccount({ name: clean, offbudget: false }, 0);
+  await api.sync();
+  await refreshActualMaps();
+  ACCT[clean] = ACCT[clean] || id;
+  return clean;
+}
 
 async function handleCardAnswer(chatId, text) {
   const p = pending[chatId];
-  const account = resolveAccount(text);
-  if (!account) { await send(chatId, `Couldn't match "${text}" to an account. Try the exact card name.`); return; }
-  if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
-  delete pending[chatId];
-  if (p.confirm) return await askConfirm(chatId, p.receipt, p.parsed, account);
-  await finalize(chatId, p.receipt, p.parsed, account);
+  const raw = text.trim();
+  // "➕ Other" path: this reply is a brand-new account name.
+  if (p.awaitNewAccount) {
+    const account = await createNamedAccount(raw);
+    if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
+    delete pending[chatId];
+    return await askConfirm(chatId, p.receipt, p.parsed, account); // confirm screen -> split buttons available
+  }
+  const account = resolveAccount(raw);
+  if (account) {
+    if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
+    delete pending[chatId];
+    return await askConfirm(chatId, p.receipt, p.parsed, account);
+  }
+  // Not a card name. The user likely moved on — reroute a new expense or an edit of the last txn
+  // instead of trapping them on the card question.
+  const ft = /\d/.test(raw) ? await parseExpense(raw) : null;
+  if (ft) { delete pending[chatId]; return await handleFreeText(chatId, ft); }
+  const editish = SPLIT_RE.test(raw) || /^(delete|undo|remove|note\b|category\s|cat\s)/i.test(raw) || /\bpaid\b|\bowe\b/i.test(raw);
+  if (editish && lastTxn[chatId]) { delete pending[chatId]; return await editLast(chatId, raw); }
+  await send(chatId, `Couldn't match "${raw}" to an account. Tap a card button, or ➕ Other to add a new one.`);
 }
 
 const editLast = (chatId, text) => editTxn(chatId, lastTxn[chatId], text);
@@ -550,7 +579,9 @@ async function onCallback(cq) {
       await send(chatId, '❌ Cancelled — nothing logged.');
     } else if (data.startsWith('card:') && pending[chatId]) {
       await dropKb(chatId, mid);
-      await handleCardAnswer(chatId, data.slice(5));
+      const ans = data.slice(5);
+      if (ans === '__new__') { pending[chatId].awaitNewAccount = true; await send(chatId, "Type the new account name (I'll create it in Actual):"); }
+      else await handleCardAnswer(chatId, ans);
     } else if (data.startsWith('sp:') && confirming[chatId]) {
       const c = confirming[chatId];
       if (data === 'sp:last') { c.parsed = { ...c.parsed, split: true, splitDecided: true, person: lastSplitPerson() }; await rerenderConfirm(chatId); }
