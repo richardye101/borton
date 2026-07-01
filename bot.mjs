@@ -489,7 +489,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
   }
   if (txnId) lastTxn[chatId] = rec;
   const body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
-  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`, txnId ? loggedKb() : undefined);
+  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}`, txnId ? loggedKb() : undefined);
   if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
@@ -498,7 +498,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
 // Re-draw a logged receipt in place from its rec (after a button edit), keeping the ✅/✏️/🗑 row.
 async function rerenderLogged(chatId, mid, rec) {
   const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, note: displayNote(rec.notes), date: rec.date });
-  await tg('editMessageText', { chat_id: chatId, message_id: mid, text: `${rec.reverse ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`, reply_markup: loggedKb() }).catch(() => {});
+  await tg('editMessageText', { chat_id: chatId, message_id: mid, text: `${rec.reverse ? '🔁' : '✅'} Logged\n${body}`, reply_markup: loggedKb() }).catch(() => {});
 }
 
 // ---- Someone-else's-card flow: they paid; ask how to split before logging. ----
@@ -537,7 +537,7 @@ async function finalizeOwnerPaid(chatId, choice) {
   const owe = (myCents / 100).toFixed(2);
   const oweLine = myCents > 0 ? `\nYou owe: $${owe} → ${owedAccount}` : `\nYou owe: nothing (all ${owner}'s)`;
   const body = fmtExpense({ total, merchant: receipt.merchant, category: parsed.category, account: `${account} (${owner}'s)`, note: parsed.notes, hideSplit: true });
-  const sentId = await send(chatId, `✅ Logged — ${owner} paid\n${body}${oweLine}\nDate: ${date}\n\n${EDIT_HINT}`, loggedKb());
+  const sentId = await send(chatId, `✅ Logged — ${owner} paid\n${body}${oweLine}\nDate: ${date}`, loggedKb());
   if (sentId) msgTxn[sentId] = rec;
   persistTxns();
   return rec;
@@ -663,13 +663,30 @@ function loggedKb() {
   ]] };
 }
 // Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
+// Category / Split / Paid-by open their own sub-menu (one thing per row → no truncation).
 function fieldMenuKb(reverse) {
-  const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
-  const rows = [[{ text: '🏷 Category', callback_data: 'e:set:cat' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
+  const rows = [[{ text: '🏷 Category', callback_data: 'e:sub:cat' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
   rows.push(reverse
-    ? [{ text: `👤 ${who} paid`, callback_data: 'e:do:person' }, { text: '👤 Someone else', callback_data: 'e:set:person' }]
-    : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: `➗ Split w/ ${who}`, callback_data: 'e:do:split' }, { text: '➗ …', callback_data: 'e:set:split' }]);
+    ? [{ text: '👤 Paid by…', callback_data: 'e:sub:person' }]
+    : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split…', callback_data: 'e:sub:split' }]);
   rows.push([{ text: '🔙 Back', callback_data: 'e:back' }]);
+  return { inline_keyboard: rows };
+}
+// Split sub-menu: one-tap with your usual person, or pick someone else. (Paid-by mirror for reverse.)
+function splitSubKb(reverse) {
+  const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
+  return { inline_keyboard: [
+    [{ text: reverse ? `👤 ${who} paid` : `➗ Split 50/50 w/ ${who}`, callback_data: reverse ? 'e:do:person' : 'e:do:split' }],
+    [{ text: '➗ Someone else…', callback_data: reverse ? 'e:set:person' : 'e:set:split' }],
+    [{ text: '🔙 Back', callback_data: 'e:menu' }],
+  ] };
+}
+// Category picker: every Actual category as a tappable button (2 per row), + type-it fallback.
+function catPickerKb() {
+  const names = Object.keys(CAT);
+  const rows = [];
+  for (let i = 0; i < names.length; i += 2) rows.push(names.slice(i, i + 2).map((n, j) => ({ text: n, callback_data: `ec:${i + j}` })));
+  rows.push([{ text: '✏️ Type it', callback_data: 'e:set:cat' }, { text: '🔙 Back', callback_data: 'e:menu' }]);
   return { inline_keyboard: rows };
 }
 
@@ -937,6 +954,17 @@ async function onCallback(cq) {
       const c = confirming[chatId];
       const kb = (c && c.promptMid === mid) ? confirmKb() : loggedKb();
       await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: kb }).catch(() => {});
+    } else if (data === 'e:sub:cat') { // open the category picker
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: catPickerKb() }).catch(() => {});
+    } else if (data === 'e:sub:split' || data === 'e:sub:person') { // open the split / paid-by sub-menu
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: splitSubKb(data === 'e:sub:person') }).catch(() => {});
+    } else if (data.startsWith('ec:')) { // a category was tapped from the picker
+      const name = Object.keys(CAT)[parseInt(data.slice(3), 10)];
+      const c = confirming[chatId];
+      if (!name) await send(chatId, 'That category is gone — tap ✏️ Edit again.');
+      else if (c && c.promptMid === mid) { c.parsed.category = name; await rerenderConfirm(chatId); }
+      else if (msgTxn[mid]) { await editTxn(chatId, msgTxn[mid], `category ${name}`); await rerenderLogged(chatId, mid, msgTxn[mid]); }
+      else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data === 'e:do:split' || data === 'e:do:person') { // one-tap: split/reverse with your usual person
       const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
       const c = confirming[chatId];
@@ -1058,7 +1086,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   }
   if (id && chat) lastTxn[chat] = rec;
   const body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: noteText, date });
-  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}\n\n${EDIT_HINT}`, id ? loggedKb() : undefined) : null;
+  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}`, id ? loggedKb() : undefined) : null;
   if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
