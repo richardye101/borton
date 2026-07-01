@@ -22,6 +22,7 @@
   "defaults": {
     "splitPerson": "Partner",
     "owedAccountFormat": "Owed by {name}",
+    "spendAccountFormat": "{name}'s spend",
     "autoSplit": {
       "examplepayee": "Partner"
     },
