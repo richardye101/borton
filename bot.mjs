@@ -624,9 +624,10 @@ async function handleFreeText(chatId, ft, confirm = true) {
 }
 
 // Persisted "most recent split partner" (in cardmap.json) so the confirm step can offer a one-tap suggestion.
-function lastSplitPerson() { return cap(cardmap.lastSplitPerson || cfg.defaults.splitPerson || '') || null; }
+// Guarded by personName so a poisoned value (e.g. a stored "Split") is ignored and never remembered.
+function lastSplitPerson() { return personName(cardmap.lastSplitPerson) || personName(cfg.defaults.splitPerson) || null; }
 function rememberSplitPerson(person) {
-  const p = cap(String(person || '').trim());
+  const p = personName(person);
   if (!p || cardmap.lastSplitPerson === p) return;
   cardmap.lastSplitPerson = p; saveCardmap();
 }
@@ -802,7 +803,7 @@ async function editTxn(chatId, rec, text) {
   // (categorized, negative = you owe); their half -> {name}'s spend (off-budget).
   const paidInfo = extractPaid(lc, true);
   if (paidInfo) {
-    const person = cap((paidInfo.person || extractPerson(raw) || rec.person || cfg.defaults.splitPerson).trim());
+    const person = personName(paidInfo.person || extractPerson(raw) || rec.person) || cap(cfg.defaults.splitPerson);
     rememberSplitPerson(person);
     if (rec.reverse) return send(chatId, `Already logged as "${person} paid".`);
     const owedName = await resolveOwedAccount(person);
@@ -817,7 +818,7 @@ async function editTxn(chatId, rec, text) {
   const sp = lc.match(/^(?:split|half|\/2)(?:\s+(?:with|w\/?)\s+(.+))?$/);
   if (sp) {
     if (rec.split) return send(chatId, 'Already split.');
-    const person = cap((sp[1] || rec.person || cfg.defaults.splitPerson).trim());
+    const person = personName(sp[1] || rec.person) || cap(cfg.defaults.splitPerson);
     rememberSplitPerson(person);
     const splitAccountName = await resolveOwedAccount(person);
     // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
@@ -833,9 +834,10 @@ async function editTxn(chatId, rec, text) {
     if (rec.reverse) return send(chatId, "This one's a reverse split (they paid) — no card to change.");
     const acct = resolveAccount(cardM[1].trim());
     if (!acct) return send(chatId, `No account matching "${cardM[1].trim()}". Try a card alias or exact name.`);
-    const splitAccountName = rec.split ? await resolveOwedAccount(rec.person || cfg.defaults.splitPerson) : null;
+    const cardPerson = personName(rec.person) || cap(cfg.defaults.splitPerson);
+    const splitAccountName = rec.split ? await resolveOwedAccount(cardPerson) : null;
     await api.deleteTransaction(id);
-    const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitAccountName, splitPersonName: cap(rec.person || cfg.defaults.splitPerson) });
+    const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitAccountName, splitPersonName: cardPerson });
     rebindTxn(id, { ...rec, id: newId, account: acct });
     persistTxns();
     return send(chatId, `💳 Card → ${acct}`);
@@ -957,8 +959,10 @@ async function onCallback(cq) {
       const cur = kind === 'pending'
         ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
         : (field === 'cat' ? rec.category : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
-      const prompts = { cat: 'Type the new category', card: 'Type the card (alias or account name)', note: 'Type the new note (replaces the current one)', split: 'Split with whom? Type a name', person: 'Who paid? Type a name' };
-      await send(chatId, `${prompts[field] || 'Type the new value'}${cur ? ` (now: ${cur})` : ''}:`, { force_reply: true, ...(cur ? { input_field_placeholder: String(cur).slice(0, 64) } : {}) });
+      const prompts = { cat: 'Send the new category', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
+      // Plain message (no force_reply — Telegram silently drops force_reply in channels, which read as
+      // "nothing happened"). editField is set, so your very next message is taken as the value.
+      await send(chatId, `✏️ ${prompts[field] || 'Send the new value'}${cur ? `\n(currently: ${cur})` : ''}`);
     } else if (data === 'e:ok') { // dismiss the buttons on a logged receipt
       await dropKb(chatId, mid);
     } else if (data === 'e:del') { // delete a logged txn
@@ -1090,6 +1094,7 @@ async function main() {
   await initActual();
   console.log('Accounts:', Object.keys(ACCT).join(', '));
   loadTxns(); // restore reply->txn links so edits survive restarts
+  if (cardmap.lastSplitPerson && !personName(cardmap.lastSplitPerson)) { delete cardmap.lastSplitPerson; saveCardmap(); } // scrub a poisoned partner name
   startIngest();
   if (!cfg.telegram.allowedChatId) console.log('WARNING: allowedChatId not set — bot will respond to anyone who messages it. Run `npm run chatid` and set it in config.json.');
   console.log('Bot running. Long-polling Telegram…');
@@ -1133,6 +1138,12 @@ function selftest() {
   assert(personName('ryan') === 'Ryan' && personName(' tia ') === 'Tia', 'personName keeps real names');
   assert(extractPaid('walmart split paid', false) === null, 'reverse: "split paid" is NOT a payer named Split');
   assert(extractPaid('tia paid', false)?.person === 'tia', 'reverse: real name still works');
+  // A poisoned remembered partner ("Split") must be ignored and never re-stored.
+  cardmap.lastSplitPerson = 'Split';
+  assert(lastSplitPerson() !== 'Split', 'poisoned lastSplitPerson ignored: ' + lastSplitPerson());
+  cardmap.lastSplitPerson = 'Ryan'; rememberSplitPerson('Split');
+  assert(cardmap.lastSplitPerson === 'Ryan', 'rememberSplitPerson refuses a directive word');
+  delete cardmap.lastSplitPerson;
   // Card ownership lookup (case-insensitive; unknown card = your own).
   cardmap.owners = { 'Wealthsimple VIP': 'Tia' };
   assert(ownerOf('wealthsimple vip') === 'Tia' && ownerOf('Amex') === null, 'ownerOf resolves owned cards, null otherwise');
