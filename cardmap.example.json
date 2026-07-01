@@ -3,5 +3,8 @@
     "amex": "American Express",
     "visa": "My Visa"
   },
-  "byLast4": {}
+  "byLast4": {},
+  "owners": {
+    "Partner's Card": "Partner"
+  }
 }

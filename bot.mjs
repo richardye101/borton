@@ -384,10 +384,36 @@ async function logReverseSplit({ owedAccount, spendAccount, total, payee, notes,
   return { id: mine ? mine.id : null, spendId: theirs ? theirs.id : null };
 }
 
+// A charge on someone else's REAL card (they paid). The full charge sits on their card account
+// (uncategorized — it's their card); your share (0 / half / full) is booked as a debt in
+// "Owed by {name}", categorized, so the category reflects only what YOU spent.
+//   myCents = 0 (all theirs) | half (split) | full (all yours)
+// Returns { cardTxnId, owedTxnId } (owedTxnId null when myCents === 0).
+async function logOwnerPaid({ cardAccount, owedAccount, total, myCents, payee, notes, category, date, personName }) {
+  const cardId = ACCT[cardAccount];
+  if (!cardId) throw new Error(`No account named "${cardAccount}" in Actual`);
+  const cents = Math.round(Number(total) * 100);
+  const stamp = Date.now();
+  const cardImp = `bot-${stamp}-${Math.floor(Math.random() * 1e6)}-card`;
+  await api.addTransactions(cardId, [{ account: cardId, date, amount: -cents, payee_name: payee, notes: [notes, `${personName} paid`].filter(Boolean).join(' · '), cleared: false, imported_id: cardImp }], { runTransfers: true });
+  let owedImp = null;
+  if (myCents > 0) {
+    const owedId = ACCT[owedAccount];
+    if (!owedId) throw new Error(`No account named "${owedAccount}" in Actual`);
+    owedImp = `bot-${stamp}-${Math.floor(Math.random() * 1e6)}-owed`;
+    await api.addTransactions(owedId, [{ account: owedId, date, amount: -myCents, payee_name: payee, notes: [notes, `your share — ${personName} paid`].filter(Boolean).join(' · '), category: CAT[category] || null, cleared: false, imported_id: owedImp }], { runTransfers: true });
+  }
+  await api.sync();
+  const cardTxn = (await api.getTransactions(cardId, date, date)).find((t) => t.imported_id === cardImp);
+  const owedTxn = owedImp ? (await api.getTransactions(ACCT[owedAccount], date, date)).find((t) => t.imported_id === owedImp) : null;
+  return { cardTxnId: cardTxn ? cardTxn.id : null, owedTxnId: owedTxn ? owedTxn.id : null };
+}
+
 // ---------- Main flow ----------
 const pending = {}; // chatId -> { receipt, parsed, last4, confirm }  (awaiting a card answer)
 const confirming = {}; // chatId -> { receipt, parsed, account }  (awaiting yes/no before logging)
 const editField = {}; // chatId -> { field, kind: 'pending'|'logged', mid }  (awaiting a typed value after ✏️ Edit → field)
+const ownerPending = {}; // chatId -> { receipt, parsed, account, owner }  (a charge on someone else's card: awaiting split/all-mine/all-theirs)
 const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
 const msgTxn = {}; // telegram message_id -> rec  (so a reply to that message edits its txn)
 const EDIT_WINDOW_MS = 60 * 60 * 1000; // a reply within an hour edits the last txn
@@ -416,7 +442,7 @@ function loadTxns() {
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
 // One-line-per-field "key: value" layout, shared by the confirm preview and the logged receipts.
-function fmtExpense({ total, merchant, category, account, split, paid, person, note, date }) {
+function fmtExpense({ total, merchant, category, account, split, paid, person, note, date, hideSplit }) {
   const half = (Number(total) / 2).toFixed(2);
   const L = [`Amount: $${Number(total).toFixed(2)}`, `Merchant: ${merchant}`, `Category: ${category}`];
   if (paid) {
@@ -424,7 +450,7 @@ function fmtExpense({ total, merchant, category, account, split, paid, person, n
     L.push(`Account: ${owedAccountFor(person)}`);
   } else {
     if (account) L.push(`Card: ${account}`);
-    L.push(`Split: ${split ? `50/50 w/ ${person} — your share $${half}` : 'no'}`);
+    if (!hideSplit) L.push(`Split: ${split ? `50/50 w/ ${person} — your share $${half}` : 'no'}`);
   }
   if (note) L.push(`Note: ${note}`);
   if (date) L.push(`Date: ${date}`);
@@ -475,6 +501,48 @@ async function rerenderLogged(chatId, mid, rec) {
   await tg('editMessageText', { chat_id: chatId, message_id: mid, text: `${rec.reverse ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`, reply_markup: loggedKb() }).catch(() => {});
 }
 
+// ---- Someone-else's-card flow: they paid; ask how to split before logging. ----
+function ownerKb(owner) {
+  return { inline_keyboard: [
+    [{ text: `➗ Split 50/50 w/ ${owner}`, callback_data: 'op:split' }],
+    [{ text: `🧍 All ${owner}'s`, callback_data: 'op:theirs' }, { text: '🙋 All mine', callback_data: 'op:mine' }],
+    [{ text: '❌ Cancel', callback_data: 'op:cancel' }],
+  ] };
+}
+async function askOwnerPaid(chatId, receipt, parsed, account, owner) {
+  const cat = parsed.category || guessCategory(receipt, parsed.notes);
+  const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
+  const note = parsed.notes || items;
+  const body = fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, note, hideSplit: true });
+  const mid = await send(chatId, `${owner} paid (on their ${account}).\n${body}\n\nHow should I split it?`, ownerKb(owner));
+  ownerPending[chatId] = { receipt, parsed: { ...parsed, category: cat, notes: note }, account, owner, promptMid: mid };
+}
+// Apply the tapped choice: 'split' (you owe half) | 'mine' (you owe all) | 'theirs' (you owe nothing).
+async function finalizeOwnerPaid(chatId, choice) {
+  const op = ownerPending[chatId];
+  if (!op) return;
+  delete ownerPending[chatId];
+  const { receipt, parsed, account, owner } = op;
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
+  const total = Number(receipt.total);
+  const cents = Math.round(total * 100);
+  const myCents = choice === 'mine' ? cents : choice === 'split' ? Math.round(cents / 2) : 0;
+  let notes = parsed.notes || '';
+  if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
+  const owedAccount = myCents > 0 ? await resolveOwedAccount(owner) : null;
+  const r = await logOwnerPaid({ cardAccount: account, owedAccount, total, myCents, payee: receipt.merchant, notes, category: parsed.category, date, personName: owner });
+  rememberSplitPerson(owner);
+  const rec = { id: r.owedTxnId || r.cardTxnId, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account, ownerPaid: true, owedCents: myCents, date, total, payee: receipt.merchant, category: parsed.category, notes, person: owner, ts: Date.now() };
+  lastTxn[chatId] = rec;
+  const owe = (myCents / 100).toFixed(2);
+  const oweLine = myCents > 0 ? `\nYou owe: $${owe} → ${owedAccount}` : `\nYou owe: nothing (all ${owner}'s)`;
+  const body = fmtExpense({ total, merchant: receipt.merchant, category: parsed.category, account: `${account} (${owner}'s)`, note: parsed.notes, hideSplit: true });
+  const sentId = await send(chatId, `✅ Logged — ${owner} paid\n${body}${oweLine}\nDate: ${date}\n\n${EDIT_HINT}`, loggedKb());
+  if (sentId) msgTxn[sentId] = rec;
+  persistTxns();
+  return rec;
+}
+
 // A field label shown in prompts / current-value hints.
 const FIELD_LABEL = { cat: 'category', card: 'card', note: 'note', split: 'split with (name)', person: 'who paid' };
 // After ✏️ Edit → a field button, the user's next message is the new value. Route it to the right place.
@@ -517,7 +585,7 @@ async function applyFieldValue(chatId, text) {
 }
 
 async function handlePhoto(chatId, msg) {
-  delete pending[chatId]; delete confirming[chatId]; // a fresh receipt supersedes any unanswered card/confirm prompt
+  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId]; // a fresh receipt supersedes any unanswered prompt
   const fileId = msg.photo[msg.photo.length - 1].file_id; // largest
   await send(chatId, '📸 reading receipt…');
   const { buf, mime } = await downloadPhoto(fileId);
@@ -534,6 +602,8 @@ async function handlePhoto(chatId, msg) {
     }
     return;
   }
+  const owner = ownerOf(account);
+  if (owner && !parsed.paid) return await askOwnerPaid(chatId, receipt, parsed, account, owner); // their card -> they paid; ask how to split
   await finalize(chatId, receipt, parsed, account);
 }
 
@@ -547,6 +617,8 @@ async function handleFreeText(chatId, ft, confirm = true) {
     pending[chatId] = { receipt, parsed, last4: null, confirm: true };
     return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card?`, cardKb());
   }
+  const owner = ownerOf(ft.cardAccount);
+  if (owner && !ft.paid) return await askOwnerPaid(chatId, receipt, parsed, ft.cardAccount, owner); // their card -> they paid; ask
   if (confirm) return await askConfirm(chatId, receipt, parsed, ft.cardAccount);
   return await finalize(chatId, receipt, parsed, ft.cardAccount);
 }
@@ -640,6 +712,25 @@ function resolveAccount(answer) {
   const partial = Object.keys(ACCT).find((n) => n.toLowerCase().includes(lc));
   return partial || null;
 }
+// cardmap.owners maps a card ACCOUNT NAME -> the person who owns it (e.g. "Wealthsimple VIP": "Tia").
+// A charge on someone else's card means they paid; ownerOf returns their name (null = your own card).
+function ownerOf(account) {
+  if (!account) return null;
+  const owners = cardmap.owners || {};
+  const key = Object.keys(owners).find((k) => k.toLowerCase() === String(account).toLowerCase());
+  return key ? personName(owners[key]) : null;
+}
+// Set/clear a card's owner from a chat command: "own wealthsimple = Tia" (or "= me"/"= none" to clear).
+function setOwner(cardText, ownerText) {
+  const account = resolveAccount(cardText);
+  if (!account) return { error: `No account matching "${cardText}".` };
+  cardmap.owners = cardmap.owners || {};
+  const person = /^(me|none|mine|self)$/i.test(ownerText.trim()) ? null : personName(ownerText);
+  const key = Object.keys(cardmap.owners).find((k) => k.toLowerCase() === account.toLowerCase()) || account;
+  if (person) cardmap.owners[key] = person; else delete cardmap.owners[key];
+  saveCardmap();
+  return { account, person };
+}
 // Create an on-budget account by name (or return the existing one if the name already exists).
 async function createNamedAccount(name) {
   const clean = name.trim();
@@ -687,8 +778,9 @@ async function editTxn(chatId, rec, text) {
   const raw = text.trim();
   const lc = raw.toLowerCase();
   if (['delete', 'undo', 'remove'].includes(lc)) {
-    await api.deleteTransaction(id);
-    if (rec.spendTxnId) await api.deleteTransaction(rec.spendTxnId).catch(() => {}); // reverse split: drop their-half leg too
+    // Remove every leg: the main txn plus any split/owner-paid siblings (reverse split, owner-paid card+owed).
+    const ids = [...new Set([id, rec.spendTxnId, rec.cardTxnId, rec.owedTxnId].filter(Boolean))];
+    for (const tid of ids) await api.deleteTransaction(tid).catch(() => {});
     await api.sync();
     if (lastTxn[chatId]?.id === id) delete lastTxn[chatId];
     persistTxns();
@@ -874,6 +966,11 @@ async function onCallback(cq) {
       await dropKb(chatId, mid);
       if (rec) await editTxn(chatId, rec, 'delete');
       else await send(chatId, 'Nothing to delete.');
+    } else if (data.startsWith('op:')) { // someone-else's-card prompt: how to split
+      if (!ownerPending[chatId]) { await dropKb(chatId, mid); return; }
+      await dropKb(chatId, mid);
+      if (data === 'op:cancel') { delete ownerPending[chatId]; await send(chatId, '❌ Cancelled — nothing logged.'); }
+      else await finalizeOwnerPaid(chatId, data.slice(3)); // split | theirs | mine
     }
   } catch (e) {
     await send(chatId, '⚠️ ' + (e.message || String(e)));
@@ -902,6 +999,14 @@ async function onUpdate(u) {
 async function dispatch(chatId, msg) {
   if (msg.photo) return await handlePhoto(chatId, msg);
   if (!msg.text) return;
+  // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
+  // "own wealthsimple = me" clears it.
+  const ownM = msg.text.match(/^own\s+(.+?)\s*[:=]\s*(.+)$/i) || msg.text.match(/^own\s+(.+)\s+(\S+)$/i);
+  if (ownM) {
+    const res = setOwner(ownM[1], ownM[2]);
+    if (!res.error) return await send(chatId, res.person ? `👤 ${res.account} is ${res.person}'s card — charges on it will ask how to split.` : `↩️ ${res.account} is yours now (no owner).`);
+    if (/[:=]/.test(msg.text)) return await send(chatId, res.error); // explicit "own X = Y" — surface the error; bare form falls through
+  }
   // A value typed after ✏️ Edit → field goes to that field (must run before the reply/edit routing).
   if (editField[chatId]) return await applyFieldValue(chatId, msg.text);
   // Reply to a previously-logged message edits that txn. If the exact message link is gone
@@ -1028,6 +1133,10 @@ function selftest() {
   assert(personName('ryan') === 'Ryan' && personName(' tia ') === 'Tia', 'personName keeps real names');
   assert(extractPaid('walmart split paid', false) === null, 'reverse: "split paid" is NOT a payer named Split');
   assert(extractPaid('tia paid', false)?.person === 'tia', 'reverse: real name still works');
+  // Card ownership lookup (case-insensitive; unknown card = your own).
+  cardmap.owners = { 'Wealthsimple VIP': 'Tia' };
+  assert(ownerOf('wealthsimple vip') === 'Tia' && ownerOf('Amex') === null, 'ownerOf resolves owned cards, null otherwise');
+  delete cardmap.owners;
   // Note stripping: the caption's description survives; routing/split directives are removed.
   assert(stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']) === 'neutrogena face cleanser', 'strip: keeps description, drops card+split: ' + stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']));
   assert(stripControlWords('dinner with mom, ryan paid', []) === 'dinner with mom', 'strip: keeps "with mom", drops "ryan paid": ' + stripControlWords('dinner with mom, ryan paid', []));
