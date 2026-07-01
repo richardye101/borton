@@ -134,6 +134,15 @@ function extractPerson(text) {
 }
 const SPLIT_RE = /\bsplit\b|\bhalf\b|\bhalves\b|\/2\b|#split/i;
 
+// Words that are never a person's name (they're directives/filler) — so "split paid" can't make a
+// person literally called "Split", and typing "split" at a name prompt falls back to the default.
+const NON_NAMES = new Set(['split', 'splits', 'half', 'halves', 'paid', 'pay', 'pays', 'owe', 'owes', 'with', 'w', 'on', 'the', 'a', 'it', 'this', 'that', 'me', 'my', 'and', 'for', 'by']);
+function personName(name) {
+  const p = (name == null ? '' : String(name)).trim();
+  if (!p || NON_NAMES.has(p.toLowerCase())) return null;
+  return cap(p);
+}
+
 // Reverse direction: someone ELSE paid a shared expense, so you owe your half.
 // Matches "NAME paid", "she/he/they paid", "paid by NAME", "i owe", "owe NAME".
 // Returns { person } (person === null means "use the resolved split person", e.g. a pronoun),
@@ -144,12 +153,13 @@ function extractPaid(text, strict) {
   const t = text || '';
   const end = strict ? '\\s*$' : '\\b';
   let m;
-  if ((m = t.match(new RegExp(`\\bpaid by\\s+([a-z][\\w'-]*)${end}`, 'i')))) return { person: m[1] };
-  if ((m = t.match(new RegExp(`\\b(?:i\\s+)?owe(?:\\s+([a-z][\\w'-]*))?${end}`, 'i')))) return { person: m[1] || null };
+  if ((m = t.match(new RegExp(`\\bpaid by\\s+([a-z][\\w'-]*)${end}`, 'i')))) return { person: personName(m[1]) };
+  if ((m = t.match(new RegExp(`\\b(?:i\\s+)?owe(?:\\s+([a-z][\\w'-]*))?${end}`, 'i')))) return { person: personName(m[1]) };
   if ((m = t.match(new RegExp(`\\b([a-z][\\w'-]*)\\s+paid${end}`, 'i')))) {
     const w = m[1].toLowerCase();
     if (w === 'i') return null;            // "I paid" = you paid, normal expense
     if (PRONOUNS.has(w)) return { person: null };
+    if (NON_NAMES.has(w)) return null;     // "split paid" etc. — not a real payer
     return { person: m[1] };
   }
   return null;
@@ -432,7 +442,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
   const desc = parsed.notes || items;
   let notes = desc;
   if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
-  const person = cap(parsed.person || cfg.defaults.splitPerson);
+  const person = personName(parsed.person) || cap(cfg.defaults.splitPerson);
   const total = Number(receipt.total);
   const half = (total / 2).toFixed(2);
   let txnId, rec;
@@ -486,11 +496,11 @@ async function applyFieldValue(chatId, text) {
       if (!acct) return await send(chatId, `No account matching "${value}". Retry with a card alias or exact name.`);
       c.account = acct;
     } else if (ef.field === 'split') {
-      const person = cap(value) || cap(cfg.defaults.splitPerson);
+      const person = personName(value) || cap(cfg.defaults.splitPerson);
       c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
       rememberSplitPerson(person);
     } else if (ef.field === 'person') { // reverse split: who paid
-      c.parsed = { ...c.parsed, paid: true, person: cap(value) || cap(cfg.defaults.splitPerson) };
+      c.parsed = { ...c.parsed, paid: true, person: personName(value) || cap(cfg.defaults.splitPerson) };
     }
     return await rerenderConfirm(chatId);
   }
@@ -581,10 +591,11 @@ function loggedKb() {
 }
 // Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
 function fieldMenuKb(reverse) {
+  const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
   const rows = [[{ text: '🏷 Category', callback_data: 'e:set:cat' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
   rows.push(reverse
-    ? [{ text: '👤 Paid by', callback_data: 'e:set:person' }]
-    : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split', callback_data: 'e:set:split' }]);
+    ? [{ text: `👤 ${who} paid`, callback_data: 'e:do:person' }, { text: '👤 Someone else', callback_data: 'e:set:person' }]
+    : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: `➗ Split w/ ${who}`, callback_data: 'e:do:split' }, { text: '➗ …', callback_data: 'e:set:split' }]);
   rows.push([{ text: '🔙 Back', callback_data: 'e:back' }]);
   return { inline_keyboard: rows };
 }
@@ -832,6 +843,18 @@ async function onCallback(cq) {
       const c = confirming[chatId];
       const kb = (c && c.promptMid === mid) ? confirmKb() : loggedKb();
       await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: kb }).catch(() => {});
+    } else if (data === 'e:do:split' || data === 'e:do:person') { // one-tap: split/reverse with your usual person
+      const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
+      const c = confirming[chatId];
+      if (c && c.promptMid === mid) { // pending preview
+        c.parsed = data === 'e:do:person'
+          ? { ...c.parsed, paid: true, split: true, splitDecided: true, person: who }
+          : { ...c.parsed, paid: false, split: true, splitDecided: true, person: who };
+        await rerenderConfirm(chatId);
+      } else if (msgTxn[mid]) { // logged receipt
+        await editTxn(chatId, msgTxn[mid], data === 'e:do:person' ? `${who} paid` : `split w/ ${who}`);
+        await rerenderLogged(chatId, mid, msgTxn[mid]);
+      } else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data.startsWith('e:set:')) { // a field was picked -> ask for the new value
       const field = data.slice(6);
       const c = confirming[chatId];
@@ -908,7 +931,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   if (d.last4) notes += (notes ? ' ' : '') + `[card ****${d.last4}]`;
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
-  const person = cap((d.with || d.person || cfg.defaults.splitPerson));
+  const person = personName(d.with || d.person) || cap(cfg.defaults.splitPerson);
   const noteText = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
   let id, rec;
   if (paid) {
@@ -1000,6 +1023,11 @@ function selftest() {
   assert(extractPaid('i paid', true) === null, 'strict: "i paid" not reverse');
   assert(extractPaid('loan paid off', true) === null, 'strict: "loan paid off" not reverse (no trailing paid)');
   assert(extractPaid('split with ryan she paid', true)?.person === null, 'strict: combined split + pronoun paid');
+  // A directive word can never become a person's name (the "Owed by Split" bug).
+  assert(personName('split') === null && personName('half') === null && personName('with') === null, 'personName rejects directive words');
+  assert(personName('ryan') === 'Ryan' && personName(' tia ') === 'Tia', 'personName keeps real names');
+  assert(extractPaid('walmart split paid', false) === null, 'reverse: "split paid" is NOT a payer named Split');
+  assert(extractPaid('tia paid', false)?.person === 'tia', 'reverse: real name still works');
   // Note stripping: the caption's description survives; routing/split directives are removed.
   assert(stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']) === 'neutrogena face cleanser', 'strip: keeps description, drops card+split: ' + stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']));
   assert(stripControlWords('dinner with mom, ryan paid', []) === 'dinner with mom', 'strip: keeps "with mom", drops "ryan paid": ' + stripControlWords('dinner with mom, ryan paid', []));
