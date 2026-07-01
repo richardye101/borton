@@ -816,6 +816,17 @@ async function editTxn(chatId, rec, text) {
     const want = m[1].trim();
     const name = Object.keys(CAT).find((c) => c.toLowerCase() === want);
     if (!name) return send(chatId, `No category named "${want}". Try the exact name.`);
+    if (rec.split && !rec.reverse && !rec.ownerPaid) {
+      // Forward split: the txn is a split PARENT (its category lives on the "your share" sub).
+      // Writing a category onto the parent would collapse the split — rebuild it instead.
+      const person = personName(rec.person) || cap(cfg.defaults.splitPerson);
+      const splitAccountName = await resolveOwedAccount(person);
+      await api.deleteTransaction(id);
+      const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: name, date: rec.date, split: true, splitAccountName, splitPersonName: person });
+      rebindTxn(id, { ...rec, id: newId, category: name });
+      persistTxns();
+      return send(chatId, `✏️ Category → ${name} (kept split w/ ${person})`);
+    }
     await api.updateTransaction(id, { category: CAT[name] }); await api.sync();
     rec.category = name;
     persistTxns();
