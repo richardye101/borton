@@ -377,6 +377,7 @@ async function logReverseSplit({ owedAccount, spendAccount, total, payee, notes,
 // ---------- Main flow ----------
 const pending = {}; // chatId -> { receipt, parsed, last4, confirm }  (awaiting a card answer)
 const confirming = {}; // chatId -> { receipt, parsed, account }  (awaiting yes/no before logging)
+const editField = {}; // chatId -> { field, kind: 'pending'|'logged', mid }  (awaiting a typed value after ✏️ Edit → field)
 const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
 const msgTxn = {}; // telegram message_id -> rec  (so a reply to that message edits its txn)
 const EDIT_WINDOW_MS = 60 * 60 * 1000; // a reply within an hour edits the last txn
@@ -424,7 +425,7 @@ const EDIT_HINT = 'Reply to edit or delete — e.g. "category Groceries", "split
 async function finalize(chatId, receipt, parsed, accountName) {
   parsed = maybeAutoSplit(receipt, parsed);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
-  const category = guessCategory(receipt, parsed.notes);
+  const category = parsed.category || guessCategory(receipt, parsed.notes);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   // Prefer what you wrote (the caption) over the receipt's OCR line-items (often cryptic shortcodes
   // like "NTG HB CLNSR"). Fall back to line-items only when you gave no description.
@@ -452,10 +453,57 @@ async function finalize(chatId, receipt, parsed, accountName) {
   }
   if (txnId) lastTxn[chatId] = rec;
   const body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
-  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`);
+  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`, txnId ? loggedKb() : undefined);
   if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
+}
+
+// Re-draw a logged receipt in place from its rec (after a button edit), keeping the ✅/✏️/🗑 row.
+async function rerenderLogged(chatId, mid, rec) {
+  const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, note: displayNote(rec.notes), date: rec.date });
+  await tg('editMessageText', { chat_id: chatId, message_id: mid, text: `${rec.reverse ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`, reply_markup: loggedKb() }).catch(() => {});
+}
+
+// A field label shown in prompts / current-value hints.
+const FIELD_LABEL = { cat: 'category', card: 'card', note: 'note', split: 'split with (name)', person: 'who paid' };
+// After ✏️ Edit → a field button, the user's next message is the new value. Route it to the right place.
+async function applyFieldValue(chatId, text) {
+  const ef = editField[chatId];
+  delete editField[chatId];
+  const value = text.trim();
+  if (ef.kind === 'pending') {
+    const c = confirming[chatId];
+    if (!c) return await send(chatId, 'That preview expired — send the expense again.');
+    if (ef.field === 'cat') {
+      const name = resolveCategory(value);
+      if (!name) return await send(chatId, `No category named "${value}". Tap ✏️ Edit → 🏷 Category to retry.`);
+      c.parsed.category = name;
+    } else if (ef.field === 'note') {
+      c.parsed.notes = value;
+    } else if (ef.field === 'card') {
+      const acct = resolveAccount(value);
+      if (!acct) return await send(chatId, `No account matching "${value}". Retry with a card alias or exact name.`);
+      c.account = acct;
+    } else if (ef.field === 'split') {
+      const person = cap(value) || cap(cfg.defaults.splitPerson);
+      c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
+      rememberSplitPerson(person);
+    } else if (ef.field === 'person') { // reverse split: who paid
+      c.parsed = { ...c.parsed, paid: true, person: cap(value) || cap(cfg.defaults.splitPerson) };
+    }
+    return await rerenderConfirm(chatId);
+  }
+  // logged: translate to an editTxn command, then re-render the receipt in place.
+  const rec = msgTxn[ef.mid] || lastTxn[chatId];
+  if (!rec) return await send(chatId, "That transaction expired — reply to a newer one.");
+  const cmd = ef.field === 'cat' ? `category ${value}`
+    : ef.field === 'note' ? `note: ${value}`
+    : ef.field === 'card' ? `card ${value}`
+    : ef.field === 'person' ? `${value} paid`
+    : `split w/ ${value}`;
+  await editTxn(chatId, rec, cmd);
+  await rerenderLogged(chatId, ef.mid, msgTxn[ef.mid] || rec);
 }
 
 async function handlePhoto(chatId, msg) {
@@ -502,39 +550,56 @@ function rememberSplitPerson(person) {
 }
 
 function confirmText(receipt, parsed, account) {
-  const cat = guessCategory(receipt, parsed.notes);
+  const cat = parsed.category || guessCategory(receipt, parsed.notes);
   const person = cap(parsed.person || cfg.defaults.splitPerson);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   const note = parsed.notes || items; // your description wins over receipt line-items
   return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, note })}`;
 }
-// Yes/No plus split controls: one-tap "Split w/ <recent>", "Split w/ …" (type any name), or undo.
-function confirmKb(parsed) {
-  const rows = [[{ text: '✅ Yes', callback_data: 'c:y' }, { text: '❌ No', callback_data: 'c:n' }]];
-  if (parsed.paid) return { inline_keyboard: rows }; // reverse split: just Yes/No
-  if (parsed.split) {
-    rows.push([{ text: "↩️ Don't split", callback_data: 'sp:off' }]);
-  } else {
-    const r = [];
-    const last = lastSplitPerson();
-    if (last) r.push({ text: `➗ Split w/ ${last}`, callback_data: 'sp:last' });
-    r.push({ text: '➗ Split w/ …', callback_data: 'sp:ask' });
-    rows.push(r);
-  }
+// Resolve a typed category to its exact Actual name (case-insensitive), or null.
+function resolveCategory(want) {
+  const w = (want || '').trim().toLowerCase();
+  return Object.keys(CAT).find((c) => c.toLowerCase() === w) || null;
+}
+// A stored note carries machine tags like "[card ****1234] [apple pay]"; strip them for display.
+const displayNote = (notes) => (notes || '').replace(/\s*\[[^\]]*\]/g, '').trim();
+// Pre-log preview: confirm, edit, or cancel.
+function confirmKb() {
+  return { inline_keyboard: [[
+    { text: '✅ Yes', callback_data: 'c:y' },
+    { text: '✏️ Edit', callback_data: 'e:menu' },
+    { text: '❌ No', callback_data: 'c:n' },
+  ]] };
+}
+// Logged receipt: dismiss the buttons, edit a field, or delete.
+function loggedKb() {
+  return { inline_keyboard: [[
+    { text: '✅ OK', callback_data: 'e:ok' },
+    { text: '✏️ Edit', callback_data: 'e:menu' },
+    { text: '🗑 Delete', callback_data: 'e:del' },
+  ]] };
+}
+// Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
+function fieldMenuKb(reverse) {
+  const rows = [[{ text: '🏷 Category', callback_data: 'e:set:cat' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
+  rows.push(reverse
+    ? [{ text: '👤 Paid by', callback_data: 'e:set:person' }]
+    : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split', callback_data: 'e:set:split' }]);
+  rows.push([{ text: '🔙 Back', callback_data: 'e:back' }]);
   return { inline_keyboard: rows };
 }
 
 // Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
 async function askConfirm(chatId, receipt, parsed, account) {
   parsed = maybeAutoSplit(receipt, parsed);
-  const mid = await send(chatId, confirmText(receipt, parsed, account), confirmKb(parsed));
+  const mid = await send(chatId, confirmText(receipt, parsed, account), confirmKb());
   confirming[chatId] = { receipt, parsed, account, promptMid: mid };
 }
-// Re-draw the live preview in place after a split toggle.
+// Re-draw the live preview in place after an edit.
 async function rerenderConfirm(chatId) {
   const c = confirming[chatId];
   if (!c || !c.promptMid) return;
-  await tg('editMessageText', { chat_id: chatId, message_id: c.promptMid, text: confirmText(c.receipt, c.parsed, c.account), reply_markup: confirmKb(c.parsed) }).catch(() => {});
+  await tg('editMessageText', { chat_id: chatId, message_id: c.promptMid, text: confirmText(c.receipt, c.parsed, c.account), reply_markup: confirmKb() }).catch(() => {});
 }
 // Returns true if it consumed the text (yes/no, or a split-partner name we asked for), false to fall through.
 async function handleConfirm(chatId, text) {
@@ -659,6 +724,19 @@ async function editTxn(chatId, rec, text) {
     persistTxns();
     return send(chatId, `✂️ Split 50/50 w/ ${person} (your share $${(rec.total / 2).toFixed(2)}).`);
   }
+  // Change the card/account. "card amex" (or "account …"). Rebuild on the new account, keeping split.
+  const cardM = lc.match(/^(?:card|account)\s+(.+)$/);
+  if (cardM) {
+    if (rec.reverse) return send(chatId, "This one's a reverse split (they paid) — no card to change.");
+    const acct = resolveAccount(cardM[1].trim());
+    if (!acct) return send(chatId, `No account matching "${cardM[1].trim()}". Try a card alias or exact name.`);
+    const splitAccountName = rec.split ? await resolveOwedAccount(rec.person || cfg.defaults.splitPerson) : null;
+    await api.deleteTransaction(id);
+    const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitAccountName, splitPersonName: cap(rec.person || cfg.defaults.splitPerson) });
+    rebindTxn(id, { ...rec, id: newId, account: acct });
+    persistTxns();
+    return send(chatId, `💳 Card → ${acct}`);
+  }
   // "note: X" / "notes = X" REPLACES the note (clears it if X is empty); any other free text APPENDS.
   const noteSet = raw.match(/^notes?\s*[:=]\s*([\s\S]*)$/i);
   if (noteSet) {
@@ -693,6 +771,7 @@ async function onRelayPost(post) {
   try {
     if (post.photo) { await handlePhoto(id, post); await react(id, post.message_id, REACT_DONE); return; } // receipt posted in the channel
     // Button taps come via callback_query, but accept typed yes/no & card answers too.
+    if (editField[id]) { await applyFieldValue(id, text); await react(id, post.message_id, REACT_DONE); return; }
     if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
     if (pending[id]) { await handleCardAnswer(id, text); await react(id, post.message_id, REACT_DONE); return; }
     // A reply to a previously-logged post edits that transaction (note / category / split / delete).
@@ -743,11 +822,35 @@ async function onCallback(cq) {
       const ans = data.slice(5);
       if (ans === '__new__') { pending[chatId].awaitNewAccount = true; await send(chatId, "Type the new account name (I'll create it in Actual):"); }
       else await handleCardAnswer(chatId, ans);
-    } else if (data.startsWith('sp:') && confirming[chatId]) {
+    } else if (data === 'e:menu') { // ✏️ Edit -> show the field picker on this message
       const c = confirming[chatId];
-      if (data === 'sp:last') { c.parsed = { ...c.parsed, split: true, splitDecided: true, person: lastSplitPerson() }; await rerenderConfirm(chatId); }
-      else if (data === 'sp:off') { c.parsed = { ...c.parsed, split: false, splitDecided: true }; await rerenderConfirm(chatId); }
-      else if (data === 'sp:ask') { c.awaitSplitName = true; await send(chatId, 'Who did you split with? Type a name.'); }
+      const rec = (c && c.promptMid === mid) ? null : msgTxn[mid];
+      if (c && c.promptMid === mid) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(c.parsed.paid) }).catch(() => {});
+      else if (rec) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(rec.reverse) }).catch(() => {});
+      else await send(chatId, "That one's too old to edit by button — reply to it instead.");
+    } else if (data === 'e:back') { // collapse the field picker back to the normal row
+      const c = confirming[chatId];
+      const kb = (c && c.promptMid === mid) ? confirmKb() : loggedKb();
+      await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: kb }).catch(() => {});
+    } else if (data.startsWith('e:set:')) { // a field was picked -> ask for the new value
+      const field = data.slice(6);
+      const c = confirming[chatId];
+      const kind = (c && c.promptMid === mid) ? 'pending' : 'logged';
+      if (kind === 'logged' && !msgTxn[mid]) { await send(chatId, "That one's too old to edit by button."); return; }
+      editField[chatId] = { field, kind, mid };
+      const rec = kind === 'logged' ? msgTxn[mid] : null;
+      const cur = kind === 'pending'
+        ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
+        : (field === 'cat' ? rec.category : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
+      const prompts = { cat: 'Type the new category', card: 'Type the card (alias or account name)', note: 'Type the new note (replaces the current one)', split: 'Split with whom? Type a name', person: 'Who paid? Type a name' };
+      await send(chatId, `${prompts[field] || 'Type the new value'}${cur ? ` (now: ${cur})` : ''}:`, { force_reply: true, ...(cur ? { input_field_placeholder: String(cur).slice(0, 64) } : {}) });
+    } else if (data === 'e:ok') { // dismiss the buttons on a logged receipt
+      await dropKb(chatId, mid);
+    } else if (data === 'e:del') { // delete a logged txn
+      const rec = msgTxn[mid] || lastTxn[chatId];
+      await dropKb(chatId, mid);
+      if (rec) await editTxn(chatId, rec, 'delete');
+      else await send(chatId, 'Nothing to delete.');
     }
   } catch (e) {
     await send(chatId, '⚠️ ' + (e.message || String(e)));
@@ -776,6 +879,8 @@ async function onUpdate(u) {
 async function dispatch(chatId, msg) {
   if (msg.photo) return await handlePhoto(chatId, msg);
   if (!msg.text) return;
+  // A value typed after ✏️ Edit → field goes to that field (must run before the reply/edit routing).
+  if (editField[chatId]) return await applyFieldValue(chatId, msg.text);
   // Reply to a previously-logged message edits that txn. If the exact message link is gone
   // (e.g. logged in an earlier process before this one started), fall back to this chat's most
   // recent txn — an explicit reply almost always means "edit the thing I just logged".
@@ -804,7 +909,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const person = cap((d.with || d.person || cfg.defaults.splitPerson));
-  const displayNote = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
+  const noteText = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
   let id, rec;
   if (paid) {
     rememberSplitPerson(person);
@@ -820,8 +925,8 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
   }
   if (id && chat) lastTxn[chat] = rec;
-  const body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: displayNote, date });
-  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}\n\n${EDIT_HINT}`) : null;
+  const body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: noteText, date });
+  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}\n\n${EDIT_HINT}`, id ? loggedKb() : undefined) : null;
   if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
