@@ -696,6 +696,13 @@ async function askConfirm(chatId, receipt, parsed, account) {
   const mid = await send(chatId, confirmText(receipt, parsed, account), confirmKb());
   confirming[chatId] = { receipt, parsed, account, promptMid: mid };
 }
+// If the chosen card belongs to someone else, ask how to split (they paid); otherwise normal confirm.
+// Used after a card is picked from the buttons, so that path gets owner detection too.
+async function confirmOrOwnerPaid(chatId, receipt, parsed, account) {
+  const owner = ownerOf(account);
+  if (owner && !parsed.paid) return await askOwnerPaid(chatId, receipt, parsed, account, owner);
+  return await askConfirm(chatId, receipt, parsed, account);
+}
 // Re-draw the live preview in place after an edit.
 async function rerenderConfirm(chatId) {
   const c = confirming[chatId];
@@ -770,13 +777,13 @@ async function handleCardAnswer(chatId, text) {
     const account = await createNamedAccount(raw);
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
     delete pending[chatId];
-    return await askConfirm(chatId, p.receipt, p.parsed, account); // confirm screen -> split buttons available
+    return await confirmOrOwnerPaid(chatId, p.receipt, p.parsed, account); // confirm screen -> split buttons available
   }
   const account = resolveAccount(raw);
   if (account) {
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
     delete pending[chatId];
-    return await askConfirm(chatId, p.receipt, p.parsed, account);
+    return await confirmOrOwnerPaid(chatId, p.receipt, p.parsed, account);
   }
   // Not a card name. The user likely moved on — reroute a new expense or an edit of the last txn
   // instead of trapping them on the card question.
