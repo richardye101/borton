@@ -155,6 +155,23 @@ function extractPaid(text, strict) {
   return null;
 }
 
+// Strip machine directives (card routing + split/paid keywords) from free text so a stored note
+// keeps only the human description ("neutrogena face cleanser"), not "... on amex split w tia".
+function stripControlWords(text, cardTokens = []) {
+  let s = ` ${text || ''} `;
+  s = s.replace(/\s+split(?:\s+(?:with|w\/?)\s+[a-z][\w'-]*)?(?=\s)/gi, ' '); // "split", "split with X"
+  s = s.replace(/\s+(?:go\s+)?halves?(?=\s)|\s+#split(?=\s)|\s+\/2(?=\s)/gi, ' ');
+  s = s.replace(/\s+paid by\s+[a-z][\w'-]*(?=\s)/gi, ' ');
+  s = s.replace(/\s+(?:i\s+)?owe(?:\s+[a-z][\w'-]*)?(?=\s)/gi, ' ');
+  s = s.replace(/\s+[a-z][\w'-]*\s+paid(?=\s)/gi, ' ');                        // "ryan paid", "she paid"
+  for (const tok of cardTokens) {                                             // "on amex", "using scotia", bare alias
+    if (!tok) continue;
+    const t = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    s = s.replace(new RegExp(`\\s+(?:on|using|used|use|via|with|w\\/?)?\\s*${t}(?=\\s)`, 'gi'), ' ');
+  }
+  return s.replace(/\s+/g, ' ').trim().replace(/^[,;·\s]+|[,;·\s]+$/g, '').trim();
+}
+
 // ---------- Caption parsing (code-side, deterministic) ----------
 function parseCaption(caption) {
   const text = (caption || '').trim();
@@ -162,11 +179,15 @@ function parseCaption(caption) {
   const paidInfo = extractPaid(text, false);
   const split = SPLIT_RE.test(lc) || !!paidInfo;
   const person = (paidInfo && paidInfo.person) || extractPerson(text);
-  let cardAccount = null;
+  let cardAccount = null, matchedAlias = null;
   for (const [alias, acct] of Object.entries(cardmap.aliases).sort((a, b) => b[0].length - a[0].length)) {
-    if (lc.includes(alias)) { cardAccount = acct; break; }
+    if (lc.includes(alias)) { cardAccount = acct; matchedAlias = alias; break; }
   }
-  return { notes: text, split, paid: !!paidInfo, person, cardAccount };
+  // notes = the caption with routing/split directives removed, so the transaction note is just
+  // what you wrote it was ("neutrogena face cleanser"), not the plumbing.
+  const cardTokens = [...(matchedAlias ? matchedAlias.split(/\s+/) : []), ...(cardAccount ? cardAccount.toLowerCase().split(/\s+/) : [])];
+  const notes = stripControlWords(text, cardTokens);
+  return { notes, split, paid: !!paidInfo, person, cardAccount };
 }
 
 // Free-text expense, e.g. "12.50 starbucks on amex split w ryan" — needs a leading
@@ -383,17 +404,37 @@ function loadTxns() {
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
 
+// One-line-per-field "key: value" layout, shared by the confirm preview and the logged receipts.
+function fmtExpense({ total, merchant, category, account, split, paid, person, note, date }) {
+  const half = (Number(total) / 2).toFixed(2);
+  const L = [`Amount: $${Number(total).toFixed(2)}`, `Merchant: ${merchant}`, `Category: ${category}`];
+  if (paid) {
+    L.push(`Paid by: ${person} (you owe $${half})`);
+    L.push(`Account: ${owedAccountFor(person)}`);
+  } else {
+    if (account) L.push(`Card: ${account}`);
+    L.push(`Split: ${split ? `50/50 w/ ${person} — your share $${half}` : 'no'}`);
+  }
+  if (note) L.push(`Note: ${note}`);
+  if (date) L.push(`Date: ${date}`);
+  return L.join('\n');
+}
+const EDIT_HINT = 'Reply to edit or delete — e.g. "category Groceries", "split w/ Ryan", "note: ...", "delete".';
+
 async function finalize(chatId, receipt, parsed, accountName) {
   parsed = maybeAutoSplit(receipt, parsed);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
   const category = guessCategory(receipt, parsed.notes);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
-  let notes = [parsed.notes, items].filter(Boolean).join(' · ');
+  // Prefer what you wrote (the caption) over the receipt's OCR line-items (often cryptic shortcodes
+  // like "NTG HB CLNSR"). Fall back to line-items only when you gave no description.
+  const desc = parsed.notes || items;
+  let notes = desc;
   if (receipt.card_last4) notes += (notes ? ' ' : '') + `[card ****${receipt.card_last4}]`;
   const person = cap(parsed.person || cfg.defaults.splitPerson);
   const total = Number(receipt.total);
   const half = (total / 2).toFixed(2);
-  let txnId, rec, summary;
+  let txnId, rec;
   if (parsed.paid) {
     // Reverse: they paid; you owe your half. Your half -> Owed by {name} (categorized);
     // their half -> {name}'s spend (off-budget). The card `accountName` is irrelevant here (they paid).
@@ -403,17 +444,15 @@ async function finalize(chatId, receipt, parsed, accountName) {
     const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total, payee: receipt.merchant, notes, category, date, personName: person });
     txnId = r.id;
     rec = { id: txnId, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, date, total, payee: receipt.merchant, category, notes, split: false, reverse: true, person, ts: Date.now() };
-    summary = `🔁 $${total.toFixed(2)} · ${receipt.merchant} — ${person} paid\n→ ${category} · you owe $${half} ("${owedName}")\n${date}${items ? '\n🧾 ' + items : ''}`;
   } else {
     if (parsed.split) rememberSplitPerson(person);
     const splitAccountName = parsed.split ? await resolveOwedAccount(person) : null;
     txnId = await logExpense({ accountName, total, payee: receipt.merchant, notes, category, date, split: parsed.split, splitAccountName, splitPersonName: person });
     rec = { id: txnId, account: accountName, date, total, payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
-    const splitLine = parsed.split ? `  ·  split w/ ${person} (your share $${half})` : '  ·  not split';
-    summary = `✅ $${total.toFixed(2)} · ${receipt.merchant}\n→ ${category} · ${accountName}${splitLine}\n${date}${items ? '\n🧾 ' + items : ''}`;
   }
   if (txnId) lastTxn[chatId] = rec;
-  const sentId = await send(chatId, `${summary}\n(reply to edit: note · "category X" · "split w/ NAME" · "NAME paid" · "delete")`);
+  const body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
+  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}\n\n${EDIT_HINT}`);
   if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
@@ -466,13 +505,8 @@ function confirmText(receipt, parsed, account) {
   const cat = guessCategory(receipt, parsed.notes);
   const person = cap(parsed.person || cfg.defaults.splitPerson);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
-  const head = `Log this?\n$${Number(receipt.total).toFixed(2)} · ${receipt.merchant}`;
-  if (parsed.paid) {
-    const half = (Number(receipt.total) / 2).toFixed(2);
-    return `${head}\n🔁 ${person} paid — you owe $${half}\n→ ${cat} · "${owedAccountFor(person)}"${items ? '\n🧾 ' + items : ''}`;
-  }
-  const splitLine = parsed.split ? `  ·  split w/ ${person}` : '  ·  not split';
-  return `${head}\n→ ${cat} · ${account}${splitLine}${items ? '\n🧾 ' + items : ''}`;
+  const note = parsed.notes || items; // your description wins over receipt line-items
+  return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, note })}`;
 }
 // Yes/No plus split controls: one-tap "Split w/ <recent>", "Split w/ …" (type any name), or undo.
 function confirmKb(parsed) {
@@ -625,8 +659,16 @@ async function editTxn(chatId, rec, text) {
     persistTxns();
     return send(chatId, `✂️ Split 50/50 w/ ${person} (your share $${(rec.total / 2).toFixed(2)}).`);
   }
-  const add = raw.replace(/^note:?\s*/i, '').trim();
-  const notes = [rec.notes, add].filter(Boolean).join(' · ');
+  // "note: X" / "notes = X" REPLACES the note (clears it if X is empty); any other free text APPENDS.
+  const noteSet = raw.match(/^notes?\s*[:=]\s*([\s\S]*)$/i);
+  if (noteSet) {
+    const notes = noteSet[1].trim();
+    await api.updateTransaction(id, { notes }); await api.sync();
+    rec.notes = notes;
+    persistTxns();
+    return send(chatId, notes ? `📝 Note set: ${notes}` : '📝 Note cleared.');
+  }
+  const notes = [rec.notes, raw].filter(Boolean).join(' · ');
   await api.updateTransaction(id, { notes }); await api.sync();
   rec.notes = notes;
   persistTxns();
@@ -744,7 +786,7 @@ async function dispatch(chatId, msg) {
   const ft = await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
   if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
-  await send(chatId, 'Send a receipt photo, or just text the expense like "12.50 starbucks on amex split with ryan". I\'ll show a preview to confirm before logging. After one\'s logged, reply within the hour to edit it — free text = note, "category X", "split w/ NAME", "NAME paid", or "delete".');
+  await send(chatId, `Send a receipt photo, or text the expense like "12.50 starbucks on amex split with ryan". I'll preview it before logging. Once logged, ${EDIT_HINT}`);
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -762,7 +804,8 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const person = cap((d.with || d.person || cfg.defaults.splitPerson));
-  let id, rec, line;
+  const displayNote = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
+  let id, rec;
   if (paid) {
     rememberSplitPerson(person);
     const owedName = await resolveOwedAccount(person);
@@ -770,16 +813,15 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total: amount, payee: merchant, notes, category, date, personName: person });
     id = r.id;
     rec = { id, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, date, total: amount, payee: merchant, category, notes, split: false, reverse: true, person, ts: Date.now() };
-    line = `🔁 $${amount.toFixed(2)} · ${merchant} — ${person} paid\n→ ${category} · you owe $${(amount / 2).toFixed(2)} ("${owedName}")`;
   } else {
     if (split) rememberSplitPerson(person);
     const splitAccountName = split ? await resolveOwedAccount(person) : null;
     id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitAccountName, splitPersonName: person });
     rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
-    line = `⚡ $${amount.toFixed(2)} · ${merchant}\n→ ${category} · ${account}${split ? `  ·  split w/ ${person}` : '  ·  not split'}`;
   }
   if (id && chat) lastTxn[chat] = rec;
-  const sentId = chat ? await send(chat, `${line}\n(reply to edit: note · "category X" · "split w/ NAME" · "NAME paid" · "delete")`) : null;
+  const body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: displayNote, date });
+  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}\n\n${EDIT_HINT}`) : null;
   if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
@@ -853,6 +895,12 @@ function selftest() {
   assert(extractPaid('i paid', true) === null, 'strict: "i paid" not reverse');
   assert(extractPaid('loan paid off', true) === null, 'strict: "loan paid off" not reverse (no trailing paid)');
   assert(extractPaid('split with ryan she paid', true)?.person === null, 'strict: combined split + pronoun paid');
+  // Note stripping: the caption's description survives; routing/split directives are removed.
+  assert(stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']) === 'neutrogena face cleanser', 'strip: keeps description, drops card+split: ' + stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']));
+  assert(stripControlWords('dinner with mom, ryan paid', []) === 'dinner with mom', 'strip: keeps "with mom", drops "ryan paid": ' + stripControlWords('dinner with mom, ryan paid', []));
+  assert(stripControlWords('split with ryan on amex', ['amex']) === '', 'strip: pure directives -> empty');
+  const cap1 = parseCaption('neutrogena face cleanser on amex split w ryan');
+  assert(cap1.notes === 'neutrogena face cleanser' && cap1.cardAccount === 'Amex' && cap1.split === true && cap1.person === 'ryan', 'caption: note cleaned + card + split + person: ' + JSON.stringify(cap1));
   console.log('selftest OK');
 }
 if (process.argv[2] === 'selftest') selftest();
