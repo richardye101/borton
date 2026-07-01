@@ -497,8 +497,17 @@ async function finalize(chatId, receipt, parsed, accountName) {
 
 // Re-draw a logged receipt in place from its rec (after a button edit), keeping the ✅/✏️/🗑 row.
 async function rerenderLogged(chatId, mid, rec) {
-  const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, note: displayNote(rec.notes), date: rec.date });
-  await tg('editMessageText', { chat_id: chatId, message_id: mid, text: `${rec.reverse ? '🔁' : '✅'} Logged\n${body}`, reply_markup: loggedKb() }).catch(() => {});
+  let text;
+  if (rec.ownerPaid) { // their card: full charge + your categorized share — keep the "X paid / you owe" framing
+    const owe = ((rec.owedCents || 0) / 100).toFixed(2);
+    const tail = rec.owedCents > 0 ? `\nYou owe: $${owe} → ${owedAccountFor(rec.person)}` : `\nYou owe: nothing (all ${rec.person}'s)`;
+    const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: `${rec.account} (${rec.person}'s)`, note: displayNote(rec.notes), hideSplit: true });
+    text = `✅ Logged — ${rec.person} paid\n${body}${tail}\nDate: ${rec.date}`;
+  } else {
+    const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, note: displayNote(rec.notes), date: rec.date });
+    text = `${rec.reverse ? '🔁' : '✅'} Logged\n${body}`;
+  }
+  await tg('editMessageText', { chat_id: chatId, message_id: mid, text, reply_markup: loggedKb() }).catch(() => {});
 }
 
 // ---- Someone-else's-card flow: they paid; ask how to split before logging. ----
