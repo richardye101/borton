@@ -120,6 +120,16 @@ async function extractReceipt(buf, mime) {
      { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
     RECEIPT_SCHEMA);
 }
+// Voice notes: Gemini transcribes the audio to text, which then runs through the normal free-text
+// pipeline (amount/card/split/paid/owner detection + confirm) exactly like a typed message.
+const TRANSCRIPT_SCHEMA = { type: 'OBJECT', properties: { text: { type: 'STRING', description: 'verbatim transcription of the spoken words' } }, required: ['text'] };
+async function transcribeAudio(buf, mime) {
+  const o = await geminiGenerate(
+    [{ text: 'Transcribe this short voice note verbatim — it describes an expense (amount, merchant, maybe a card or "split"). Return only the spoken words as text; spell out card names as heard.' },
+     { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
+    TRANSCRIPT_SCHEMA);
+  return (o.text || '').trim();
+}
 
 // ---------- Split helpers (person -> "Owed by {name}" / "{name}'s spend" accounts) ----------
 const OWED_FMT = cfg.defaults.owedAccountFormat || 'Owed by {name}';
@@ -616,6 +626,22 @@ async function handlePhoto(chatId, msg) {
   await finalize(chatId, receipt, parsed, account);
 }
 
+// Voice note -> transcribe -> treat as free text (goes through confirm, split, owner detection, etc.).
+async function handleVoice(chatId, msg) {
+  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
+  const v = msg.voice || msg.audio;
+  await send(chatId, '🎙 transcribing…');
+  const f = await tg('getFile', { file_id: v.file_id });
+  const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  const text = await transcribeAudio(buf, v.mime_type || 'audio/ogg');
+  if (!text) return await send(chatId, "Couldn't make out the voice note — try again, or type it.");
+  const ft = await parseExpense(text);
+  if (!ft) return await send(chatId, `🎙 Heard: "${text}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
+  await send(chatId, `🎙 Heard: "${text}"`);
+  return await handleFreeText(chatId, ft);
+}
+
 // confirm=true (manual DM): preview + wait for yes. confirm=false (relay/poorton): log directly.
 async function handleFreeText(chatId, ft, confirm = true) {
   const receipt = { merchant: ft.merchant, total: ft.amount, card_last4: '', date: '', line_items: ft.items || [] };
@@ -919,6 +945,7 @@ async function onRelayPost(post) {
   await react(id, post.message_id, REACT_SEEN);
   try {
     if (post.photo) { await handlePhoto(id, post); await react(id, post.message_id, REACT_DONE); return; } // receipt posted in the channel
+    if (post.voice || post.audio) { await handleVoice(id, post); await react(id, post.message_id, REACT_DONE); return; }
     // Button taps come via callback_query, but accept typed yes/no & card answers too.
     if (editField[id]) { await applyFieldValue(id, text); await react(id, post.message_id, REACT_DONE); return; }
     if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
@@ -1057,6 +1084,7 @@ async function onUpdate(u) {
 
 async function dispatch(chatId, msg) {
   if (msg.photo) return await handlePhoto(chatId, msg);
+  if (msg.voice || msg.audio) return await handleVoice(chatId, msg);
   if (!msg.text) return;
   // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
   // "own wealthsimple = me" clears it.
