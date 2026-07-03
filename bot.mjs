@@ -120,16 +120,6 @@ async function extractReceipt(buf, mime) {
      { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
     RECEIPT_SCHEMA);
 }
-// Voice notes: Gemini transcribes the audio to text, which then runs through the normal free-text
-// pipeline (amount/card/split/paid/owner detection + confirm) exactly like a typed message.
-const TRANSCRIPT_SCHEMA = { type: 'OBJECT', properties: { text: { type: 'STRING', description: 'verbatim transcription of the spoken words' } }, required: ['text'] };
-async function transcribeAudio(buf, mime) {
-  const o = await geminiGenerate(
-    [{ text: 'Transcribe this short voice note verbatim — it describes an expense (amount, merchant, maybe a card or "split"). Return only the spoken words as text; spell out card names as heard.' },
-     { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
-    TRANSCRIPT_SCHEMA);
-  return (o.text || '').trim();
-}
 
 // ---------- Split helpers (person -> "Owed by {name}" / "{name}'s spend" accounts) ----------
 const OWED_FMT = cfg.defaults.owedAccountFormat || 'Owed by {name}';
@@ -279,6 +269,30 @@ async function geminiFreeText(text) {
   const split = paid || (!!o.split && SPLIT_RE.test(text));
   const person = split ? (o.person || '').trim() || null : null;
   return { amount, split, paid, person, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
+}
+
+// Voice notes: one Gemini call on the audio returns the structured expense (same fields as free
+// text) plus a verbatim transcript — like the photo path, not a two-step transcribe-then-parse.
+const VOICE_SCHEMA = { type: 'OBJECT', properties: { text: { type: 'STRING', description: 'verbatim transcription of the spoken words' }, ...FREETEXT_SCHEMA.properties }, required: ['text'] };
+async function parseVoice(buf, mime) {
+  let o;
+  try {
+    o = await geminiGenerate(
+      [{ text: 'This voice note describes one expense. Transcribe it verbatim into "text", and fill the expense fields from it. Only set split/paid if actually said. If no dollar amount is spoken, set total to 0.' },
+       { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
+      VOICE_SCHEMA);
+  } catch { return { transcript: '', ft: null }; }
+  const transcript = (o.text || '').trim();
+  const amount = Math.abs(Number(o.total));
+  if (!amount || !isFinite(amount)) return { transcript, ft: null };
+  const merchant = (o.merchant || '').trim() || 'Manual entry';
+  const items = (o.items || []).map((x) => String(x).trim()).filter(Boolean);
+  // Same code-side guards as typed text, checked against the transcript (never split on a bare mention).
+  const paid = !!o.paid && !!extractPaid(transcript, false);
+  const split = paid || (!!o.split && SPLIT_RE.test(transcript));
+  const person = split ? (o.person || '').trim() || null : null;
+  const ft = { amount, split, paid, person, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
+  return { transcript, ft };
 }
 
 // ---------- Category guess (light; user/Actual rules can refine) ----------
@@ -626,7 +640,7 @@ async function handlePhoto(chatId, msg) {
   await finalize(chatId, receipt, parsed, account);
 }
 
-// Voice note -> transcribe -> treat as free text (goes through confirm, split, owner detection, etc.).
+// Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
 async function handleVoice(chatId, msg) {
   delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
   const v = msg.voice || msg.audio;
@@ -634,11 +648,10 @@ async function handleVoice(chatId, msg) {
   const f = await tg('getFile', { file_id: v.file_id });
   const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
   const buf = Buffer.from(await r.arrayBuffer());
-  const text = await transcribeAudio(buf, v.mime_type || 'audio/ogg');
-  if (!text) return await send(chatId, "Couldn't make out the voice note — try again, or type it.");
-  const ft = await parseExpense(text);
-  if (!ft) return await send(chatId, `🎙 Heard: "${text}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
-  await send(chatId, `🎙 Heard: "${text}"`);
+  const { transcript, ft } = await parseVoice(buf, v.mime_type || 'audio/ogg');
+  if (!transcript) return await send(chatId, "Couldn't make out the voice note — try again, or type it.");
+  if (!ft) return await send(chatId, `🎙 Heard: "${transcript}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
+  await send(chatId, `🎙 Heard: "${transcript}"`);
   return await handleFreeText(chatId, ft);
 }
 
