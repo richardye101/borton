@@ -59,6 +59,16 @@ function cardKb() {
   rows.push([{ text: '➕ Other (new account)', callback_data: 'card:__new__' }]);
   return { inline_keyboard: rows };
 }
+// Asked right after a brand-new account is created, so ownership (and therefore split
+// prompting via cardmap.owners) is set up on the very first charge, not a manual follow-up.
+function newAccountOwnerKb(defaultPerson) {
+  return {
+    inline_keyboard: [
+      [{ text: '🙋 Mine', callback_data: 'newacct:mine' }, { text: `👤 ${defaultPerson}'s`, callback_data: 'newacct:owner' }],
+      [{ text: '✏️ Someone else…', callback_data: 'newacct:other' }],
+    ],
+  };
+}
 const dropKb = (chatId, mid) => tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid }).catch(() => {});
 // Reaction feedback: 👀 on receipt, 👍 when done. (Telegram's allowed reaction set
 // excludes ✅, so 👍 stands in for the "done" check.) Pass '' to clear.
@@ -820,12 +830,25 @@ async function createNamedAccount(name) {
 async function handleCardAnswer(chatId, text) {
   const p = pending[chatId];
   const raw = text.trim();
+  // Ownership question after a brand-new account: any typed reply here names the owner
+  // (reached either directly, or after tapping "✏️ Someone else…").
+  if (p.awaitNewAccountOwner) {
+    const person = personName(raw);
+    if (!person) { await send(chatId, "Didn't catch a name — try again, or tap a button above."); return; }
+    cardmap.owners = cardmap.owners || {};
+    cardmap.owners[p.newAccount] = person;
+    saveCardmap();
+    const { receipt, parsed, newAccount } = p;
+    delete pending[chatId];
+    return await confirmOrOwnerPaid(chatId, receipt, parsed, newAccount); // owner now set -> this triggers the split prompt
+  }
   // "➕ Other" path: this reply is a brand-new account name.
   if (p.awaitNewAccount) {
     const account = await createNamedAccount(raw);
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
-    delete pending[chatId];
-    return await confirmOrOwnerPaid(chatId, p.receipt, p.parsed, account); // confirm screen -> split buttons available
+    const defaultPerson = cap(lastSplitPerson() || cfg.defaults.splitPerson);
+    pending[chatId] = { ...p, awaitNewAccount: false, awaitNewAccountOwner: true, newAccount: account };
+    return await send(chatId, `Created "${account}". Whose card is it?`, newAccountOwnerKb(defaultPerson));
   }
   const account = resolveAccount(raw);
   if (account) {
@@ -1011,6 +1034,19 @@ async function onCallback(cq) {
       const ans = data.slice(5);
       if (ans === '__new__') { pending[chatId].awaitNewAccount = true; await send(chatId, "Type the new account name (I'll create it in Actual):"); }
       else await handleCardAnswer(chatId, ans);
+    } else if (data.startsWith('newacct:') && pending[chatId]?.awaitNewAccountOwner) { // whose card is the new account?
+      await dropKb(chatId, mid);
+      const p = pending[chatId];
+      const choice = data.slice(8); // mine | owner | other
+      if (choice === 'other') { await send(chatId, 'Type their name:'); return; } // next text reply names them (handleCardAnswer)
+      if (choice === 'owner') {
+        cardmap.owners = cardmap.owners || {};
+        cardmap.owners[p.newAccount] = cap(lastSplitPerson() || cfg.defaults.splitPerson);
+        saveCardmap();
+      } // 'mine': leave cardmap.owners unset for this account — defaults to yours
+      const { receipt, parsed, newAccount } = p;
+      delete pending[chatId];
+      await confirmOrOwnerPaid(chatId, receipt, parsed, newAccount);
     } else if (data === 'e:menu') { // ✏️ Edit -> show the field picker on this message
       const c = confirming[chatId];
       const rec = (c && c.promptMid === mid) ? null : msgTxn[mid];
@@ -1244,6 +1280,11 @@ function selftest() {
   cardmap.owners = { 'Wealthsimple VIP': 'Tia' };
   assert(ownerOf('wealthsimple vip') === 'Tia' && ownerOf('Amex') === null, 'ownerOf resolves owned cards, null otherwise');
   delete cardmap.owners;
+  // New-account ownership buttons: callback_data must round-trip through the 'newacct:'.length
+  // slice in onCallback (data.slice(8)) — a prefix-length typo here silently breaks the button.
+  const nak = newAccountOwnerKb('Tia');
+  const choices = nak.inline_keyboard.flat().map((b) => b.callback_data.slice(8));
+  assert(choices.join(',') === 'mine,owner,other', "newacct button choices parse via slice(8): " + choices.join(','));
   // Note stripping: the caption's description survives; routing/split directives are removed.
   assert(stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']) === 'neutrogena face cleanser', 'strip: keeps description, drops card+split: ' + stripControlWords('neutrogena face cleanser on amex split w ryan', ['amex']));
   assert(stripControlWords('dinner with mom, ryan paid', []) === 'dinner with mom', 'strip: keeps "with mom", drops "ryan paid": ' + stripControlWords('dinner with mom, ryan paid', []));
