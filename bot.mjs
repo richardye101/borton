@@ -53,7 +53,15 @@ async function send(chatId, text, reply_markup) {
 // Inline-keyboard widgets (tappable buttons -> callback_query).
 const YESNO_KB = { inline_keyboard: [[{ text: '✅ Yes', callback_data: 'c:y' }, { text: '❌ No', callback_data: 'c:n' }]] };
 function cardKb() {
-  const accounts = [...new Set(Object.values(cardmap.aliases))].filter((a) => `card:${a}`.length <= 64);
+  // Offer real, open accounts straight from Actual (so the list stays current),
+  // minus the internal split-tracking accounts (Owed by … / …'s spend). Falls
+  // back to the cardmap aliases if Actual hasn't loaded yet.
+  const live = ACCOUNTS.length
+    ? ACCOUNTS.filter((a) => !a.closed).map((a) => a.name)
+    : [...new Set(Object.values(cardmap.aliases))];
+  const accounts = [...new Set(live)]
+    .filter((n) => !isHelperAccount(n))
+    .filter((n) => `card:${n}`.length <= 64);
   const rows = [];
   for (let i = 0; i < accounts.length; i += 2) rows.push(accounts.slice(i, i + 2).map((a) => ({ text: a, callback_data: `card:${a}` })));
   rows.push([{ text: '➕ Other (new account)', callback_data: 'card:__new__' }]);
@@ -137,6 +145,11 @@ const SPEND_FMT = cfg.defaults.spendAccountFormat || "{name}'s spend";
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 const owedAccountFor = (person) => OWED_FMT.replace('{name}', cap(String(person).trim()));
 const spendAccountFor = (person) => SPEND_FMT.replace('{name}', cap(String(person).trim()));
+// The split-tracking accounts ("Owed by {name}" / "{name}'s spend") are internal —
+// never shown as pickable cards. Build a matcher from the configured formats.
+const fmtToRe = (fmt) => new RegExp('^' + fmt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\{name\\}', '.+') + '$', 'i');
+const OWED_RE = fmtToRe(OWED_FMT), SPEND_RE = fmtToRe(SPEND_FMT);
+const isHelperAccount = (n) => OWED_RE.test(n) || SPEND_RE.test(n);
 // "split with Ryan" / "split w ryan" -> "Ryan"; bare "split" -> null (caller uses the default person)
 function extractPerson(text) {
   const m = (text || '').match(/\bsplit\s+(?:with|w\/?)\s+([a-z][\w'-]*)/i);
@@ -330,7 +343,7 @@ function maybeAutoSplit(receipt, parsed) {
 }
 
 // ---------- Actual ----------
-let ACCT = {}, CAT = {}, TRANSFER_PAYEE = {};
+let ACCT = {}, CAT = {}, TRANSFER_PAYEE = {}, ACCOUNTS = [];
 async function initActual() {
   if (!fs.existsSync(cfg.actual.dataDir)) fs.mkdirSync(cfg.actual.dataDir, { recursive: true });
   await api.init({ dataDir: path.resolve(__dir, cfg.actual.dataDir), serverURL: cfg.actual.serverURL, password: ACTUAL_PASSWORD });
@@ -338,9 +351,16 @@ async function initActual() {
   await refreshActualMaps();
 }
 async function refreshActualMaps() {
-  ACCT = Object.fromEntries((await api.getAccounts()).map((a) => [a.name, a.id]));
+  ACCOUNTS = await api.getAccounts();                 // full objects (name, id, closed, offbudget)
+  ACCT = Object.fromEntries(ACCOUNTS.map((a) => [a.name, a.id]));
   CAT = Object.fromEntries((await api.getCategories()).map((c) => [c.name, c.id]));
   for (const p of await api.getPayees()) if (p.transfer_acct) TRANSFER_PAYEE[p.transfer_acct] = p.id;
+}
+// Existing payee id by name (case-insensitive), creating it if new.
+async function resolvePayeeId(name) {
+  const want = name.trim().toLowerCase();
+  const found = (await api.getPayees()).find((p) => (p.name || '').toLowerCase() === want);
+  return found ? found.id : await api.createPayee({ name: name.trim() });
 }
 // Match an "Owed by {name}" account (case-insensitive) or create it on-budget.
 async function resolveOwedAccount(person) {
@@ -600,6 +620,8 @@ async function applyFieldValue(chatId, text) {
       const name = resolveCategory(value);
       if (!name) return await send(chatId, `No category named "${value}". Tap ✏️ Edit → 🏷 Category to retry.`);
       c.parsed.category = name;
+    } else if (ef.field === 'merchant') {
+      if (value) c.receipt.merchant = value;
     } else if (ef.field === 'note') {
       c.parsed.notes = value;
     } else if (ef.field === 'card') {
@@ -619,6 +641,7 @@ async function applyFieldValue(chatId, text) {
   const rec = msgTxn[ef.mid] || lastTxn[chatId];
   if (!rec) return await send(chatId, "That transaction expired — reply to a newer one.");
   const cmd = ef.field === 'cat' ? `category ${value}`
+    : ef.field === 'merchant' ? `merchant: ${value}`
     : ef.field === 'note' ? `note: ${value}`
     : ef.field === 'card' ? `card ${value}`
     : ef.field === 'person' ? `${value} paid`
@@ -723,7 +746,7 @@ function loggedKb() {
 // Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
 // Category / Split / Paid-by open their own sub-menu (one thing per row → no truncation).
 function fieldMenuKb(reverse) {
-  const rows = [[{ text: '🏷 Category', callback_data: 'e:sub:cat' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
+  const rows = [[{ text: '🏷 Category', callback_data: 'e:sub:cat' }, { text: '🏬 Merchant', callback_data: 'e:set:merchant' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
   rows.push(reverse
     ? [{ text: '👤 Paid by…', callback_data: 'e:sub:person' }]
     : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split…', callback_data: 'e:sub:split' }]);
@@ -825,6 +848,19 @@ async function createNamedAccount(name) {
   await refreshActualMaps();
   ACCT[clean] = ACCT[clean] || id;
   return clean;
+}
+
+// Move a card on/off budget in Actual. Someone else's cards (e.g. Tia's) should be
+// off-budget so their spending never touches your envelopes. "offbudget wealthsimple".
+async function setAccountBudget(cardText, offbudget) {
+  const account = resolveAccount(cardText);
+  const acct = account && ACCOUNTS.find((a) => a.name.toLowerCase() === account.toLowerCase());
+  if (!acct) return { error: `No account matching "${cardText}".` };
+  if (!!acct.offbudget === !!offbudget) return { account, offbudget, already: true };
+  await api.updateAccount(acct.id, { offbudget });
+  await api.sync();
+  await refreshActualMaps();
+  return { account, offbudget };
 }
 
 async function handleCardAnswer(chatId, text) {
@@ -947,6 +983,20 @@ async function editTxn(chatId, rec, text) {
     rebindTxn(id, { ...rec, id: newId, account: acct });
     persistTxns();
     return send(chatId, `💳 Card → ${acct}`);
+  }
+  // Change the merchant/payee. "merchant: X" or "payee X". Updates every leg (split parent,
+  // reverse-split spend leg, owner-paid card+owed legs) so they all show the new payee.
+  const merchM = raw.match(/^(?:merchant|payee)\s*[:=]?\s*(.+)$/i);
+  if (merchM) {
+    const payee = merchM[1].trim();
+    if (!payee) return send(chatId, 'Send a merchant name.');
+    const payeeId = await resolvePayeeId(payee);
+    const ids = [...new Set([id, rec.spendTxnId, rec.cardTxnId, rec.owedTxnId].filter(Boolean))];
+    for (const tid of ids) await api.updateTransaction(tid, { payee: payeeId }).catch(() => {});
+    await api.sync();
+    rec.payee = payee;
+    persistTxns();
+    return send(chatId, `🏬 Merchant → ${payee}`);
   }
   // "note: X" / "notes = X" REPLACES the note (clears it if X is empty); any other free text APPENDS.
   const noteSet = raw.match(/^notes?\s*[:=]\s*([\s\S]*)$/i);
@@ -1088,9 +1138,9 @@ async function onCallback(cq) {
       editField[chatId] = { field, kind, mid };
       const rec = kind === 'logged' ? msgTxn[mid] : null;
       const cur = kind === 'pending'
-        ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
-        : (field === 'cat' ? rec.category : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
-      const prompts = { cat: 'Send the new category', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
+        ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'merchant' ? (c.receipt.merchant || '') : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
+        : (field === 'cat' ? rec.category : field === 'merchant' ? rec.payee : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
+      const prompts = { cat: 'Send the new category', merchant: 'Send the new merchant name', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
       // Plain message (no force_reply — Telegram silently drops force_reply in channels, which read as
       // "nothing happened"). editField is set, so your very next message is taken as the value.
       await send(chatId, `✏️ ${prompts[field] || 'Send the new value'}${cur ? `\n(currently: ${cur})` : ''}`);
@@ -1142,6 +1192,14 @@ async function dispatch(chatId, msg) {
     const res = setOwner(ownM[1], ownM[2]);
     if (!res.error) return await send(chatId, res.person ? `👤 ${res.account} is ${res.person}'s card — charges on it will ask how to split.` : `↩️ ${res.account} is yours now (no owner).`);
     if (/[:=]/.test(msg.text)) return await send(chatId, res.error); // explicit "own X = Y" — surface the error; bare form falls through
+  }
+  // "offbudget wealthsimple" / "onbudget amex" — move a card off/on budget in Actual.
+  const budM = msg.text.match(/^(off|on)[\s-]?budget\s+(.+)$/i);
+  if (budM) {
+    const res = await setAccountBudget(budM[2].trim(), /^off/i.test(budM[1]));
+    if (res.error) return await send(chatId, `⚠️ ${res.error}`);
+    const state = res.offbudget ? 'off-budget' : 'on-budget';
+    return await send(chatId, res.already ? `${res.account} is already ${state}.` : `${res.offbudget ? '📤' : '📥'} ${res.account} is now ${state}.`);
   }
   // A value typed after ✏️ Edit → field goes to that field (must run before the reply/edit routing).
   if (editField[chatId]) return await applyFieldValue(chatId, msg.text);
