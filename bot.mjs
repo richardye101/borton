@@ -257,7 +257,11 @@ function parseFreeText(text) {
 async function parseExpense(text) {
   const ft = parseFreeText(text);
   const descriptive = /[,]|\b(bought|and|for|with)\b/i.test(text) || text.trim().split(/\s+/).length > 5;
-  if (ft && !descriptive) return ft;
+  // Escalate to Gemini when the text is descriptive, OR when the terse parse matched no card (not a
+  // reverse split): a "which card?" prompt is coming anyway, and Gemini recovers the spoken card word
+  // so answering the prompt can learn it — regardless of how tersely the card was worded.
+  const noCard = ft && !ft.cardAccount && !ft.paid;
+  if (ft && !descriptive && !noCard) return ft;
   if (/\d/.test(text)) { const g = await geminiFreeText(text); if (g) return g; }
   return ft; // Gemini unavailable -> fall back to the regex result
 }
