@@ -139,12 +139,13 @@ async function extractReceipt(buf, mime) {
     RECEIPT_SCHEMA);
 }
 
-// ---------- Split helpers (person -> "Owed by {name}" / "{name}'s spend" accounts) ----------
+// ---------- Split helpers (person -> "Owed by {name}" account) ----------
 const OWED_FMT = cfg.defaults.owedAccountFormat || 'Owed by {name}';
+// "{name}'s spend" is retired for new bookings, but kept here so isHelperAccount still hides any
+// leftover spend account (e.g. old cardless-paid entries) from the card pickers.
 const SPEND_FMT = cfg.defaults.spendAccountFormat || "{name}'s spend";
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 const owedAccountFor = (person) => OWED_FMT.replace('{name}', cap(String(person).trim()));
-const spendAccountFor = (person) => SPEND_FMT.replace('{name}', cap(String(person).trim()));
 // The split-tracking accounts ("Owed by {name}" / "{name}'s spend") are internal —
 // never shown as pickable cards. Build a matcher from the configured formats.
 const fmtToRe = (fmt) => new RegExp('^' + fmt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\{name\\}', '.+') + '$', 'i');
@@ -380,18 +381,6 @@ async function resolveOwedAccount(person) {
   ACCT[want] = ACCT[want] || newId;
   return want;
 }
-// Match a "{name}'s spend" account (case-insensitive) or create it OFF-budget (their share of a
-// reverse split is tracked here without touching your budget envelopes).
-async function resolveSpendAccount(person) {
-  const want = spendAccountFor(person);
-  const existing = Object.keys(ACCT).find((n) => n.toLowerCase() === want.toLowerCase());
-  if (existing) return existing;
-  const newId = await api.createAccount({ name: want, offbudget: true }, 0);
-  await api.sync();
-  await refreshActualMaps();
-  ACCT[want] = ACCT[want] || newId;
-  return want;
-}
 async function logExpense({ accountName, total, payee, notes, category, date, split, splitAccountName, splitPersonName }) {
   const acctId = ACCT[accountName];
   if (!acctId) throw new Error(`No account named "${accountName}" in Actual`);
@@ -420,29 +409,6 @@ async function logExpense({ accountName, total, payee, notes, category, date, sp
   await api.sync();
   const created = (await api.getTransactions(acctId, txn.date, txn.date)).find((t) => t.imported_id === importedId);
   return created ? created.id : null;
-}
-
-// Reverse split: SOMEONE ELSE paid a shared expense. Two transactions, both negative:
-//   your half  -> "Owed by {name}" (on-budget, categorized) — your share hits the category, balance goes negative (you owe them)
-//   their half -> "{name}'s spend"  (off-budget, uncategorized) — tracks their share without touching your budget
-// Returns { id (your-half txn, the one edits act on), spendId (their-half txn) }.
-async function logReverseSplit({ owedAccount, spendAccount, total, payee, notes, category, date, personName }) {
-  const owedId = ACCT[owedAccount];
-  const spendId = ACCT[spendAccount];
-  if (!owedId) throw new Error(`No account named "${owedAccount}" in Actual`);
-  if (!spendId) throw new Error(`No account named "${spendAccount}" in Actual`);
-  const cents = Math.round(Number(total) * 100);
-  const half = Math.round(cents / 2);
-  const catId = CAT[category] || null;
-  const stamp = Date.now();
-  const myImported = `bot-${stamp}-${Math.floor(Math.random() * 1e6)}-mine`;
-  const theirImported = `bot-${stamp}-${Math.floor(Math.random() * 1e6)}-theirs`;
-  await api.addTransactions(owedId, [{ account: owedId, date, amount: -half, payee_name: payee, notes: [notes, `your share — ${personName} paid`].filter(Boolean).join(' · '), category: catId, cleared: false, imported_id: myImported }], { runTransfers: true });
-  await api.addTransactions(spendId, [{ account: spendId, date, amount: -(cents - half), payee_name: payee, notes: [notes, `${personName}'s share`].filter(Boolean).join(' · '), cleared: false, imported_id: theirImported }], { runTransfers: true });
-  await api.sync();
-  const mine = (await api.getTransactions(owedId, date, date)).find((t) => t.imported_id === myImported);
-  const theirs = (await api.getTransactions(spendId, date, date)).find((t) => t.imported_id === theirImported);
-  return { id: mine ? mine.id : null, spendId: theirs ? theirs.id : null };
 }
 
 // A charge on someone else's REAL card (they paid). The full charge sits on their card account
@@ -534,14 +500,14 @@ async function finalize(chatId, receipt, parsed, accountName) {
   const half = (total / 2).toFixed(2);
   let txnId, rec;
   if (parsed.paid) {
-    // Reverse: they paid; you owe your half. Your half -> Owed by {name} (categorized);
-    // their half -> {name}'s spend (off-budget). The card `accountName` is irrelevant here (they paid).
+    // They paid a shared expense: full charge on the card they used (off-budget) + your half,
+    // negative & categorized, on Owed by {name}. Reconciles the card to a real statement.
     rememberSplitPerson(person);
     const owedName = await resolveOwedAccount(person);
-    const spendName = await resolveSpendAccount(person);
-    const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total, payee: receipt.merchant, notes, category, date, personName: person });
-    txnId = r.id;
-    rec = { id: txnId, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, date, total, payee: receipt.merchant, category, notes, split: false, reverse: true, person, ts: Date.now() };
+    const myCents = Math.round(total * 100 / 2);
+    const r = await logOwnerPaid({ cardAccount: accountName, owedAccount: owedName, total, myCents, payee: receipt.merchant, notes, category, date, personName: person });
+    txnId = r.owedTxnId || r.cardTxnId;
+    rec = { id: txnId, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account: accountName, ownerPaid: true, owedCents: myCents, date, total, payee: receipt.merchant, category, notes, person, ts: Date.now() };
   } else {
     if (parsed.split) rememberSplitPerson(person);
     const splitAccountName = parsed.split ? await resolveOwedAccount(person) : null;
@@ -549,8 +515,16 @@ async function finalize(chatId, receipt, parsed, accountName) {
     rec = { id: txnId, account: accountName, date, total, payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
   }
   if (txnId) lastTxn[chatId] = rec;
-  const body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
-  const sentId = await send(chatId, `${parsed.paid ? '🔁' : '✅'} Logged\n${body}`, txnId ? loggedKb() : undefined);
+  let header, body;
+  if (rec.ownerPaid) {
+    const oweLine = rec.owedCents > 0 ? `\nYou owe: $${(rec.owedCents / 100).toFixed(2)} → ${owedAccountFor(person)}` : `\nYou owe: nothing (all ${person}'s)`;
+    body = fmtExpense({ total, merchant: receipt.merchant, category, account: `${accountName} (${person}'s)`, note: desc, hideSplit: true }) + oweLine + `\nDate: ${date}`;
+    header = `✅ Logged — ${person} paid`;
+  } else {
+    body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
+    header = '✅ Logged';
+  }
+  const sentId = await send(chatId, `${header}\n${body}`, txnId ? loggedKb() : undefined);
   if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
@@ -715,11 +689,14 @@ async function handleVoiceEdit(chatId, msg) {
 async function handleFreeText(chatId, ft, confirm = true) {
   const receipt = { merchant: ft.merchant, total: ft.amount, card_last4: '', date: '', line_items: ft.items || [] };
   const parsed = { notes: ft.notes || '', split: ft.split, paid: ft.paid, person: ft.person };
-  // Reverse splits don't need a card of yours (they paid) — skip the card prompt entirely.
-  if (!ft.cardAccount && !ft.paid) {
-    if (!confirm) throw new Error(`couldn't match a card in "${ft.merchant}"`);
+  // Every expense now needs a card — including "X paid", which books the full charge on the card they
+  // used so it reconciles. Prompt for it (whose card, for the paid case) if the message didn't name one.
+  if (!ft.cardAccount) {
+    const who = cap(ft.person || cfg.defaults.splitPerson);
+    if (!confirm) throw new Error(ft.paid ? `need the card ${who} paid with` : `couldn't match a card in "${ft.merchant}"`);
     pending[chatId] = { receipt, parsed, last4: null, cardToken: ft.cardToken || null, confirm: true };
-    return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card?`, cardKb());
+    const prompt = ft.paid ? `${who} paid — which card did they use?` : 'Which card?';
+    return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\n${prompt}`, cardKb());
   }
   const owner = ownerOf(ft.cardAccount);
   if (owner && !ft.paid) return await askOwnerPaid(chatId, receipt, parsed, ft.cardAccount, owner); // their card -> they paid; ask
@@ -983,21 +960,21 @@ async function editTxn(chatId, rec, text) {
     return send(chatId, `✏️ Category → ${name}`);
   }
   // Reverse direction (check BEFORE forward split, since "split with ryan he paid" is both-shaped):
-  // someone ELSE paid a shared expense, you owe your half. "NAME paid", "she/he paid", "paid by NAME",
-  // "i owe", "owe NAME" (optionally prefixed with "split with NAME"). Your half -> Owed by {name}
-  // (categorized, negative = you owe); their half -> {name}'s spend (off-budget).
+  // someone ELSE paid a shared expense. Rebook owner-paid: full charge on the card they used
+  // (off-budget) + your half, negative & categorized, on Owed by {name}.
   const paidInfo = extractPaid(lc, true);
   if (paidInfo) {
     const person = personName(paidInfo.person || extractPerson(raw) || rec.person) || cap(cfg.defaults.splitPerson);
     rememberSplitPerson(person);
-    if (rec.reverse) return send(chatId, `Already logged as "${person} paid".`);
+    if (rec.ownerPaid || rec.reverse) return send(chatId, `Already logged as "${person} paid".`);
+    if (!rec.account || !ACCT[rec.account]) return send(chatId, "No card on this one to book the full charge against — set the card first (\"card <name>\").");
     const owedName = await resolveOwedAccount(person);
-    const spendName = await resolveSpendAccount(person);
-    await purgeLegs(rec); // drop the original + any siblings (it was on your/their card; they actually paid)
-    const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, personName: person });
-    rebindTxn(id, { ...rec, id: r.id, spendTxnId: r.spendId, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, account: owedName, spendAccount: spendName, split: false, reverse: true, person });
+    const myCents = Math.round(rec.total * 100 / 2);
+    await purgeLegs(rec); // drop the original + any siblings; rebuild as owner-paid
+    const r = await logOwnerPaid({ cardAccount: rec.account, owedAccount: owedName, total: rec.total, myCents, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, personName: person });
+    rebindTxn(id, { ...rec, id: r.owedTxnId || r.cardTxnId, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, spendTxnId: undefined, ownerPaid: true, owedCents: myCents, reverse: false, split: false, account: rec.account, person });
     persistTxns();
-    return send(chatId, `🔁 ${person} paid — you owe $${(rec.total / 2).toFixed(2)} → ${rec.category} ("${owedName}").`);
+    return send(chatId, `✅ ${person} paid — full charge on ${rec.account}, your $${(rec.total / 2).toFixed(2)} → ${owedName}.`);
   }
   // Forward split: you paid, they owe you half. "split" or "split with NAME".
   const sp = lc.match(/^(?:split|half|\/2)(?:\s+(?:with|w\/?)\s+(.+))?$/);
@@ -1272,7 +1249,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const merchant = (d.merchant || 'Apple Pay').toString().trim() || 'Apple Pay';
   const paid = !!d.paid; // reverse: someone else paid, you owe your half
   const account = (d.card && resolveAccount(String(d.card))) || (d.last4 && cardmap.byLast4[d.last4]) || null;
-  if (!account && !paid) throw new Error(`couldn't match card "${d.card || d.last4 || '?'}"`);
+  if (!account) throw new Error(`couldn't match card "${d.card || d.last4 || '?'}"`); // full charge always lands on a card now
   const date = /^\d{4}-\d{2}-\d{2}$/.test(d.date || '') ? d.date : todayISO();
   const split = !!d.split;
   let notes = (d.note || '').toString().trim();
@@ -1281,26 +1258,19 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const person = personName(d.with || d.person) || cap(cfg.defaults.splitPerson);
   const noteText = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
-  const cardOwner = !paid ? ownerOf(account) : null;
+  // "someone else paid" = the payer named in d.paid/d.with, or (for a normal charge) the card's owner.
+  const payer = paid ? person : ownerOf(account);
   let id, rec;
-  if (paid) {
-    rememberSplitPerson(person);
-    const owedName = await resolveOwedAccount(person);
-    const spendName = await resolveSpendAccount(person);
-    const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total: amount, payee: merchant, notes, category, date, personName: person });
-    id = r.id;
-    rec = { id, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, date, total: amount, payee: merchant, category, notes, split: false, reverse: true, person, ts: Date.now() };
-  } else if (cardOwner) {
-    // Someone else's card via Apple Pay: no buttons to ask how to split, so default to 50/50
-    // (Shortcut can override with "mine": all yours, or "theirs": all theirs). Full charge on their
-    // off-budget card + your share to Owed by {owner} categorized — same ledger as the tap-through flow.
-    // ponytail: 50/50 default; pass d.mine / d.theirs from the Shortcut to shift it.
+  if (payer) {
+    // Full charge on the payer's off-budget card + your share to Owed by {payer}, categorized. No
+    // buttons in a POST, so default 50/50 — the Shortcut can send "mine" (all yours) / "theirs" (all theirs).
+    // ponytail: 50/50 default; pass d.mine / d.theirs to shift it.
     const myCents = d.theirs ? 0 : d.mine ? Math.round(amount * 100) : Math.round(amount * 100 / 2);
-    const owedName = myCents > 0 ? await resolveOwedAccount(cardOwner) : null;
-    const r = await logOwnerPaid({ cardAccount: account, owedAccount: owedName, total: amount, myCents, payee: merchant, notes, category, date, personName: cardOwner });
-    rememberSplitPerson(cardOwner);
+    const owedName = myCents > 0 ? await resolveOwedAccount(payer) : null;
+    const r = await logOwnerPaid({ cardAccount: account, owedAccount: owedName, total: amount, myCents, payee: merchant, notes, category, date, personName: payer });
+    rememberSplitPerson(payer);
     id = r.owedTxnId || r.cardTxnId;
-    rec = { id, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account, ownerPaid: true, owedCents: myCents, date, total: amount, payee: merchant, category, notes, person: cardOwner, ts: Date.now() };
+    rec = { id, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account, ownerPaid: true, owedCents: myCents, date, total: amount, payee: merchant, category, notes, person: payer, ts: Date.now() };
   } else {
     if (split) rememberSplitPerson(person);
     const splitAccountName = split ? await resolveOwedAccount(person) : null;
@@ -1378,7 +1348,6 @@ function selftest() {
   const b = parseFreeText('paid $7 for coffee');
   assert(b && b.amount === 7 && b.split === false && b.paid === false, '$amount mid-string, no split/paid');
   // Reverse direction ("someone else paid").
-  assert(spendAccountFor('ryan') === "Ryan's spend", 'spend account name: ' + spendAccountFor('ryan'));
   const c = parseFreeText('$50 dinner split with ryan, she paid');
   assert(c && c.amount === 50 && c.paid === true, 'reverse: paid detected');
   assert(c.person === 'ryan', 'reverse: pronoun "she" resolves to named "ryan": ' + c.person);
