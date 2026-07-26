@@ -673,19 +673,35 @@ async function handlePhoto(chatId, msg) {
   await finalize(chatId, receipt, parsed, account);
 }
 
-// Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
-async function handleVoice(chatId, msg) {
-  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
+// Download a Telegram voice/audio note and run it through Gemini -> { transcript, ft }.
+async function transcribeVoiceNote(msg) {
   const v = msg.voice || msg.audio;
-  await send(chatId, '🎙 transcribing…');
   const f = await tg('getFile', { file_id: v.file_id });
   const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
   const buf = Buffer.from(await r.arrayBuffer());
-  const { transcript, ft } = await parseVoice(buf, v.mime_type || 'audio/ogg');
+  return parseVoice(buf, v.mime_type || 'audio/ogg');
+}
+// Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
+async function handleVoice(chatId, msg) {
+  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
+  await send(chatId, '🎙 transcribing…');
+  const { transcript, ft } = await transcribeVoiceNote(msg);
   if (!transcript) return await send(chatId, "Couldn't make out the voice note — try again, or type it.");
   if (!ft) return await send(chatId, `🎙 Heard: "${transcript}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
   await send(chatId, `🎙 Heard: "${transcript}"`);
   return await handleFreeText(chatId, ft);
+}
+// A voice note sent while awaiting an ✏️ Edit value — or as a reply to a logged receipt — is the
+// spoken note/value, NOT a new expense. Transcribe and route it there. Returns true if it handled it.
+async function handleVoiceEdit(chatId, msg) {
+  const editReply = msg.reply_to_message && (msgTxn[msg.reply_to_message.message_id] || lastTxn[chatId]);
+  if (!editField[chatId] && !editReply) return false;
+  await send(chatId, '🎙 transcribing…');
+  const { transcript } = await transcribeVoiceNote(msg);
+  if (!transcript) { await send(chatId, "Couldn't make out the voice note — try again, or type it."); return true; }
+  if (editField[chatId]) await applyFieldValue(chatId, transcript);
+  else await editTxn(chatId, editReply, transcript);
+  return true;
 }
 
 // confirm=true (manual DM): preview + wait for yes. confirm=false (relay/poorton): log directly.
@@ -1031,7 +1047,10 @@ async function onRelayPost(post) {
   await react(id, post.message_id, REACT_SEEN);
   try {
     if (post.photo) { await handlePhoto(id, post); await react(id, post.message_id, REACT_DONE); return; } // receipt posted in the channel
-    if (post.voice || post.audio) { await handleVoice(id, post); await react(id, post.message_id, REACT_DONE); return; }
+    if (post.voice || post.audio) {
+      if (!(await handleVoiceEdit(id, post))) await handleVoice(id, post); // editing a note by voice, not a new expense
+      await react(id, post.message_id, REACT_DONE); return;
+    }
     // Button taps come via callback_query, but accept typed yes/no & card answers too.
     if (editField[id]) { await applyFieldValue(id, text); await react(id, post.message_id, REACT_DONE); return; }
     if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
@@ -1183,7 +1202,10 @@ async function onUpdate(u) {
 
 async function dispatch(chatId, msg) {
   if (msg.photo) return await handlePhoto(chatId, msg);
-  if (msg.voice || msg.audio) return await handleVoice(chatId, msg);
+  if (msg.voice || msg.audio) {
+    if (await handleVoiceEdit(chatId, msg)) return; // editing a note by voice, not a new expense
+    return await handleVoice(chatId, msg);
+  }
   if (!msg.text) return;
   // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
   // "own wealthsimple = me" clears it.
