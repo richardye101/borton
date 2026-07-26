@@ -919,6 +919,12 @@ async function handleCardAnswer(chatId, text) {
 
 const editLast = (chatId, text) => editTxn(chatId, lastTxn[chatId], text);
 
+// Delete every leg of a txn — the main one plus any siblings (reverse-split spend leg, owner-paid
+// card+owed legs). Used before a rebuild so a multi-leg txn never leaves an orphan behind.
+async function purgeLegs(rec) {
+  const ids = [...new Set([rec.id, rec.spendTxnId, rec.cardTxnId, rec.owedTxnId].filter(Boolean))];
+  for (const tid of ids) await api.deleteTransaction(tid).catch(() => {});
+}
 // Edit a specific transaction (by its rec): note text, "category X", "split", or "delete".
 async function editTxn(chatId, rec, text) {
   if (!rec || !rec.id) return send(chatId, "I don't have that transaction on hand anymore.");
@@ -926,9 +932,7 @@ async function editTxn(chatId, rec, text) {
   const raw = text.trim();
   const lc = raw.toLowerCase();
   if (['delete', 'undo', 'remove'].includes(lc)) {
-    // Remove every leg: the main txn plus any split/owner-paid siblings (reverse split, owner-paid card+owed).
-    const ids = [...new Set([id, rec.spendTxnId, rec.cardTxnId, rec.owedTxnId].filter(Boolean))];
-    for (const tid of ids) await api.deleteTransaction(tid).catch(() => {});
+    await purgeLegs(rec);
     await api.sync();
     if (lastTxn[chatId]?.id === id) delete lastTxn[chatId];
     persistTxns();
@@ -966,9 +970,9 @@ async function editTxn(chatId, rec, text) {
     if (rec.reverse) return send(chatId, `Already logged as "${person} paid".`);
     const owedName = await resolveOwedAccount(person);
     const spendName = await resolveSpendAccount(person);
-    await api.deleteTransaction(id); // drop the original (it was on your card; they actually paid)
+    await purgeLegs(rec); // drop the original + any siblings (it was on your/their card; they actually paid)
     const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, personName: person });
-    rebindTxn(id, { ...rec, id: r.id, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, split: false, reverse: true, person });
+    rebindTxn(id, { ...rec, id: r.id, spendTxnId: r.spendId, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, account: owedName, spendAccount: spendName, split: false, reverse: true, person });
     persistTxns();
     return send(chatId, `🔁 ${person} paid — you owe $${(rec.total / 2).toFixed(2)} → ${rec.category} ("${owedName}").`);
   }
@@ -980,9 +984,9 @@ async function editTxn(chatId, rec, text) {
     rememberSplitPerson(person);
     const splitAccountName = await resolveOwedAccount(person);
     // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
-    await api.deleteTransaction(id);
+    await purgeLegs(rec);
     const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true, splitAccountName, splitPersonName: person });
-    rebindTxn(id, { ...rec, id: newId, split: true, person });
+    rebindTxn(id, { ...rec, id: newId, spendTxnId: undefined, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, split: true, person });
     persistTxns();
     return send(chatId, `✂️ Split 50/50 w/ ${person} (your share $${(rec.total / 2).toFixed(2)}).`);
   }
@@ -994,9 +998,9 @@ async function editTxn(chatId, rec, text) {
     if (!acct) return send(chatId, `No account matching "${cardM[1].trim()}". Try a card alias or exact name.`);
     const cardPerson = personName(rec.person) || cap(cfg.defaults.splitPerson);
     const splitAccountName = rec.split ? await resolveOwedAccount(cardPerson) : null;
-    await api.deleteTransaction(id);
+    await purgeLegs(rec); // clear any owner-paid card+owed legs so changing the card leaves no orphan
     const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitAccountName, splitPersonName: cardPerson });
-    rebindTxn(id, { ...rec, id: newId, account: acct });
+    rebindTxn(id, { ...rec, id: newId, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, account: acct });
     persistTxns();
     return send(chatId, `💳 Card → ${acct}`);
   }
@@ -1254,6 +1258,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const category = guessCategory({ merchant, line_items: [] }, notes);
   const person = personName(d.with || d.person) || cap(cfg.defaults.splitPerson);
   const noteText = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
+  const cardOwner = !paid ? ownerOf(account) : null;
   let id, rec;
   if (paid) {
     rememberSplitPerson(person);
@@ -1262,6 +1267,17 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     const r = await logReverseSplit({ owedAccount: owedName, spendAccount: spendName, total: amount, payee: merchant, notes, category, date, personName: person });
     id = r.id;
     rec = { id, spendTxnId: r.spendId, account: owedName, spendAccount: spendName, date, total: amount, payee: merchant, category, notes, split: false, reverse: true, person, ts: Date.now() };
+  } else if (cardOwner) {
+    // Someone else's card via Apple Pay: no buttons to ask how to split, so default to 50/50
+    // (Shortcut can override with "mine": all yours, or "theirs": all theirs). Full charge on their
+    // off-budget card + your share to Owed by {owner} categorized — same ledger as the tap-through flow.
+    // ponytail: 50/50 default; pass d.mine / d.theirs from the Shortcut to shift it.
+    const myCents = d.theirs ? 0 : d.mine ? Math.round(amount * 100) : Math.round(amount * 100 / 2);
+    const owedName = myCents > 0 ? await resolveOwedAccount(cardOwner) : null;
+    const r = await logOwnerPaid({ cardAccount: account, owedAccount: owedName, total: amount, myCents, payee: merchant, notes, category, date, personName: cardOwner });
+    rememberSplitPerson(cardOwner);
+    id = r.owedTxnId || r.cardTxnId;
+    rec = { id, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account, ownerPaid: true, owedCents: myCents, date, total: amount, payee: merchant, category, notes, person: cardOwner, ts: Date.now() };
   } else {
     if (split) rememberSplitPerson(person);
     const splitAccountName = split ? await resolveOwedAccount(person) : null;
@@ -1269,8 +1285,16 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
   }
   if (id && chat) lastTxn[chat] = rec;
-  const body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: noteText, date });
-  const sentId = chat ? await send(chat, `${paid ? '🔁' : '⚡'} Logged\n${body}`, id ? loggedKb() : undefined) : null;
+  let header, body;
+  if (rec.ownerPaid) {
+    const oweLine = rec.owedCents > 0 ? `\nYou owe: $${(rec.owedCents / 100).toFixed(2)} → ${owedAccountFor(rec.person)}` : `\nYou owe: nothing (all ${rec.person}'s)`;
+    body = fmtExpense({ total: amount, merchant, category, account: `${account} (${rec.person}'s)`, note: noteText, hideSplit: true }) + oweLine + `\nDate: ${date}`;
+    header = `⚡ Logged — ${rec.person} paid`;
+  } else {
+    body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: noteText, date });
+    header = `${paid ? '🔁' : '⚡'} Logged`;
+  }
+  const sentId = chat ? await send(chat, `${header}\n${body}`, id ? loggedKb() : undefined) : null;
   if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
