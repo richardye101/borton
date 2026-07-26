@@ -291,7 +291,10 @@ async function geminiFreeText(text) {
   const paid = !!o.paid && !!extractPaid(text, false);
   const split = paid || (!!o.split && SPLIT_RE.test(text));
   const person = split ? (o.person || '').trim() || null : null;
-  return { amount, split, paid, person, cardAccount: o.card ? resolveAccount(String(o.card)) : null, merchant, items, notes: (o.note || '').trim() };
+  const cardAccount = o.card ? resolveAccount(String(o.card)) : null;
+  // Keep the spoken card word when it didn't resolve, so picking the card at the prompt can learn it.
+  const cardToken = !cardAccount && o.card ? String(o.card).trim().toLowerCase() : null;
+  return { amount, split, paid, person, cardAccount, cardToken, merchant, items, notes: (o.note || '').trim() };
 }
 
 // Voice notes: one Gemini call on the audio returns the structured expense (same fields as free
@@ -711,7 +714,7 @@ async function handleFreeText(chatId, ft, confirm = true) {
   // Reverse splits don't need a card of yours (they paid) — skip the card prompt entirely.
   if (!ft.cardAccount && !ft.paid) {
     if (!confirm) throw new Error(`couldn't match a card in "${ft.merchant}"`);
-    pending[chatId] = { receipt, parsed, last4: null, confirm: true };
+    pending[chatId] = { receipt, parsed, last4: null, cardToken: ft.cardToken || null, confirm: true };
     return await send(chatId, `$${ft.amount.toFixed(2)} · ${ft.merchant}\nWhich card?`, cardKb());
   }
   const owner = ownerOf(ft.cardAccount);
@@ -879,6 +882,19 @@ async function setAccountBudget(cardText, offbudget) {
   return { account, offbudget };
 }
 
+// Remember a card word the parser couldn't place (e.g. Apple Pay's "Scotia Card") -> the account you
+// picked, so the same word auto-matches next time — the free-text analog of byLast4 learning. Skips
+// generic words that would over-match, and no-ops if it's already mapped.
+const GENERIC_CARD_WORDS = new Set(['card', 'visa', 'mastercard', 'credit', 'debit', 'cc', 'the card', 'credit card', 'debit card']);
+function learnCardAlias(token, account) {
+  const key = String(token || '').trim().toLowerCase();
+  if (!key || /^\d+$/.test(key) || GENERIC_CARD_WORDS.has(key)) return false;
+  cardmap.aliases = cardmap.aliases || {};
+  if (cardmap.aliases[key] === account) return false;
+  cardmap.aliases[key] = account;
+  saveCardmap();
+  return true;
+}
 async function handleCardAnswer(chatId, text) {
   const p = pending[chatId];
   const raw = text.trim();
@@ -898,6 +914,7 @@ async function handleCardAnswer(chatId, text) {
   if (p.awaitNewAccount) {
     const account = await createNamedAccount(raw);
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
+    if (p.cardToken) learnCardAlias(p.cardToken, account);
     const defaultPerson = cap(lastSplitPerson() || cfg.defaults.splitPerson);
     pending[chatId] = { ...p, awaitNewAccount: false, awaitNewAccountOwner: true, newAccount: account };
     return await send(chatId, `Created "${account}". Whose card is it?`, newAccountOwnerKb(defaultPerson));
@@ -905,7 +922,9 @@ async function handleCardAnswer(chatId, text) {
   const account = resolveAccount(raw);
   if (account) {
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
+    const learned = p.cardToken && learnCardAlias(p.cardToken, account);
     delete pending[chatId];
+    if (learned) await send(chatId, `👍 I'll remember "${p.cardToken}" → ${account}.`);
     return await confirmOrOwnerPaid(chatId, p.receipt, p.parsed, account);
   }
   // Not a card name. The user likely moved on — reroute a new expense or an edit of the last txn
@@ -1384,6 +1403,11 @@ function selftest() {
   cardmap.owners = { 'Wealthsimple VIP': 'Tia' };
   assert(ownerOf('wealthsimple vip') === 'Tia' && ownerOf('Amex') === null, 'ownerOf resolves owned cards, null otherwise');
   delete cardmap.owners;
+  // Card-alias learning: a distinct card word is remembered; generic words / numbers are not.
+  cardmap.aliases = { ...cardmap.aliases };
+  assert(learnCardAlias('Scotia Card', 'Scotiabank VI') === true && cardmap.aliases['scotia card'] === 'Scotiabank VI', 'learnCardAlias remembers a distinct card word');
+  assert(learnCardAlias('scotia card', 'Scotiabank VI') === false, 'learnCardAlias is a no-op when already mapped');
+  assert(learnCardAlias('visa', 'Amex') === false && learnCardAlias('1234', 'Amex') === false, 'learnCardAlias skips generic words and pure numbers');
   // New-account ownership buttons: callback_data must round-trip through the 'newacct:'.length
   // slice in onCallback (data.slice(8)) — a prefix-length typo here silently breaks the button.
   const nak = newAccountOwnerKb('Tia');
