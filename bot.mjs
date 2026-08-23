@@ -467,6 +467,17 @@ function loadTxns() {
 }
 
 function todayISO() { return new Date().toISOString().slice(0, 10); }
+// Gemini reads a well-formed but wrong YEAR off some receipts ("2023-08-26" for a 2026 charge),
+// which buries the txn years back in Actual where you never see it. A shape check isn't enough —
+// only trust a receipt date inside a plausible window, else fall back to today.
+// ponytail: fixed window, widen PAST_DAYS if you start logging older receipts.
+const DATE_FUTURE_DAYS = 2, DATE_PAST_DAYS = 60;
+function safeDate(d) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d || '')) return todayISO();
+  const days = (Date.parse(`${d}T00:00:00Z`) - Date.parse(`${todayISO()}T00:00:00Z`)) / 86400000;
+  if (!isFinite(days) || days > DATE_FUTURE_DAYS || days < -DATE_PAST_DAYS) return todayISO();
+  return d;
+}
 
 // One-line-per-field "key: value" layout, shared by the confirm preview and the logged receipts.
 function fmtExpense({ total, merchant, category, account, split, paid, person, note, date, hideSplit }) {
@@ -487,7 +498,7 @@ const EDIT_HINT = 'Reply to edit or delete — e.g. "category Groceries", "split
 
 async function finalize(chatId, receipt, parsed, accountName) {
   parsed = maybeAutoSplit(receipt, parsed);
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
+  const date = safeDate(receipt.date);
   const category = parsed.category || guessCategory(receipt, parsed.notes);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   // Prefer what you wrote (the caption) over the receipt's OCR line-items (often cryptic shortcodes
@@ -567,7 +578,7 @@ async function finalizeOwnerPaid(chatId, choice) {
   if (!op) return;
   delete ownerPending[chatId];
   const { receipt, parsed, account, owner } = op;
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(receipt.date || '') ? receipt.date : todayISO();
+  const date = safeDate(receipt.date);
   const total = Number(receipt.total);
   const cents = Math.round(total * 100);
   const myCents = choice === 'mine' ? cents : choice === 'split' ? Math.round(cents / 2) : 0;
@@ -1250,7 +1261,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const paid = !!d.paid; // reverse: someone else paid, you owe your half
   const account = (d.card && resolveAccount(String(d.card))) || (d.last4 && cardmap.byLast4[d.last4]) || null;
   if (!account) throw new Error(`couldn't match card "${d.card || d.last4 || '?'}"`); // full charge always lands on a card now
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(d.date || '') ? d.date : todayISO();
+  const date = safeDate(d.date);
   const split = !!d.split;
   let notes = (d.note || '').toString().trim();
   if (d.last4) notes += (notes ? ' ' : '') + `[card ****${d.last4}]`;
@@ -1356,6 +1367,15 @@ function selftest() {
   assert(d && d.paid === true && d.person === 'ryan', 'reverse: "NAME paid" without "split"');
   const e = parseFreeText('$20 lunch i paid on amex');
   assert(e && e.paid === false, '"I paid" is NOT reverse (you paid): ' + JSON.stringify(e));
+  // Date sanity: a well-formed date with a bad OCR year must not be trusted (the "missing txn" bug).
+  const shift = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+  assert(safeDate(shift(0)) === todayISO(), 'today passes through');
+  assert(safeDate(shift(-3)) === shift(-3), 'a 3-day-old receipt passes through');
+  assert(safeDate('2023-08-26') === todayISO(), 'wrong-year OCR date falls back to today');
+  assert(safeDate(shift(-400)) === todayISO(), 'far-past date falls back to today');
+  assert(safeDate(shift(30)) === todayISO(), 'far-future date falls back to today');
+  assert(safeDate('') === todayISO() && safeDate(null) === todayISO(), 'empty/null -> today');
+  assert(safeDate('26-08-2023') === todayISO(), 'malformed shape -> today');
   assert(extractPaid('she paid', true)?.person === null, 'strict: bare pronoun "she paid"');
   assert(extractPaid('ryan paid', true)?.person === 'ryan', 'strict: "ryan paid"');
   assert(extractPaid('i paid', true) === null, 'strict: "i paid" not reverse');
