@@ -114,20 +114,25 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 // Fall back to lighter, less-contended models (lite variants rarely 503) rather than other popular flash models.
 const GEMINI_MODELS = [cfg.gemini.model, ...(cfg.gemini.fallbackModels || ['gemini-2.0-flash-lite', 'gemini-flash-lite-latest', 'gemini-2.0-flash'])]
   .filter((m, i, a) => m && a.indexOf(m) === i);
+const GEMINI_TIMEOUT_MS = 60_000;
 async function geminiGenerate(parts, schema) {
   const body = { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', responseSchema: schema } };
+  const signal = AbortSignal.timeout(GEMINI_TIMEOUT_MS);
   let lastErr = 'unknown';
   for (const model of GEMINI_MODELS) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body) });
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body), signal });
         if (r.status === 429 || r.status >= 500) { lastErr = `${model} HTTP ${r.status}`; await sleep(700 * (attempt + 1)); continue; }
         const d = await r.json();
         const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!t) { lastErr = `${model}: ${JSON.stringify(d).slice(0, 150)}`; break; } // bad response -> try next model
         return JSON.parse(t);
-      } catch (e) { lastErr = `${model}: ${e.message}`; await sleep(700); }
+      } catch (e) {
+        if (signal.aborted) throw new Error(`Gemini timed out after ${GEMINI_TIMEOUT_MS / 1000}s`);
+        lastErr = `${model}: ${e.message}`; await sleep(700);
+      }
     }
   }
   throw new Error('Gemini unavailable (' + lastErr + ')');
@@ -645,9 +650,16 @@ async function applyFieldValue(chatId, text) {
 async function handlePhoto(chatId, msg) {
   delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId]; // a fresh receipt supersedes any unanswered prompt
   const fileId = msg.photo[msg.photo.length - 1].file_id; // largest
-  await send(chatId, '📸 reading receipt…');
-  const { buf, mime } = await downloadPhoto(fileId);
-  const receipt = await extractReceipt(buf, mime);
+  const statusMid = await send(chatId, '📸 reading receipt…');
+  let receipt;
+  try {
+    const { buf, mime } = await downloadPhoto(fileId);
+    receipt = await extractReceipt(buf, mime);
+    if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: '📸 Receipt read.' }).catch(() => {});
+  } catch (e) {
+    if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: "⚠️ Couldn't read that receipt." }).catch(() => {});
+    throw e;
+  }
   const parsed = parseCaption(msg.caption);
   let account = parsed.cardAccount || (receipt.card_last4 && cardmap.byLast4[receipt.card_last4]) || null;
   if (!account) {
@@ -665,22 +677,29 @@ async function handlePhoto(chatId, msg) {
   await finalize(chatId, receipt, parsed, account);
 }
 
-// Download a Telegram voice/audio note and run it through Gemini -> { transcript, ft }.
-async function transcribeVoiceNote(msg) {
-  const v = msg.voice || msg.audio;
-  const f = await tg('getFile', { file_id: v.file_id });
-  const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  return parseVoice(buf, v.mime_type || 'audio/ogg');
+// Download a Telegram voice/audio note, run it through Gemini, and replace the progress message.
+async function transcribeVoiceNote(chatId, msg) {
+  const statusMid = await send(chatId, '🎙 transcribing…');
+  try {
+    const v = msg.voice || msg.audio;
+    const f = await tg('getFile', { file_id: v.file_id });
+    const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
+    const buf = Buffer.from(await r.arrayBuffer());
+    const result = await parseVoice(buf, v.mime_type || 'audio/ogg');
+    const text = result.transcript ? `🎙 Heard: "${result.transcript}"` : "Couldn't make out the voice note — try again, or type it.";
+    if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text }).catch(() => {});
+    return result;
+  } catch (e) {
+    if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: "⚠️ Couldn't transcribe that voice note." }).catch(() => {});
+    throw e;
+  }
 }
 // Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
 async function handleVoice(chatId, msg) {
   delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
-  await send(chatId, '🎙 transcribing…');
-  const { transcript, ft } = await transcribeVoiceNote(msg);
-  if (!transcript) return await send(chatId, "Couldn't make out the voice note — try again, or type it.");
+  const { transcript, ft } = await transcribeVoiceNote(chatId, msg);
+  if (!transcript) return;
   if (!ft) return await send(chatId, `🎙 Heard: "${transcript}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
-  await send(chatId, `🎙 Heard: "${transcript}"`);
   return await handleFreeText(chatId, ft);
 }
 // A voice note sent while awaiting an ✏️ Edit value — or as a reply to a logged receipt — is the
@@ -688,9 +707,8 @@ async function handleVoice(chatId, msg) {
 async function handleVoiceEdit(chatId, msg) {
   const editReply = msg.reply_to_message && (msgTxn[msg.reply_to_message.message_id] || lastTxn[chatId]);
   if (!editField[chatId] && !editReply) return false;
-  await send(chatId, '🎙 transcribing…');
-  const { transcript } = await transcribeVoiceNote(msg);
-  if (!transcript) { await send(chatId, "Couldn't make out the voice note — try again, or type it."); return true; }
+  const { transcript } = await transcribeVoiceNote(chatId, msg);
+  if (!transcript) return true;
   if (editField[chatId]) await applyFieldValue(chatId, transcript);
   else await editTxn(chatId, editReply, transcript);
   return true;
@@ -1346,8 +1364,8 @@ async function main() {
     } catch (e) { console.error('poll error', e.message); await sleep(3000); }
   }
 }
-// `node bot.mjs selftest` — checks the free-text parser without touching Telegram/Actual.
-function selftest() {
+// `node bot.mjs selftest` — checks core behavior without touching Telegram/Actual.
+async function selftest() {
   const assert = (c, m) => { if (!c) { console.error('FAIL:', m); process.exit(1); } };
   assert(parseFreeText('hello there') === null, 'no amount -> null');
   assert(parseFreeText('category Dining') === null, 'no amount -> null (edit-like)');
@@ -1401,6 +1419,7 @@ function selftest() {
   assert(learnCardAlias('Scotia Card', 'Scotiabank VI') === true && cardmap.aliases['scotia card'] === 'Scotiabank VI', 'learnCardAlias remembers a distinct card word');
   assert(learnCardAlias('scotia card', 'Scotiabank VI') === false, 'learnCardAlias is a no-op when already mapped');
   assert(learnCardAlias('visa', 'Amex') === false && learnCardAlias('1234', 'Amex') === false, 'learnCardAlias skips generic words and pure numbers');
+  delete cardmap.aliases['scotia card']; saveCardmap();
   // New-account ownership buttons: callback_data must round-trip through the 'newacct:'.length
   // slice in onCallback (data.slice(8)) — a prefix-length typo here silently breaks the button.
   const nak = newAccountOwnerKb('Tia');
@@ -1412,7 +1431,59 @@ function selftest() {
   assert(stripControlWords('split with ryan on amex', ['amex']) === '', 'strip: pure directives -> empty');
   const cap1 = parseCaption('neutrogena face cleanser on amex split w ryan');
   assert(cap1.notes === 'neutrogena face cleanser' && cap1.cardAccount === 'Amex' && cap1.split === true && cap1.person === 'ryan', 'caption: note cleaned + card + split + person: ' + JSON.stringify(cap1));
+
+  // A completed voice transcription replaces its progress message; it must never leave the chat
+  // looking permanently stuck on "transcribing…" after the note update has already finished.
+  const realFetch = globalThis.fetch;
+  const requests = [];
+  let fixture = 'voice';
+  globalThis.fetch = async (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (String(url).endsWith('/sendMessage')) return { json: async () => ({ ok: true, result: { message_id: 77 } }) };
+    if (String(url).endsWith('/getFile')) return { json: async () => ({ ok: true, result: { file_path: fixture === 'voice' ? 'voice.ogg' : 'receipt.jpg' } }) };
+    if (String(url).includes('/file/bot')) return { arrayBuffer: async () => Buffer.from(fixture) };
+    if (String(url).includes('generativelanguage.googleapis.com')) return {
+      status: 200,
+      json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(fixture === 'voice'
+        ? { text: 'updated note', total: 0, merchant: '', items: [], note: '', card: '', split: false, paid: false, person: '' }
+        : { merchant: 'Test Shop', date: '', total: 12.34, currency: 'CAD', tax: 0, card_last4: '', line_items: [] }) }] } }] }),
+    };
+    if (String(url).endsWith('/editMessageText')) return { json: async () => ({ ok: true }) };
+    throw new Error('Unexpected selftest fetch: ' + url);
+  };
+  try {
+    const voice = await transcribeVoiceNote(42, { voice: { file_id: 'voice-1', mime_type: 'audio/ogg' } });
+    assert(voice.transcript === 'updated note', 'voice transcript returned: ' + voice.transcript);
+    const edit = requests.find((r) => r.url.endsWith('/editMessageText'));
+    const body = edit && JSON.parse(edit.options.body);
+    assert(body?.chat_id === 42 && body?.message_id === 77 && body?.text === '🎙 Heard: "updated note"', 'voice progress message replaced: ' + JSON.stringify(body));
+
+    fixture = 'photo'; requests.length = 0;
+    await handlePhoto(43, { photo: [{ file_id: 'photo-1' }], caption: '' });
+    const photoEdit = requests.find((r) => r.url.endsWith('/editMessageText'));
+    const photoBody = photoEdit && JSON.parse(photoEdit.options.body);
+    assert(photoBody?.chat_id === 43 && photoBody?.message_id === 77 && photoBody?.text === '📸 Receipt read.', 'photo progress message replaced: ' + JSON.stringify(photoBody));
+    delete pending[43];
+
+    // A Gemini socket that stops responding must release the sequential Telegram update loop.
+    const realAbortTimeout = AbortSignal.timeout;
+    AbortSignal.timeout = () => realAbortTimeout(5);
+    globalThis.fetch = (_url, options = {}) => new Promise((_, reject) => {
+      options.signal?.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+    });
+    let timeoutError;
+    try {
+      await Promise.race([
+        geminiGenerate([{ text: 'receipt' }], RECEIPT_SCHEMA),
+        sleep(100).then(() => { throw new Error('selftest deadline expired'); }),
+      ]);
+    } catch (e) { timeoutError = e; }
+    AbortSignal.timeout = realAbortTimeout;
+    assert(/Gemini timed out/i.test(timeoutError?.message || ''), 'hung Gemini request aborts: ' + timeoutError?.message);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
   console.log('selftest OK');
 }
-if (process.argv[2] === 'selftest') selftest();
+if (process.argv[2] === 'selftest') selftest().catch((e) => { console.error(e); process.exit(1); });
 else main().catch((e) => { console.error(e); process.exit(1); });
