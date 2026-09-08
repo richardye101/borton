@@ -6,6 +6,9 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import { createActualTools } from './actual-tools.mjs';
+import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(fs.readFileSync(path.join(__dir, 'config.json'), 'utf8'));
@@ -36,6 +39,49 @@ for (const [k, v] of [['TELEGRAM_BOT_KEY', TELEGRAM_TOKEN], ['GOOGLE_API_KEY', G
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // Actual self-signed cert
 const TG = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+let budgetAgent;
+let agentTools;
+const agentFor = chatId => String(chatId) === String(cfg.telegram.allowedChatId) ? budgetAgent : null;
+// Telegram polling is sequential; ingest shares this queue during confirmations.
+let actualQueue = Promise.resolve();
+const serializeActual = fn => {
+  const guarded = () => {
+    if (agentTools?.hasPendingWrite()) throw new Error('An earlier Actual write is still pending; please wait before retrying.');
+    return fn();
+  };
+  const next = actualQueue.then(guarded, guarded);
+  actualQueue = next.catch(() => {});
+  return next;
+};
+
+function initAgent({ readOnly = false } = {}) {
+  const tools = createActualTools(api, { currency: cfg.defaults.currency || 'CAD' });
+  if (!readOnly) agentTools = tools;
+  return createAgent({ tools,
+    generate: createGeminiGenerate({ apiKey: GEMINI_KEY, models: [...GEMINI_MODELS] }),
+    statePath: readOnly ? null : path.resolve(__dir, cfg.actual.dataDir, 'agent-state.json'),
+    allowedChatId: cfg.telegram.allowedChatId, readOnly,
+    currency: cfg.defaults.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto' });
+}
+async function sendAgentResult(chatId, result) {
+  const chunks = result.text.match(/[\s\S]{1,3400}/gu) || ['No response.'];
+  for (let i = 0; i < chunks.length; i++) {
+    const keyboard = result.planId && i === chunks.length - 1 ? { inline_keyboard: [[
+      { text: 'Confirm', callback_data: `ag:y:${result.planId}` },
+      { text: 'Cancel', callback_data: `ag:n:${result.planId}` },
+    ]] } : undefined;
+    await send(chatId, chunks[i], keyboard);
+  }
+}
+async function runAgent(chatId, text, rec = null) {
+  if (!budgetAgent) return send(chatId, 'The budget assistant is unavailable. Please try again shortly.');
+  if (!agentFor(chatId)) return send(chatId, 'Send budget questions to my authorized direct chat.');
+  if (rec) budgetAgent.remember(chatId, `Receipt reference: ${JSON.stringify({ id: rec.id, cardTxnId: rec.cardTxnId, owedTxnId: rec.owedTxnId, date: rec.date, account: rec.account, payee: rec.payee })}`);
+  const p = budgetAgent.pending(chatId);
+  if (p && /^(?:yes|confirm|ok|okay)$/i.test(text.trim())) return sendAgentResult(chatId, { text: 'Please use Confirm on the full plan above to apply it.', planId: p.id });
+  if (p && /^(?:no|cancel)$/i.test(text.trim())) return sendAgentResult(chatId, await budgetAgent.cancel(chatId, p.id));
+  return sendAgentResult(chatId, await budgetAgent.message(chatId, text));
+}
 
 // ---------- Telegram helpers ----------
 async function tg(method, params) {
@@ -43,11 +89,13 @@ async function tg(method, params) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params || {}),
+    signal: AbortSignal.timeout(method === 'getUpdates' ? 65_000 : 20_000),
   });
   return r.json();
 }
 async function send(chatId, text, reply_markup) {
   const r = await tg('sendMessage', { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
+  if (r?.ok === false) throw new Error('Telegram could not deliver the message.');
   return r?.result?.message_id;
 }
 // Inline-keyboard widgets (tappable buttons -> callback_query).
@@ -89,7 +137,7 @@ async function react(chatId, messageId, emoji) {
 async function downloadPhoto(fileId) {
   const f = await tg('getFile', { file_id: fileId });
   const filePath = f.result.file_path;
-  const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`);
+  const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`, { signal: AbortSignal.timeout(30_000) });
   const buf = Buffer.from(await r.arrayBuffer());
   const mime = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
   return { buf, mime };
@@ -261,6 +309,7 @@ function parseFreeText(text) {
 // Regex handles the terse form ("12.50 starbucks on amex"); anything descriptive
 // (items, prose) escalates to Gemini so the store and items get separated.
 async function parseExpense(text) {
+  if (isAgentRequest(text)) return null;
   const ft = parseFreeText(text);
   const descriptive = /[,]|\b(bought|and|for|with)\b/i.test(text) || text.trim().split(/\s+/).length > 5;
   // Escalate to Gemini when the text is descriptive, OR when the terse parse matched no card (not a
@@ -268,7 +317,7 @@ async function parseExpense(text) {
   // so answering the prompt can learn it — regardless of how tersely the card was worded.
   const noCard = ft && !ft.cardAccount && !ft.paid;
   if (ft && !descriptive && !noCard) return ft;
-  if (/\d/.test(text)) { const g = await geminiFreeText(text); if (g) return g; }
+  if (/\d/.test(text)) { const g = await geminiFreeText(text); if (g === false) return null; if (g) return g; }
   return ft; // Gemini unavailable -> fall back to the regex result
 }
 
@@ -277,6 +326,7 @@ async function parseExpense(text) {
 const FREETEXT_SCHEMA = {
   type: 'OBJECT',
   properties: {
+    isExpense: { type: 'BOOLEAN', description: 'True only when logging a new expense. Questions, requests to find or modify records, budgets, transfers, and conversation are false even if they contain amounts.' },
     total: { type: 'NUMBER', description: 'amount spent' },
     merchant: { type: 'STRING', description: 'the store / payee name ONLY (e.g. "No Frills"), not the items; empty string if not stated' },
     items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'distinct purchased products as short names (e.g. groceries ["eggs","cheese"]). Leave EMPTY for a restaurant meal or single service — that context goes in note, not items.' },
@@ -291,8 +341,9 @@ const FREETEXT_SCHEMA = {
 async function geminiFreeText(text) {
   let o;
   try {
-    o = await geminiGenerate([{ text: `Extract a single expense from this message into the schema. Put only the store/payee name in "merchant" and the purchased items in "items". Message: ${JSON.stringify(text)}` }], FREETEXT_SCHEMA);
+    o = await geminiGenerate([{ text: `Determine whether this message logs a new expense (isExpense). For questions, commands, budget changes or other conversation, set isExpense=false and total=0. Otherwise extract the expense. Put only the store/payee name in "merchant" and purchased items in "items". Message: ${JSON.stringify(text)}` }], FREETEXT_SCHEMA);
   } catch { return null; } // Gemini down across all models -> caller falls back to the regex parse
+  if (o.isExpense === false) return false;
   const amount = Math.abs(Number(o.total));
   if (!amount || !isFinite(amount)) return null;
   const merchant = (o.merchant || '').trim() || 'Manual entry';
@@ -314,11 +365,12 @@ async function parseVoice(buf, mime) {
   let o;
   try {
     o = await geminiGenerate(
-      [{ text: 'This voice note describes one expense. Transcribe it verbatim into "text", and fill the expense fields from it. Only set split/paid if actually said. If no dollar amount is spoken, set total to 0.' },
+      [{ text: 'Transcribe this voice note verbatim into "text". If it logs a new expense, set isExpense=true and fill expense fields. Questions, instructions to change records or budgets, and general conversation have isExpense=false and total=0 even when amounts are mentioned. Only set split/paid if actually said.' },
        { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
       VOICE_SCHEMA);
   } catch { return { transcript: '', ft: null }; }
   const transcript = (o.text || '').trim();
+  if (o.isExpense === false || isAgentRequest(transcript)) return { transcript, ft: null };
   const amount = Math.abs(Number(o.total));
   if (!amount || !isFinite(amount)) return { transcript, ft: null };
   const merchant = (o.merchant || '').trim() || 'Manual entry';
@@ -683,7 +735,7 @@ async function transcribeVoiceNote(chatId, msg) {
   try {
     const v = msg.voice || msg.audio;
     const f = await tg('getFile', { file_id: v.file_id });
-    const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`);
+    const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`, { signal: AbortSignal.timeout(30_000) });
     const buf = Buffer.from(await r.arrayBuffer());
     const result = await parseVoice(buf, v.mime_type || 'audio/ogg');
     const text = result.transcript ? `🎙 Heard: "${result.transcript}"` : "Couldn't make out the voice note — try again, or type it.";
@@ -699,17 +751,18 @@ async function handleVoice(chatId, msg) {
   delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
   const { transcript, ft } = await transcribeVoiceNote(chatId, msg);
   if (!transcript) return;
-  if (!ft) return await send(chatId, `🎙 Heard: "${transcript}"\nbut no amount in there — try again like "12.50 starbucks on amex".`);
+  if (agentFor(chatId)?.pending(chatId) || !ft) return runAgent(chatId, transcript);
   return await handleFreeText(chatId, ft);
 }
 // A voice note sent while awaiting an ✏️ Edit value — or as a reply to a logged receipt — is the
 // spoken note/value, NOT a new expense. Transcribe and route it there. Returns true if it handled it.
 async function handleVoiceEdit(chatId, msg) {
-  const editReply = msg.reply_to_message && (msgTxn[msg.reply_to_message.message_id] || lastTxn[chatId]);
+  const editReply = msg.reply_to_message && msgTxn[msg.reply_to_message.message_id];
   if (!editField[chatId] && !editReply) return false;
   const { transcript } = await transcribeVoiceNote(chatId, msg);
   if (!transcript) return true;
   if (editField[chatId]) await applyFieldValue(chatId, transcript);
+  else if (isAgentRequest(transcript) && !isReceiptEdit(transcript)) await runAgent(chatId, transcript, editReply);
   else await editTxn(chatId, editReply, transcript);
   return true;
 }
@@ -1120,8 +1173,23 @@ async function onCallback(cq) {
   const data = cq.data || '';
   await tg('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
   if (!chatId) return;
+  if (data.startsWith('ag:') && (!cfg.telegram.allowedChatId || String(chatId) !== String(cfg.telegram.allowedChatId))) return;
   try {
-    if (data === 'c:y') {
+    if (data.startsWith('ag:')) {
+      if (!budgetAgent) return;
+      const [, choice, planId] = data.split(':');
+      if (!/^[a-f0-9]{32}$/.test(planId || '') || !['y','n'].includes(choice)) return;
+      const result = choice === 'y' ? await budgetAgent.confirm(chatId, planId) : await budgetAgent.cancel(chatId, planId);
+      if (result.changed) {
+        await refreshActualMaps();
+        // Receipt edit caches cannot retain old amounts/categories after agent mutations.
+        for (const mid of Object.keys(msgTxn)) delete msgTxn[mid];
+        for (const cid of Object.keys(lastTxn)) delete lastTxn[cid];
+        persistTxns();
+      }
+      if (!budgetAgent.pending(chatId)) await dropKb(chatId, mid);
+      await sendAgentResult(chatId, result);
+    } else if (data === 'c:y') {
       const c = confirming[chatId];
       await dropKb(chatId, mid);
       if (!c) return;
@@ -1240,6 +1308,7 @@ async function dispatch(chatId, msg) {
     return await handleVoice(chatId, msg);
   }
   if (!msg.text) return;
+  if (agentFor(chatId)?.pending(chatId)) return runAgent(chatId, msg.text);
   // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
   // "own wealthsimple = me" clears it.
   const ownM = msg.text.match(/^own\s+(.+?)\s*[:=]\s*(.+)$/i) || msg.text.match(/^own\s+(.+)\s+(\S+)$/i);
@@ -1261,14 +1330,17 @@ async function dispatch(chatId, msg) {
   // Reply to a previously-logged message edits that txn. If the exact message link is gone
   // (e.g. logged in an earlier process before this one started), fall back to this chat's most
   // recent txn — an explicit reply almost always means "edit the thing I just logged".
-  const repliedTo = msg.reply_to_message && (msgTxn[msg.reply_to_message.message_id] || lastTxn[chatId]);
-  if (repliedTo) return await editTxn(chatId, repliedTo, msg.text);
+  const repliedTo = msg.reply_to_message && msgTxn[msg.reply_to_message.message_id];
+  if (repliedTo) {
+    if (isAgentRequest(msg.text) && !isReceiptEdit(msg.text)) return runAgent(chatId, msg.text, repliedTo);
+    return await editTxn(chatId, repliedTo, msg.text);
+  }
   if (confirming[chatId] && await handleConfirm(chatId, msg.text)) return;
   if (pending[chatId]) return await handleCardAnswer(chatId, msg.text);
+  if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS && isReceiptEdit(msg.text)) return await editLast(chatId, msg.text);
   const ft = await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
-  if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS) return await editLast(chatId, msg.text);
-  await send(chatId, `Send a receipt photo, or text the expense like "12.50 starbucks on amex split with ryan". I'll preview it before logging. Once logged, ${EDIT_HINT}`);
+  return runAgent(chatId, msg.text, lastTxn[chatId]);
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -1334,7 +1406,7 @@ function startIngest() {
         const u = new URL(req.url, 'http://x');
         const given = u.searchParams.get('secret') || req.headers['x-secret'];
         if (given !== secret) { res.writeHead(401); return res.end('unauthorized'); }
-        const out = await handleIngest(JSON.parse(body || '{}'));
+        const out = await serializeActual(() => handleIngest(JSON.parse(body || '{}')));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, ...out }));
       } catch (e) {
@@ -1348,8 +1420,18 @@ function startIngest() {
 }
 
 async function main() {
+  const smoke = process.argv[2] === 'agent-smoke';
+  if (smoke) cfg.actual.dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-agent-smoke-'));
   console.log('Connecting to Actual…');
   await initActual();
+  if (smoke) {
+    const result = await initAgent({ readOnly: true }).message(cfg.telegram.allowedChatId, 'Use list_accounts to count open accounts. Reply only with the count. Do not list names or balances.');
+    console.log('Agent smoke:', result.text);
+    await api.shutdown();
+    if (!/\d/.test(result.text) || /failed|unavailable|timed out/i.test(result.text)) throw new Error('Agent smoke did not return an account count');
+    return;
+  }
+  budgetAgent = cfg.agent?.enabled === false ? null : initAgent();
   console.log('Accounts:', Object.keys(ACCT).join(', '));
   loadTxns(); // restore reply->txn links so edits survive restarts
   if (cardmap.lastSplitPerson && !personName(cardmap.lastSplitPerson)) { delete cardmap.lastSplitPerson; saveCardmap(); } // scrub a poisoned partner name
@@ -1360,7 +1442,7 @@ async function main() {
   for (;;) {
     try {
       const res = await tg('getUpdates', { offset, timeout: 50 });
-      for (const u of res.result || []) { offset = u.update_id + 1; await onUpdate(u); }
+      for (const u of res.result || []) { offset = u.update_id + 1; await serializeActual(() => onUpdate(u)); }
     } catch (e) { console.error('poll error', e.message); await sleep(3000); }
   }
 }
@@ -1437,6 +1519,7 @@ async function selftest() {
   const realFetch = globalThis.fetch;
   const requests = [];
   let fixture = 'voice';
+  let voiceFixture = { text: 'updated note', total: 0, merchant: '', items: [], note: '', card: '', split: false, paid: false, person: '' };
   globalThis.fetch = async (url, options = {}) => {
     requests.push({ url: String(url), options });
     if (String(url).endsWith('/sendMessage')) return { json: async () => ({ ok: true, result: { message_id: 77 } }) };
@@ -1445,7 +1528,7 @@ async function selftest() {
     if (String(url).includes('generativelanguage.googleapis.com')) return {
       status: 200,
       json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(fixture === 'voice'
-        ? { text: 'updated note', total: 0, merchant: '', items: [], note: '', card: '', split: false, paid: false, person: '' }
+        ? voiceFixture
         : { merchant: 'Test Shop', date: '', total: 12.34, currency: 'CAD', tax: 0, card_last4: '', line_items: [] }) }] } }] }),
     };
     if (String(url).endsWith('/editMessageText')) return { json: async () => ({ ok: true }) };
@@ -1464,6 +1547,34 @@ async function selftest() {
     const photoBody = photoEdit && JSON.parse(photoEdit.options.body);
     assert(photoBody?.chat_id === 43 && photoBody?.message_id === 77 && photoBody?.text === '📸 Receipt read.', 'photo progress message replaced: ' + JSON.stringify(photoBody));
     delete pending[43];
+
+    // General text/voice must not turn into a receipt or append to its note.
+    const oldAllowed = cfg.telegram.allowedChatId;
+    cfg.telegram.allowedChatId = 42;
+    const agentMessages = []; let remembered = null;
+    budgetAgent = {
+      pending: () => null,
+      remember: (_chat, text) => { remembered = text; },
+      message: async (chat, text) => { agentMessages.push({chat,text}); return {text:'Agent answer'}; },
+    };
+    lastTxn[42] = {id:'txn-fixture',ts:Date.now(),date:todayISO(),account:'Amex',payee:'Test'};
+    await dispatch(42, {text:'show groceries for August 2026'});
+    assert(agentMessages.at(-1)?.text === 'show groceries for August 2026', 'question with number routes to agent');
+    assert(remembered?.includes('txn-fixture'), 'receipt reference supplied to agent');
+    msgTxn[91] = lastTxn[42];
+    await dispatch(42, {text:'change that to groceries',reply_to_message:{message_id:91}});
+    assert(agentMessages.at(-1)?.text === 'change that to groceries', 'natural language reply does not become a note');
+    fixture = 'voice'; requests.length = 0;
+    voiceFixture = {text:'increase groceries by 200 dollars',total:200,isExpense:false};
+    await handleVoice(42, {voice:{file_id:'voice-command',mime_type:'audio/ogg'}});
+    assert(agentMessages.at(-1)?.text === voiceFixture.text, 'spoken budget command reaches agent');
+    assert(requests.filter(r => r.url.includes('generativelanguage.googleapis.com')).length === 1, 'voice transcribed once');
+    const pid='a'.repeat(32);
+    requests.length = 0;
+    await sendAgentResult(42, {text:'plan '.repeat(1600),planId:pid});
+    const sent=requests.filter(r=>r.url.endsWith('/sendMessage')).map(r=>JSON.parse(r.options.body));
+    assert(sent.length>1&&sent.slice(0,-1).every(r=>!r.reply_markup)&&sent.at(-1).reply_markup.inline_keyboard[0][0].callback_data===`ag:y:${pid}`, 'one confirmation after complete plan');
+    budgetAgent=null; cfg.telegram.allowedChatId=oldAllowed;delete lastTxn[42];delete msgTxn[91];
 
     // A Gemini socket that stops responding must release the sequential Telegram update loop.
     const realAbortTimeout = AbortSignal.timeout;

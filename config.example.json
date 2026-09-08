@@ -14,6 +14,10 @@
   "ingest": {
     "port": 28455
   },
+  "agent": {
+    "enabled": true,
+    "timezone": "America/Toronto"
+  },
   "actual": {
     "serverURL": "https://YOUR_ACTUAL_SERVER:5006",
     "syncId": "YOUR_BUDGET_SYNC_ID",

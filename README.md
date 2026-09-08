@@ -36,9 +36,50 @@ names); commit only the `*.example.json` templates.
 - If the receipt has no card number, it asks which card you used.
 
 ## Architecture
-- `bot.mjs` — everything: Telegram long-poll, Gemini extractor (swappable), caption parser, Actual writes.
+
+- `bot.mjs` — Telegram long-poll, receipts, voice transcription, expense workflows, and agent routing.
+- `agent.mjs` — Gemini tool loop, short conversation memory and confirmed plans.
+- `actual-tools.mjs` — validated Actual queries, reports and mutation proposals.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
+
+## Conversational Actual assistant
+
+Ask naturally by text or voice: “How much did I spend on groceries last month?”,
+“Find the Costco charge from Friday”, “Change that to Household”, or
+“Increase this month's grocery budget by $200.” Receipt photos and explicit expense/edit
+commands keep their existing workflows. General questions go to the agent.
+
+The agent can work with transactions/transfers, accounts, categories and groups, payees,
+budget amounts/carryover, schedules, rules, tags, notes and bank sync. It reads immediately.
+For changes it shows the complete plan with before/after values and one **Confirm / Cancel**
+keyboard. Only Confirm executes it. Describe a revision to replace the plan and invalidate
+the old buttons. Plans expire after 24 hours. Direct receipt workflows retain their existing
+confirmations; the new plan requirement applies to agent operations.
+
+The agent requires `telegram.allowedChatId`; it is not available to strangers or relay channels.
+Set `agent.enabled` to `false` to disable it, or `agent.timezone` to your IANA timezone (default
+`America/Toronto`). It uses the existing Gemini model/key and adds no runtime dependency.
+
+Actual computes aggregates locally. Gemini receives the requested totals or matching records,
+with transaction notes only when needed. It does not receive API credentials, configuration,
+or the raw budget database. Short history (12 messages), up to 50 entity references, a pending
+plan and the last 100 execution records persist in `actual-data/agent-state.json` (mode 0600).
+That file contains financial context; keep it private with the rest of the Actual cache.
+
+Confirmed plans are sequential, not atomic. A failure reports completed, uncertain and
+unattempted steps. Interrupted writes are never automatically replayed. Ask the bot to inspect
+Actual before requesting a new plan. It checks snapshots again before applying changes.
+Destructive account/category/payee changes are presented separately from edits to other object
+types. Split-parent structural changes remain in the existing receipt split workflow; the
+agent can edit child categories/notes without collapsing the split.
+
+Offline checks: `node tools/test_agent.mjs` and `node bot.mjs selftest` (use synthetic
+config/cardmap files for selftest, which exercises card-map learning).
+Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
+Actual cache, asks Gemini to count open accounts using tools, and never polls Telegram or
+executes financial mutations. The temporary cache is private financial data and is kept under
+the OS temporary directory for diagnosis.
 
 ## Deploy
 On an always-on host with network access to the Actual server (e.g. a Proxmox LXC). The repo is
