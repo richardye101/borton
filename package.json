@@ -9,6 +9,6 @@
     "chatid": "node tools/get-chat-id.mjs"
   },
   "dependencies": {
-    "@actual-app/api": "26.6.0"
+    "@actual-app/api": "26.8.1"
   }
 }

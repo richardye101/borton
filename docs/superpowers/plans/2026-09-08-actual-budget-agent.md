@@ -4,7 +4,7 @@
 
 **Architecture:** `actual-tools.mjs` exposes validated reads and staged writes. `agent.mjs` coordinates Gemini, persisted conversations and frozen confirmations. `bot.mjs` retains receipt workflows and routes remaining requests to the agent.
 
-**Tech stack:** Node ESM, built-in fetch/fs/assert, installed `@actual-app/api` 26.6.0.
+**Tech stack:** Node ESM, built-in fetch/fs/assert, `@actual-app/api` 26.8.1 (matched to the live server after the smoke test exposed a migration mismatch).
 
 **Spec:** `docs/superpowers/specs/2026-09-08-actual-budget-agent-design.md`
 
@@ -79,3 +79,14 @@
 - [ ] Report deployment/test result and preserve any conflicting user work and its backup.
 
 Execution is inline in the existing worktree. The user approved the design and authorized the repo/deployment update; no additional planning approval is needed.
+
+## Verification results
+
+Tasks 1–3 implemented. Offline agent checks and the receipt selftest pass. Staging against the
+live server verified budget/transaction reads, transaction proposal validation, a real Gemini
+tool call returning the open-account count, and Gemini staging a complete plan with execution
+disabled. No real budget mutations were executed by these checks.
+
+Compatibility findings: Actual 26.6.0 cannot open the live 26.8.1 budget, so the API pin now
+matches the server. `getCategories({hidden:true})` selects only hidden categories; the tool
+layer combines visible/hidden queries, with a regression assertion.

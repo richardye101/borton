@@ -74,6 +74,18 @@ await test('lists report truncation; aggregates include all matching records',as
   assert.equal((await t.read('find_transactions',{start:'2026-09-01',end:'2026-09-30'})).truncated,true);
   assert.equal((await t.read('run_report',{metric:'spending',start:'2026-09-01',end:'2026-09-30'})).total,8000);
 });
+await test('refunds reduce expense totals instead of inflating income',async()=>{
+  const f=fakeActual();f.data.transaction.push({id:'refund',account:'a',date:'2026-09-03',amount:200,payee:'p',category:'food'});
+  const t=createActualTools(f.api),args={start:'2026-09-01',end:'2026-09-30'};
+  assert.equal((await t.read('run_report',{...args,metric:'spending'})).total,800);
+  assert.equal((await t.read('run_report',{...args,metric:'income'})).total,0);
+});
+await test('hidden category query includes visible and hidden records',async()=>{
+  const f=fakeActual();f.data.category.push({id:'hidden',name:'Hidden',group_id:'g',hidden:true});
+  f.api.getCategories=async({hidden=false}={})=>copy(f.data.category.filter(c=>!!c.hidden===hidden));
+  const t=createActualTools(f.api);assert.equal((await t.read('list_categories',{})).rows.length,3);
+  assert.equal((await t.prepare('propose_budget_change',{month:'2026-09',category:'food',amount:100})).length,1);
+});
 await test('all mutation families stage without writes and use installed API signatures',async()=>{
   const f=fakeActual(),t=createActualTools(f.api);
   const requests=[
@@ -159,6 +171,23 @@ await test('tool limits, invalid tools and timeouts never mutate',async()=>{
 await test('read-only smoke mode excludes proposals',async()=>{
   const f=fakeActual();const agent=createAgent({tools:createActualTools(f.api),allowedChatId:42,readOnly:true,generate:script(req=>{assert.ok(req.declarations.every(d=>!d.name.startsWith('propose_')));return answer('Read only');})});
   assert.equal((await agent.message(42,'hello')).text,'Read only');assert.equal(f.writes.length,0);
+});
+await test('plan-only smoke mode cannot execute even a valid confirmation',async()=>{
+  const f=fakeActual();const a=createAgent({tools:createActualTools(f.api),allowedChatId:42,planOnly:true,generate:script(content('propose_budget_change',{month:'2026-09',category:'food',amount:100}),answer('Ready'))});
+  const p=await a.message(42,'plan');assert.ok(p.planId);await a.confirm(42,p.planId);assert.equal(f.writes.length,0);
+});
+await test('conversational references survive restart and tool results stay local',async()=>{
+  const file=path.join(temp,'context.json'),f=fakeActual(),tools=createActualTools(f.api);
+  const a=createAgent({tools,allowedChatId:42,statePath:file,generate:script(content('find_transactions',{start:'2026-09-01',end:'2026-09-30',query:'Costco'}),answer('Found your Costco charge.'))});
+  await a.message(42,'find Costco');
+  const b=createAgent({tools,allowedChatId:42,statePath:file,generate:script(req=>{assert.match(req.system,/t1/);assert.ok(req.contents.some(c=>c.parts[0].text.includes('Costco charge')));return answer('Remembered');})});
+  await b.message(42,'what account was that?');assert.equal(fs.readFileSync(file,'utf8').includes('Private notes'),false);
+});
+await test('failed cloud sync reports completion without replaying writes',async()=>{
+  const f=fakeActual();let syncs=0;f.api.sync=async()=>{if(++syncs>1)throw Error('offline');};
+  const a=createAgent({tools:createActualTools(f.api),allowedChatId:42,generate:script(content('propose_budget_change',{month:'2026-09',category:'food',amount:100}),answer('Ready'))});
+  const p=await a.message(42,'change budget'),r=await a.confirm(42,p.planId);assert.match(r.text,/Cloud sync failed/);assert.match(r.text,/Applied 1/);
+  await a.confirm(42,p.planId);assert.equal(f.writes.length,1);
 });
 await test('transport does not expose API secrets in errors',async()=>{
   const g=createGeminiGenerate({apiKey:'secret-key',models:['fake'],fetchImpl:async()=>({ok:false,status:401})});

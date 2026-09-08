@@ -115,7 +115,12 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
       const timer=setTimeout(()=>{timedOut=true;if(isWrite)pendingWrite=true;reject(new Error('Actual API timed out'));},isWrite?45_000:15_000);
       Promise.resolve().then(()=>value(...args)).then(resolve,reject).finally(()=>{clearTimeout(timer);if(timedOut&&isWrite)pendingWrite=false;});
     });}});
-  const list = async kind => (await api[getters[kind]](...(['category','group'].includes(kind) ? [{ hidden:true }] : []))).map(r => pick(r, columns[kind]));
+  const list = async kind => {
+    const rows=await api[getters[kind]]();
+    // Actual's hidden:true selects hidden records; it does not mean "include hidden".
+    if(['category','group'].includes(kind)) rows.push(...await api[getters[kind]]({hidden:true}));
+    return [...new Map(rows.map(r=>[r.id,pick(r,columns[kind])])).values()];
+  };
   const rowsFor = async args => {
     if (args.start > args.end) fail('start must precede end');
     const accounts = await list('account');
@@ -131,7 +136,7 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
     const payees = await list('payee'); const categories = await list('category');
     const pmap = Object.fromEntries(payees.map(p => [p.id,p])); const cmap = Object.fromEntries(categories.map(c => [c.id,c]));
     const amap = Object.fromEntries(accounts.map(a => [a.id,a]));
-    return rows.map(t => ({ ...t, payeeName:pmap[t.payee]?.name || '', accountName:amap[t.account]?.name || '', categoryName:cmap[t.category]?.name || '', _transfer:!!(t.transfer_id || pmap[t.payee]?.transfer_acct) }))
+    return rows.map(t => ({ ...t, payeeName:pmap[t.payee]?.name || '', accountName:amap[t.account]?.name || '', categoryName:cmap[t.category]?.name || '', _income:!!cmap[t.category]?.is_income, _transfer:!!(t.transfer_id || pmap[t.payee]?.transfer_acct) }))
       .filter(t => (!args.ids || args.ids.includes(t.id)) && (!args.category || t.category === args.category) && (!args.payee || t.payee === args.payee)
         && (args.amount === undefined || t.amount === args.amount) && (args.cleared === undefined || !!t.cleared === args.cleared)
         && (!args.query || `${t.payeeName} ${t.notes||''}`.toLowerCase().includes(args.query.toLowerCase())));
@@ -168,10 +173,11 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
         return {metric:args.metric,asOf:args.end,unit:'cents',total:balances.reduce((n,a)=>n+a.amount,0),...(args.metric==='balances'?windowed(balances,args):{})};
       }
       const kept=rows.filter(t=>!t.is_parent&&!t._transfer&&(args.includeOffbudget||!t._offbudget));
-      const income=kept.filter(t=>t.amount>0).reduce((s,t)=>s+t.amount,0);
-      const outflow=kept.filter(t=>t.amount<0).reduce((s,t)=>s-t.amount,0);
+      const incoming=t=>t._income||!t.category&&t.amount>0;
+      const income=kept.filter(incoming).reduce((s,t)=>s+t.amount,0);
+      const outflow=kept.filter(t=>!incoming(t)).reduce((s,t)=>s-t.amount,0);
       const out={metric:args.metric,start:args.start,end:args.end,unit:'cents',count:kept.length,total:args.metric==='income'?income:args.metric==='cashflow'?income-outflow:outflow};
-      if(args.metric==='categories') { const totals=new Map(); for(const t of kept.filter(t=>t.amount<0)) { const key=t.category||'uncategorized'; const r=totals.get(key)||{id:key,name:t.categoryName||'Uncategorized',amount:0};r.amount-=t.amount;totals.set(key,r); } Object.assign(out,windowed([...totals.values()].sort((a,b)=>b.amount-a.amount),{})); }
+      if(args.metric==='categories') { const totals=new Map(); for(const t of kept.filter(t=>!incoming(t))) { const key=t.category||'uncategorized'; const r=totals.get(key)||{id:key,name:t.categoryName||'Uncategorized',amount:0};r.amount-=t.amount;totals.set(key,r); } Object.assign(out,windowed([...totals.values()].sort((a,b)=>b.amount-a.amount),{})); }
       return out;
     }
     if(name==='get_note') return record('note',args.id);
@@ -311,7 +317,7 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
       const old=op.before?.[k==='amount'&&op.domain==='budget'?'budgeted':k];
       return `  ${labels[k]||k.charAt(0).toUpperCase()+k.slice(1)}: ${old!==undefined&&op.action!=='create'?human(k,old)+' → ':''}${human(k,v)}`;
     });
-    const warning=op.action==='delete'||op.action==='merge'||op.action==='close'||op.domain==='bank_sync'?'⚠ ':'';
+    const warning=op.action==='delete'||op.action==='merge'||op.action==='close'||op.domain==='bank_sync'||op.fields?.actions?.some(a=>a.op==='delete-transaction')?'⚠ ':'';
     const title=op.domain==='bank_sync'?'Import latest bank transactions':op.domain==='sync'?'Retry cloud synchronization':`${op.action||'Set'} ${op.domain}: ${label}`;
     return warning+title+'\n'+changes.join('\n')+(op.impact?`\n  Impact: ${op.impact.transactions} transactions, ${op.impact.budgetMonths} budget months, ${op.impact.relatedRulesOrSchedules} related rules/schedules.`:'');
   }
@@ -377,5 +383,8 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
   // Gemini's OpenAPI subset omits local-only bounds; validation still enforces them.
   const geminiSchema = s => s.anyOf ? { anyOf:s.anyOf.filter(x=>x.type!=='null').map(geminiSchema),...(s.anyOf.some(x=>x.type==='null')?{nullable:true}:{}) }
     : { type:s.type.toUpperCase(),...(s.description?{description:s.description}:{}),...(s.enum?{enum:s.enum}:{}),...(s.properties?{properties:Object.fromEntries(Object.entries(s.properties).map(([k,v])=>[k,geminiSchema(v)])),...(s.required.length?{required:s.required}:{})}:{}),...(s.items?{items:geminiSchema(s.items)}:{}) };
-  return {declarations:definitions.map(d=>({...d,parameters:geminiSchema(d.parameters)})),read,prepare,validate,execute,sync:()=>api.sync(),hasPendingWrite:()=>pendingWrite};
+  return {declarations:definitions.map(d=>({...d,parameters:geminiSchema(d.parameters)})),read,prepare,validate,execute,sync:()=>{
+    if(pendingWrite) throw new Error('A prior Actual write is still pending');
+    return api.sync();
+  },hasPendingWrite:()=>pendingWrite};
 }

@@ -56,7 +56,7 @@ function until(promise,signal) {
 const freshChat = () => ({history:[],references:[],pending:null,results:[]});
 const clone = x => structuredClone(x);
 
-export function createAgent({ tools, generate, statePath, allowedChatId, now=Date.now, timeoutMs=60_000, readOnly=false, currency='CAD', timezone='America/Toronto' }) {
+export function createAgent({ tools, generate, statePath, allowedChatId, now=Date.now, timeoutMs=60_000, readOnly=false, planOnly=false, currency='CAD', timezone='America/Toronto' }) {
   let state={version:1,chats:{}};
   if(statePath&&fs.existsSync(statePath)) {
     state=JSON.parse(fs.readFileSync(statePath,'utf8'));
@@ -164,7 +164,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, now=Dat
       c.pending=null;remember(c,'model','Plan cancelled. Nothing changed.');save();return {text:'Cancelled. Nothing changed.'};
     });},
     async confirm(chatId,planId) {return exclusive(chatId,async c=>{
-      if(readOnly) return {text:'This session is read-only.'};
+      if(readOnly||planOnly) return {text:'This session cannot execute changes.'};
       const prior=c.results.find(r=>r.id===planId);if(prior) return {text:prior.text};
       const p=c.pending;
       if(!p||p.id!==planId) return {text:'That plan was replaced, cancelled or already completed. Ask me for a fresh preview.'};

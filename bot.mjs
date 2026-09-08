@@ -54,13 +54,13 @@ const serializeActual = fn => {
   return next;
 };
 
-function initAgent({ readOnly = false } = {}) {
+function initAgent({ readOnly = false, planOnly = false } = {}) {
   const tools = createActualTools(api, { currency: cfg.defaults.currency || 'CAD' });
-  if (!readOnly) agentTools = tools;
+  if (!readOnly && !planOnly) agentTools = tools;
   return createAgent({ tools,
     generate: createGeminiGenerate({ apiKey: GEMINI_KEY, models: [...GEMINI_MODELS] }),
-    statePath: readOnly ? null : path.resolve(__dir, cfg.actual.dataDir, 'agent-state.json'),
-    allowedChatId: cfg.telegram.allowedChatId, readOnly,
+    statePath: readOnly || planOnly ? null : path.resolve(__dir, cfg.actual.dataDir, 'agent-state.json'),
+    allowedChatId: cfg.telegram.allowedChatId, readOnly, planOnly,
     currency: cfg.defaults.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto' });
 }
 async function sendAgentResult(chatId, result) {
@@ -1181,7 +1181,7 @@ async function onCallback(cq) {
       if (!/^[a-f0-9]{32}$/.test(planId || '') || !['y','n'].includes(choice)) return;
       const result = choice === 'y' ? await budgetAgent.confirm(chatId, planId) : await budgetAgent.cancel(chatId, planId);
       if (result.changed) {
-        await refreshActualMaps();
+        try { await refreshActualMaps(); } catch { result.text += '\nReceipt account lookup could not refresh; restart the bot after Actual recovers.'; }
         // Receipt edit caches cannot retain old amounts/categories after agent mutations.
         for (const mid of Object.keys(msgTxn)) delete msgTxn[mid];
         for (const cid of Object.keys(lastTxn)) delete lastTxn[cid];
@@ -1425,10 +1425,24 @@ async function main() {
   console.log('Connecting to Actual…');
   await initActual();
   if (smoke) {
+    const smokeTools = createActualTools(api);
+    const today = new Date().toISOString().slice(0, 10);
+    await smokeTools.read('get_budget', { month: today.slice(0, 7) });
+    const recent = await smokeTools.read('find_transactions', { start: today.slice(0, 7) + '-01', end: today, limit: 1 });
+    if (recent.rows.length) {
+      const record = recent.rows[0];
+      const operations = await smokeTools.prepare('propose_transaction_changes', { changes: [{ action: 'update', id: record.id, fields: { cleared: !!record.cleared } }] });
+      await smokeTools.validate(operations);
+    }
+    console.log('Agent smoke: budget/transaction reads and proposal validation passed');
     const result = await initAgent({ readOnly: true }).message(cfg.telegram.allowedChatId, 'Use list_accounts to count open accounts. Reply only with the count. Do not list names or balances.');
-    console.log('Agent smoke:', result.text);
+    console.log('Agent smoke: account count', result.text);
+    const planner = initAgent({ planOnly: true });
+    const planned = await planner.message(cfg.telegram.allowedChatId, 'Use list_accounts to find one open account, then propose updating its name to exactly its existing name. This is a plan-only smoke check. Do not execute anything.');
+    console.log('Agent plan smoke:', planned.planId ? 'plan staged; execution disabled' : planned.text);
     await api.shutdown();
     if (!/\d/.test(result.text) || /failed|unavailable|timed out/i.test(result.text)) throw new Error('Agent smoke did not return an account count');
+    if (!planned.planId) throw new Error('Agent plan smoke did not produce a validated plan');
     return;
   }
   budgetAgent = cfg.agent?.enabled === false ? null : initAgent();
@@ -1442,7 +1456,15 @@ async function main() {
   for (;;) {
     try {
       const res = await tg('getUpdates', { offset, timeout: 50 });
-      for (const u of res.result || []) { offset = u.update_id + 1; await serializeActual(() => onUpdate(u)); }
+      for (const u of res.result || []) {
+        offset = u.update_id + 1;
+        try { await serializeActual(() => onUpdate(u)); }
+        catch (e) {
+          const chatId = u.message?.chat?.id || u.callback_query?.message?.chat?.id;
+          if (String(chatId) === String(cfg.telegram.allowedChatId)) await send(chatId, 'Actual is still finishing an earlier write. Please wait, then retry.').catch(() => {});
+          console.error('update processing failed', e.message);
+        }
+      }
     } catch (e) { console.error('poll error', e.message); await sleep(3000); }
   }
 }

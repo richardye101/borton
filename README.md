@@ -77,9 +77,14 @@ agent can edit child categories/notes without collapsing the split.
 Offline checks: `node tools/test_agent.mjs` and `node bot.mjs selftest` (use synthetic
 config/cardmap files for selftest, which exercises card-map learning).
 Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
-Actual cache, asks Gemini to count open accounts using tools, and never polls Telegram or
-executes financial mutations. The temporary cache is private financial data and is kept under
+Actual cache, verifies budget/transaction read schemas, asks Gemini to count open accounts,
+and stages a sample plan with execution disabled. It never polls Telegram or executes financial
+mutations. The temporary cache is private financial data and is kept under
 the OS temporary directory for diagnosis.
+
+The API client is pinned to `26.8.1`, matching the deployed Actual server. A newer budget may
+reject an older client with `out-of-sync-migrations`; update the pin to the server's version
+and run the smoke check before restarting production.
 
 ## Deploy
 On an always-on host with network access to the Actual server (e.g. a Proxmox LXC). The repo is
