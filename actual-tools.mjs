@@ -225,6 +225,11 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
     if(target&&domain==='transaction') for(const [key,kind] of Object.entries({account:'account',payee:'payee',category:'category'})) if(target[key]) await watch(kind,target[key]);
     if(fields[domain]) {
       validateSchema(fields[domain],f,'fields');
+      // Models may echo the whole transaction. A real update should only patch changed fields.
+      // Leave intentional all-no-op proposals intact (used by non-mutating planning checks).
+      if(domain==='transaction'&&action==='update'&&target&&Object.keys(f).some(k=>!Object.is(f[k],target[k]))) {
+        for(const key of Object.keys(f)) if(Object.is(f[key],target[key])) delete f[key];
+      }
       if(!action) fail('Action required');
       if(action==='create') {
         if(op.id) fail('A create cannot supply an existing ID');

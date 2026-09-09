@@ -17,7 +17,7 @@ function declaration(name) {
 const planId = 'a'.repeat(32);
 function fixture() {
   const writes = [], requests = [], messages = [], calls = [], confirmations = [], references = [];
-  const rec = { id: 'receipt-fixture', date: '2026-09-09', notes: 'Eggs and butter on sale', ts: Date.now() };
+  const rec = { id: 'receipt-fixture', date: '2026-09-09', account: 'Scotiabank VI', payee: 'Shop', notes: 'Eggs and butter on sale', ts: Date.now() };
   const bot = vm.createContext({
     console: { log() {}, error() {} },
     cfg: { telegram: { allowedChatId: 42, relayChannelId: -42 }, agent: { relayEnabled: true }, defaults: {} },

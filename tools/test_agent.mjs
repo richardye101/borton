@@ -209,4 +209,12 @@ await test('opted-in channel date correction is isolated, staged, and applied on
   assert.equal(f.data.transaction[0].date,'2026-09-08');assert.equal(f.writes.length,1);
   assert.deepEqual(f.writes[0].args,['t1',{date:'2026-09-08'}]);
 });
+await test('date-only updates discard echoed unchanged transaction fields',async()=>{
+  const f=fakeActual(),t=createActualTools(f.api);
+  const ops=await t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{date:'2026-09-08',account:'a',payee:'p',category:'food',amount:-1000,cleared:false}}]});
+  assert.deepEqual(ops[0].fields,{date:'2026-09-08'});
+  await t.validate(ops);assert.equal(f.writes.length,0);
+  const noop=await t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{cleared:false}}]});
+  assert.deepEqual(noop[0].fields,{cleared:false});
+});
 console.log(`test_agent: ${checks} checks passed`);

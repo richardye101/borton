@@ -80,7 +80,7 @@ async function sendAgentResult(chatId, result) {
 async function runAgent(chatId, text, rec = null) {
   if (!budgetAgent) return send(chatId, 'The budget assistant is unavailable. Please try again shortly.');
   if (!agentFor(chatId)) return send(chatId, 'Send budget questions to my authorized direct chat.');
-  if (rec) budgetAgent.remember(chatId, `Receipt reference: ${JSON.stringify({ id: rec.id, cardTxnId: rec.cardTxnId, owedTxnId: rec.owedTxnId, date: rec.date, account: rec.account, payee: rec.payee })}`);
+  if (rec) budgetAgent.remember(chatId, `Receipt reference: ${JSON.stringify({ id: rec.id, cardTxnId: rec.cardTxnId, owedTxnId: rec.owedTxnId, date: rec.date, accountName: rec.account, payeeName: rec.payee })}`);
   const p = budgetAgent.pending(chatId);
   if (p && /^(?:yes|confirm|ok|okay)$/i.test(text.trim())) return sendAgentResult(chatId, { text: 'Please use Confirm on the full plan above to apply it.', planId: p.id });
   if (p && /^(?:no|cancel)$/i.test(text.trim())) return sendAgentResult(chatId, await budgetAgent.cancel(chatId, p.id));
