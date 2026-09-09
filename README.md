@@ -57,7 +57,14 @@ keyboard. Only Confirm executes it. Describe a revision to replace the plan and 
 the old buttons. Plans expire after 24 hours. Direct receipt workflows retain their existing
 confirmations; the new plan requirement applies to agent operations.
 
-The agent requires `telegram.allowedChatId`; it is not available to strangers or relay channels.
+The agent requires `telegram.allowedChatId`, set to the owner's private Telegram chat/user ID.
+To enable it in the configured `telegram.relayChannelId`, explicitly set `agent.relayEnabled`
+to `true`. Channel subscribers can see its budget replies and plans; only the owner's Telegram
+account can use Confirm/Cancel or receipt-edit buttons. Typed channel “yes” cannot confirm.
+Private and channel conversation histories and receipt references stay separate.
+Ordinary text/voice replies (such as “This should be Sept 8th”) go to the agent, not into notes.
+Use an explicit `note: ...` command or the Note field for note edits. Channel text edits produce
+confirmed plans; trusted structured receipt uploads retain their existing workflow.
 Set `agent.enabled` to `false` to disable it, or `agent.timezone` to your IANA timezone (default
 `America/Toronto`). It uses the existing Gemini model/key and adds no runtime dependency.
 
@@ -74,7 +81,8 @@ Destructive account/category/payee changes are presented separately from edits t
 types. Split-parent structural changes remain in the existing receipt split workflow; the
 agent can edit child categories/notes without collapsing the split.
 
-Offline checks: `node tools/test_agent.mjs` and `node bot.mjs selftest` (use synthetic
+Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs`,
+and `node bot.mjs selftest` (use synthetic
 config/cardmap files for selftest, which exercises card-map learning).
 Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
 Actual cache, verifies budget/transaction read schemas, asks Gemini to count open accounts,

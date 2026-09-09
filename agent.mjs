@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { ToolError } from './actual-tools.mjs';
 
 export const isAgentRequest = text => /\?|^(?:(?:hey|hi)[, ]+)?(?:please\s+)?(?:how|what|when|where|why|which|who|show|list|find|search|compare|summari[sz]e|tell|can|could|would|should|do|did|does|is|are|was|were|change|move|transfer|set|increase|decrease|add|create|rename|merge|close|reopen|delete|remove|clear|reconcile|update|rebalance|budget|sync|also|instead|actually|make|put)\b/i.test(text.trim());
-export const isReceiptEdit = text => /^(?:(?:category|cat|card|account|merchant|payee)\s+.+|notes?\s*[:=][\s\S]*|delete|undo|remove|split(?:\s+(?:with|w\/?)\s+.+)?|half|\/2|(?:\w+)\s+paid)$/i.test(text.trim());
+export const isReceiptEdit = text => /^(?:(?:category|cat|card|account|merchant|payee)\s+.+|notes?\s*[:=][\s\S]*|delete|undo|remove|(?:un|no|remove|undo)[\s-]?split|split(?:\s+(?:with|w\/?)\s+.+)?|half|\/2|(?:\w+)\s+paid)$/i.test(text.trim());
 
 const INSTRUCTIONS = `You are Borton, the user's Actual Budget assistant. Help with natural-language questions and multi-step budget operations.
 Use tools for financial facts. Never invent amounts, records, IDs, or successful changes. All money in tool calls/results is integer cents; format human amounts as currency.
@@ -56,7 +56,7 @@ function until(promise,signal) {
 const freshChat = () => ({history:[],references:[],pending:null,results:[]});
 const clone = x => structuredClone(x);
 
-export function createAgent({ tools, generate, statePath, allowedChatId, now=Date.now, timeoutMs=60_000, readOnly=false, planOnly=false, currency='CAD', timezone='America/Toronto' }) {
+export function createAgent({ tools, generate, statePath, allowedChatId, allowedChatIds=[], now=Date.now, timeoutMs=60_000, readOnly=false, planOnly=false, currency='CAD', timezone='America/Toronto' }) {
   let state={version:1,chats:{}};
   if(statePath&&fs.existsSync(statePath)) {
     state=JSON.parse(fs.readFileSync(statePath,'utf8'));
@@ -71,7 +71,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, now=Dat
     fs.renameSync(tmp,statePath);
   }
   function chat(chatId) {
-    if(!allowedChatId||String(chatId)!==String(allowedChatId)) throw new Error('This chat is not authorized for the agent.');
+    if(!allowedChatId||![allowedChatId,...allowedChatIds].filter(Boolean).some(id=>String(chatId)===String(id))) throw new Error('This chat is not authorized for the agent.');
     return state.chats[chatId] ||= freshChat();
   }
   // Any interrupted execution is terminal. The unfinished call may already have written.

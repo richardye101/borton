@@ -41,7 +41,10 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // Actual self-signed cert
 const TG = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 let budgetAgent;
 let agentTools;
-const agentFor = chatId => String(chatId) === String(cfg.telegram.allowedChatId) ? budgetAgent : null;
+const isRelay = chatId => !!cfg.telegram.relayChannelId && String(chatId) === String(cfg.telegram.relayChannelId);
+const isAllowedChat = chatId => !!cfg.telegram.allowedChatId && (String(chatId) === String(cfg.telegram.allowedChatId) || isRelay(chatId));
+const isOwner = userId => !!cfg.telegram.allowedChatId && String(userId) === String(cfg.telegram.allowedChatId);
+const agentFor = chatId => isAllowedChat(chatId) && (!isRelay(chatId) || cfg.agent?.relayEnabled === true) ? budgetAgent : null;
 // Telegram polling is sequential; ingest shares this queue during confirmations.
 let actualQueue = Promise.resolve();
 const serializeActual = fn => {
@@ -61,6 +64,7 @@ function initAgent({ readOnly = false, planOnly = false } = {}) {
     generate: createGeminiGenerate({ apiKey: GEMINI_KEY, models: [...GEMINI_MODELS] }),
     statePath: readOnly || planOnly ? null : path.resolve(__dir, cfg.actual.dataDir, 'agent-state.json'),
     allowedChatId: cfg.telegram.allowedChatId, readOnly, planOnly,
+    allowedChatIds: cfg.agent?.relayEnabled === true ? [cfg.telegram.relayChannelId] : [],
     currency: cfg.defaults.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto' });
 }
 async function sendAgentResult(chatId, result) {
@@ -532,7 +536,14 @@ const confirming = {}; // chatId -> { receipt, parsed, account }  (awaiting yes/
 const editField = {}; // chatId -> { field, kind: 'pending'|'logged', mid }  (awaiting a typed value after ✏️ Edit → field)
 const ownerPending = {}; // chatId -> { receipt, parsed, account, owner }  (a charge on someone else's card: awaiting split/all-mine/all-theirs)
 const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
-const msgTxn = {}; // telegram message_id -> rec  (so a reply to that message edits its txn)
+const msgTxn = {}; // chatId:messageId -> rec (Telegram message IDs are only unique within a chat)
+function receiptFor(chatId, mid) {
+  const scoped = msgTxn[`${chatId}:${mid}`];
+  if (scoped) return scoped;
+  // Old links are safe only when they identify this chat's known latest receipt.
+  const legacy = msgTxn[mid];
+  return legacy && lastTxn[chatId]?.id === legacy.id ? legacy : null;
+}
 const EDIT_WINDOW_MS = 60 * 60 * 1000; // a reply within an hour edits the last txn
 // A txn rec carries enough to rebuild it (needed for split-by-reply): { id, account, date, total, payee, category, notes, split, reverse, spendTxnId, person, ts }
 
@@ -632,7 +643,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
     header = '✅ Logged';
   }
   const sentId = await send(chatId, `${header}\n${body}`, txnId ? loggedKb() : undefined);
-  if (txnId && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
+  if (txnId && sentId) msgTxn[`${chatId}:${sentId}`] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
 }
@@ -689,7 +700,7 @@ async function finalizeOwnerPaid(chatId, choice) {
   const oweLine = myCents > 0 ? `\nYou owe: $${owe} → ${owedAccount}` : `\nYou owe: nothing (all ${owner}'s)`;
   const body = fmtExpense({ total, merchant: receipt.merchant, category: parsed.category, account: `${account} (${owner}'s)`, note: parsed.notes, hideSplit: true });
   const sentId = await send(chatId, `✅ Logged — ${owner} paid\n${body}${oweLine}\nDate: ${date}`, loggedKb());
-  if (sentId) msgTxn[sentId] = rec;
+  if (sentId) msgTxn[`${chatId}:${sentId}`] = rec;
   persistTxns();
   return rec;
 }
@@ -727,7 +738,7 @@ async function applyFieldValue(chatId, text) {
     return await rerenderConfirm(chatId);
   }
   // logged: translate to an editTxn command, then re-render the receipt in place.
-  const rec = msgTxn[ef.mid] || lastTxn[chatId];
+  const rec = receiptFor(chatId, ef.mid);
   if (!rec) return await send(chatId, "That transaction expired — reply to a newer one.");
   const cmd = ef.field === 'cat' ? `category ${value}`
     : ef.field === 'merchant' ? `merchant: ${value}`
@@ -735,8 +746,9 @@ async function applyFieldValue(chatId, text) {
     : ef.field === 'card' ? `card ${value}`
     : ef.field === 'person' ? `${value} paid`
     : `split w/ ${value}`;
+  if (isRelay(chatId)) return runAgent(chatId, cmd, rec);
   await editTxn(chatId, rec, cmd);
-  await rerenderLogged(chatId, ef.mid, msgTxn[ef.mid] || rec);
+  await rerenderLogged(chatId, ef.mid, receiptFor(chatId, ef.mid) || rec);
 }
 
 async function handlePhoto(chatId, msg) {
@@ -788,23 +800,9 @@ async function transcribeVoiceNote(chatId, msg) {
 }
 // Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
 async function handleVoice(chatId, msg) {
-  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId];
   const { transcript, ft } = await transcribeVoiceNote(chatId, msg);
   if (!transcript) return;
-  if (agentFor(chatId)?.pending(chatId) || !ft) return runAgent(chatId, transcript);
-  return await handleFreeText(chatId, ft);
-}
-// A voice note sent while awaiting an ✏️ Edit value — or as a reply to a logged receipt — is the
-// spoken note/value, NOT a new expense. Transcribe and route it there. Returns true if it handled it.
-async function handleVoiceEdit(chatId, msg) {
-  const editReply = msg.reply_to_message && msgTxn[msg.reply_to_message.message_id];
-  if (!editField[chatId] && !editReply) return false;
-  const { transcript } = await transcribeVoiceNote(chatId, msg);
-  if (!transcript) return true;
-  if (editField[chatId]) await applyFieldValue(chatId, transcript);
-  else if (isAgentRequest(transcript) && !isReceiptEdit(transcript)) await runAgent(chatId, transcript, editReply);
-  else await editTxn(chatId, editReply, transcript);
-  return true;
+  return dispatch(chatId, { ...msg, voice: undefined, audio: undefined, text: transcript }, ft);
 }
 
 // confirm=true (manual DM): preview + wait for yes. confirm=false (relay/poorton): log directly.
@@ -928,7 +926,10 @@ async function handleConfirm(chatId, text) {
     await rerenderConfirm(chatId);
     return true;
   }
-  if (/^(y|yes|ok|okay|confirm|👍|yep|yeah)$/.test(lc)) { delete confirming[chatId]; await finalize(chatId, c.receipt, c.parsed, c.account); return true; }
+  if (/^(y|yes|ok|okay|confirm|👍|yep|yeah)$/.test(lc)) {
+    if (isRelay(chatId)) { await send(chatId, 'Please use the confirmation button above. Only the owner can apply changes.'); return true; }
+    delete confirming[chatId]; await finalize(chatId, c.receipt, c.parsed, c.account); return true;
+  }
   if (/^(n|no|nope|cancel|nvm)$/.test(lc)) { delete confirming[chatId]; await send(chatId, '❌ Cancelled — nothing logged.'); return true; }
   delete confirming[chatId]; // anything else: drop the stale prompt, reinterpret the new message
   return false;
@@ -1007,7 +1008,7 @@ function rememberCard(p, account) {
   if (p.last4) cardmap.byLast4[p.last4] = account;
   if (p.cardKey || p.last4) saveCardmap();
 }
-async function handleCardAnswer(chatId, text) {
+async function handleCardAnswer(chatId, text, ownerVerified = false) {
   const p = pending[chatId];
   const raw = text.trim();
   // Ownership question after a brand-new account: any typed reply here names the owner
@@ -1024,6 +1025,10 @@ async function handleCardAnswer(chatId, text) {
   }
   // "➕ Other" path: this reply is a brand-new account name.
   if (p.awaitNewAccount) {
+    if (isRelay(chatId)) {
+      p.awaitNewAccount = false;
+      return runAgent(chatId, `Create an Actual account named ${JSON.stringify(raw)}. Do not log the pending receipt yet.`);
+    }
     const account = await createNamedAccount(raw);
     if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
@@ -1034,6 +1039,7 @@ async function handleCardAnswer(chatId, text) {
   }
   const account = resolveAccount(raw);
   if (account) {
+    if (isRelay(chatId) && p.ingest && !ownerVerified) return send(chatId, 'Tap the matching card button so I can verify the owner before logging this charge.', cardKb());
     // A tap from the Shortcut (ingest): remember the card->account mapping, then log the charge.
     if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
@@ -1047,7 +1053,8 @@ async function handleCardAnswer(chatId, text) {
   const ft = /\d/.test(raw) ? await parseExpense(raw) : null;
   if (ft) { delete pending[chatId]; return await handleFreeText(chatId, ft); }
   const editish = SPLIT_RE.test(raw) || /^(delete|undo|remove|note\b|category\s|cat\s)/i.test(raw) || /\bpaid\b|\bowe\b/i.test(raw);
-  if (editish && lastTxn[chatId]) { delete pending[chatId]; return await editLast(chatId, raw); }
+  if (editish && lastTxn[chatId] && !isRelay(chatId)) { delete pending[chatId]; return await editLast(chatId, raw); }
+  if (agentFor(chatId)) { delete pending[chatId]; return runAgent(chatId, raw, lastTxn[chatId]); }
   await send(chatId, `Couldn't match "${raw}" to an account. Tap a card button, or ➕ Other to add a new one.`);
 }
 
@@ -1062,6 +1069,7 @@ async function purgeLegs(rec) {
 // Edit a specific transaction (by its rec): note text, "category X", "split", or "delete".
 async function editTxn(chatId, rec, text) {
   if (!rec || !rec.id) return send(chatId, "I don't have that transaction on hand anymore.");
+  if (!isReceiptEdit(text)) return runAgent(chatId, text, rec);
   const id = rec.id;
   const raw = text.trim();
   const lc = raw.toLowerCase();
@@ -1165,7 +1173,7 @@ async function editTxn(chatId, rec, text) {
     persistTxns();
     return send(chatId, `🏬 Merchant → ${payee}`);
   }
-  // "note: X" / "notes = X" REPLACES the note (clears it if X is empty); any other free text APPENDS.
+  // Only explicit note instructions change a note; ordinary replies go to the agent.
   const noteSet = raw.match(/^notes?\s*[:=]\s*([\s\S]*)$/i);
   if (noteSet) {
     const notes = noteSet[1].trim();
@@ -1174,11 +1182,7 @@ async function editTxn(chatId, rec, text) {
     persistTxns();
     return send(chatId, notes ? `📝 Note set: ${notes}` : '📝 Note cleared.');
   }
-  const notes = [rec.notes, raw].filter(Boolean).join(' · ');
-  await api.updateTransaction(id, { notes }); await api.sync();
-  rec.notes = notes;
-  persistTxns();
-  return send(chatId, '📝 Note added.');
+  return runAgent(chatId, raw, rec);
 }
 // After a rebuild (split), point every reference to the old txn id at the new rec.
 function rebindTxn(oldId, newRec) {
@@ -1197,32 +1201,13 @@ async function onRelayPost(post) {
   const text = (post.text || '').trim();
   await react(id, post.message_id, REACT_SEEN);
   try {
-    if (post.photo) { await handlePhoto(id, post); await react(id, post.message_id, REACT_DONE); return; } // receipt posted in the channel
-    if (post.voice || post.audio) {
-      if (!(await handleVoiceEdit(id, post))) await handleVoice(id, post); // editing a note by voice, not a new expense
-      await react(id, post.message_id, REACT_DONE); return;
-    }
-    // Button taps come via callback_query, but accept typed yes/no & card answers too.
-    if (editField[id]) { await applyFieldValue(id, text); await react(id, post.message_id, REACT_DONE); return; }
-    if (confirming[id] && await handleConfirm(id, text)) { await react(id, post.message_id, REACT_DONE); return; }
-    if (pending[id]) { await handleCardAnswer(id, text); await react(id, post.message_id, REACT_DONE); return; }
-    // A reply to a previously-logged post edits that transaction (note / category / split / delete).
-    // Fall back to the channel's most recent txn if the exact message link didn't survive a restart.
-    const repliedTo = post.reply_to_message && (msgTxn[post.reply_to_message.message_id] || lastTxn[id]);
-    if (repliedTo) {
-      await editTxn(id, repliedTo, text);
-    } else if (text.startsWith('{')) {
-      // poorton's structured posts log directly — no confirmation. (iOS curls quotes; normalize.)
+    if (text.startsWith('{') && !post.reply_to_message && !editField[id] && !confirming[id] && !pending[id]) {
+      // Keep the trusted structured receipt integration; human conversation shares DM routing.
       let json = null;
       try { json = JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")); } catch { /* fall through */ }
-      if (json) { const rec = await handleIngest(json, id); if (rec?.id) { msgTxn[post.message_id] = rec; persistTxns(); } }
-      else { const ft = await parseExpense(text); if (!ft) throw new Error('bad JSON and no amount found'); await handleFreeText(id, ft); }
-    } else {
-      // free text = a human typing -> confirm with Yes/No buttons (also asks card via buttons)
-      const ft = await parseExpense(text);
-      if (!ft) throw new Error('no amount found — try "12.50 merchant on amex"');
-      await handleFreeText(id, ft);
-    }
+      if (json) { const rec = await handleIngest(json, id); if (rec?.id) { msgTxn[`${id}:${post.message_id}`] = rec; persistTxns(); } }
+      else await dispatch(id, post);
+    } else await dispatch(id, post);
     await react(id, post.message_id, REACT_DONE);
   } catch (e) {
     await react(id, post.message_id, '');
@@ -1236,9 +1221,12 @@ async function onCallback(cq) {
   const chatId = cq.message?.chat?.id;
   const mid = cq.message?.message_id;
   const data = cq.data || '';
+  if (!isAllowedChat(chatId) || !isOwner(cq.from?.id)) {
+    await tg('answerCallbackQuery', { callback_query_id: cq.id, text: 'Only the budget owner can use these buttons.', show_alert: true }).catch(() => {});
+    return;
+  }
   await tg('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
-  if (!chatId) return;
-  if (data.startsWith('ag:') && (!cfg.telegram.allowedChatId || String(chatId) !== String(cfg.telegram.allowedChatId))) return;
+  if (data.startsWith('ag:') && !agentFor(chatId)) return;
   try {
     if (data.startsWith('ag:')) {
       if (!budgetAgent) return;
@@ -1257,10 +1245,11 @@ async function onCallback(cq) {
     } else if (data === 'c:y') {
       const c = confirming[chatId];
       await dropKb(chatId, mid);
-      if (!c) return;
+      if (!c || c.promptMid !== mid) return;
       delete confirming[chatId];
       await finalize(chatId, c.receipt, c.parsed, c.account);
     } else if (data === 'c:n') {
+      if (confirming[chatId]?.promptMid !== mid) return;
       delete confirming[chatId];
       await dropKb(chatId, mid);
       await send(chatId, '❌ Cancelled — nothing logged.');
@@ -1268,7 +1257,7 @@ async function onCallback(cq) {
       await dropKb(chatId, mid);
       const ans = data.slice(5);
       if (ans === '__new__') { pending[chatId].awaitNewAccount = true; await send(chatId, "Type the new account name (I'll create it in Actual):"); }
-      else await handleCardAnswer(chatId, ans);
+      else await handleCardAnswer(chatId, ans, true);
     } else if (data.startsWith('newacct:') && pending[chatId]?.awaitNewAccountOwner) { // whose card is the new account?
       await dropKb(chatId, mid);
       const p = pending[chatId];
@@ -1284,7 +1273,7 @@ async function onCallback(cq) {
       await confirmOrOwnerPaid(chatId, receipt, parsed, newAccount);
     } else if (data === 'e:menu') { // ✏️ Edit -> show the field picker on this message
       const c = confirming[chatId];
-      const rec = (c && c.promptMid === mid) ? null : msgTxn[mid];
+      const rec = (c && c.promptMid === mid) ? null : receiptFor(chatId, mid);
       if (c && c.promptMid === mid) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(c.parsed.paid) }).catch(() => {});
       else if (rec) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(rec.reverse) }).catch(() => {});
       else await send(chatId, "That one's too old to edit by button — reply to it instead.");
@@ -1301,7 +1290,7 @@ async function onCallback(cq) {
       const c = confirming[chatId];
       if (!name) await send(chatId, 'That category is gone — tap ✏️ Edit again.');
       else if (c && c.promptMid === mid) { c.parsed.category = name; await rerenderConfirm(chatId); }
-      else if (msgTxn[mid]) { await editTxn(chatId, msgTxn[mid], `category ${name}`); await rerenderLogged(chatId, mid, msgTxn[mid]); }
+      else if (receiptFor(chatId, mid)) { await editTxn(chatId, receiptFor(chatId, mid), `category ${name}`); await rerenderLogged(chatId, mid, receiptFor(chatId, mid)); }
       else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data === 'e:do:split' || data === 'e:do:person') { // one-tap: split/reverse with your usual person
       const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
@@ -1311,22 +1300,22 @@ async function onCallback(cq) {
           ? { ...c.parsed, paid: true, split: true, splitDecided: true, person: who, persons: [] }
           : { ...c.parsed, paid: false, split: true, splitDecided: true, person: who, persons: [who] };
         await rerenderConfirm(chatId);
-      } else if (msgTxn[mid]) { // logged receipt
-        await editTxn(chatId, msgTxn[mid], data === 'e:do:person' ? `${who} paid` : `split w/ ${who}`);
-        await rerenderLogged(chatId, mid, msgTxn[mid]);
+      } else if (receiptFor(chatId, mid)) { // logged receipt
+        await editTxn(chatId, receiptFor(chatId, mid), data === 'e:do:person' ? `${who} paid` : `split w/ ${who}`);
+        await rerenderLogged(chatId, mid, receiptFor(chatId, mid));
       } else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data === 'e:do:unsplit') { // remove a split
       const c = confirming[chatId];
       if (c && c.promptMid === mid) { c.parsed = { ...c.parsed, split: false, splitDecided: true, person: null, persons: [] }; await rerenderConfirm(chatId); }
-      else if (msgTxn[mid]) { await editTxn(chatId, msgTxn[mid], 'unsplit'); await rerenderLogged(chatId, mid, msgTxn[mid]); }
+      else if (receiptFor(chatId, mid)) { await editTxn(chatId, receiptFor(chatId, mid), 'unsplit'); await rerenderLogged(chatId, mid, receiptFor(chatId, mid)); }
       else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data.startsWith('e:set:')) { // a field was picked -> ask for the new value
       const field = data.slice(6);
       const c = confirming[chatId];
       const kind = (c && c.promptMid === mid) ? 'pending' : 'logged';
-      if (kind === 'logged' && !msgTxn[mid]) { await send(chatId, "That one's too old to edit by button."); return; }
+      if (kind === 'logged' && !receiptFor(chatId, mid)) { await send(chatId, "That one's too old to edit by button."); return; }
       editField[chatId] = { field, kind, mid };
-      const rec = kind === 'logged' ? msgTxn[mid] : null;
+      const rec = kind === 'logged' ? receiptFor(chatId, mid) : null;
       const cur = kind === 'pending'
         ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'merchant' ? (c.receipt.merchant || '') : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
         : (field === 'cat' ? rec.category : field === 'merchant' ? rec.payee : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
@@ -1337,7 +1326,7 @@ async function onCallback(cq) {
     } else if (data === 'e:ok') { // dismiss the buttons on a logged receipt
       await dropKb(chatId, mid);
     } else if (data === 'e:del') { // delete a logged txn
-      const rec = msgTxn[mid] || lastTxn[chatId];
+      const rec = receiptFor(chatId, mid);
       await dropKb(chatId, mid);
       if (rec) await editTxn(chatId, rec, 'delete');
       else await send(chatId, 'Nothing to delete.');
@@ -1371,24 +1360,21 @@ async function onUpdate(u) {
   }
 }
 
-async function dispatch(chatId, msg) {
+async function dispatch(chatId, msg, voiceExpense) {
   if (msg.photo) return await handlePhoto(chatId, msg);
-  if (msg.voice || msg.audio) {
-    if (await handleVoiceEdit(chatId, msg)) return; // editing a note by voice, not a new expense
-    return await handleVoice(chatId, msg);
-  }
+  if (msg.voice || msg.audio) return await handleVoice(chatId, msg);
   if (!msg.text) return;
-  if (agentFor(chatId)?.pending(chatId)) return runAgent(chatId, msg.text);
+  if (agentFor(chatId)?.pending(chatId)) return runAgent(chatId, msg.text, msg.reply_to_message ? receiptFor(chatId, msg.reply_to_message.message_id) : null);
   // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
   // "own wealthsimple = me" clears it.
-  const ownM = msg.text.match(/^own\s+(.+?)\s*[:=]\s*(.+)$/i) || msg.text.match(/^own\s+(.+)\s+(\S+)$/i);
+  const ownM = !isRelay(chatId) && (msg.text.match(/^own\s+(.+?)\s*[:=]\s*(.+)$/i) || msg.text.match(/^own\s+(.+)\s+(\S+)$/i));
   if (ownM) {
     const res = setOwner(ownM[1], ownM[2]);
     if (!res.error) return await send(chatId, res.person ? `👤 ${res.account} is ${res.person}'s card — charges on it will ask how to split.` : `↩️ ${res.account} is yours now (no owner).`);
     if (/[:=]/.test(msg.text)) return await send(chatId, res.error); // explicit "own X = Y" — surface the error; bare form falls through
   }
   // "offbudget wealthsimple" / "onbudget amex" — move a card off/on budget in Actual.
-  const budM = msg.text.match(/^(off|on)[\s-]?budget\s+(.+)$/i);
+  const budM = !isRelay(chatId) && msg.text.match(/^(off|on)[\s-]?budget\s+(.+)$/i);
   if (budM) {
     const res = await setAccountBudget(budM[2].trim(), /^off/i.test(budM[1]));
     if (res.error) return await send(chatId, `⚠️ ${res.error}`);
@@ -1400,15 +1386,16 @@ async function dispatch(chatId, msg) {
   // Reply to a previously-logged message edits that txn. If the exact message link is gone
   // (e.g. logged in an earlier process before this one started), fall back to this chat's most
   // recent txn — an explicit reply almost always means "edit the thing I just logged".
-  const repliedTo = msg.reply_to_message && msgTxn[msg.reply_to_message.message_id];
+  const repliedTo = msg.reply_to_message && receiptFor(chatId, msg.reply_to_message.message_id);
   if (repliedTo) {
-    if (isAgentRequest(msg.text) && !isReceiptEdit(msg.text)) return runAgent(chatId, msg.text, repliedTo);
+    if (isRelay(chatId) || !isReceiptEdit(msg.text)) return runAgent(chatId, msg.text, repliedTo);
     return await editTxn(chatId, repliedTo, msg.text);
   }
   if (confirming[chatId] && await handleConfirm(chatId, msg.text)) return;
   if (pending[chatId]) return await handleCardAnswer(chatId, msg.text);
-  if (lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS && isReceiptEdit(msg.text)) return await editLast(chatId, msg.text);
-  const ft = await parseExpense(msg.text);
+  if (msg.reply_to_message) return send(chatId, 'I cannot safely identify that older receipt. Tell me its merchant, amount and date so I can find it before proposing changes.');
+  if (!isRelay(chatId) && lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS && isReceiptEdit(msg.text)) return await editLast(chatId, msg.text);
+  const ft = voiceExpense !== undefined ? voiceExpense : await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
   return runAgent(chatId, msg.text, lastTxn[chatId]);
 }
@@ -1469,7 +1456,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     header = `${paid ? '🔁' : '⚡'} Logged`;
   }
   const sentId = chat ? await send(chat, `${header}\n${body}`, id ? loggedKb() : undefined) : null;
-  if (id && sentId) msgTxn[sentId] = rec; // reply to my reply to edit it
+  if (id && sentId) msgTxn[`${chat}:${sentId}`] = rec; // reply to my reply to edit it
   persistTxns();
   return rec;
 }

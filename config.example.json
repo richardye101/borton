@@ -16,6 +16,7 @@
   },
   "agent": {
     "enabled": true,
+    "relayEnabled": false,
     "timezone": "America/Toronto"
   },
   "actual": {

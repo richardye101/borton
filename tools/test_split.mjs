@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { test } from 'node:test';
+import { isReceiptEdit } from '../agent.mjs';
 
 const source = fs.readFileSync(new URL('../bot.mjs', import.meta.url), 'utf8');
 // The bot starts polling on import. Load its top-level declarations without startup/config I/O.
@@ -19,6 +20,7 @@ function fixture() {
   const writes = [], messages = [];
   const bot = vm.createContext({
     console,
+    isReceiptEdit,
     cfg: { defaults: { splitPerson: 'Ryan' }, telegram: { allowedChatId: 42 } },
     ACCT: { Card: 'card', Alice: 'a', Bob: 'b', Carol: 'c', Ryan: 'r' },
     CAT: { Dining: 'dining' },
@@ -41,7 +43,7 @@ function fixture() {
     rebindTxn: () => {},
     persistTxns: () => {},
   });
-  vm.runInContext(['cap', 'NON_NAMES', 'PRONOUNS', 'personName', 'namesList', 'extractPersons',
+  vm.runInContext(['isRelay', 'isAllowedChat', 'isOwner', 'cap', 'NON_NAMES', 'PRONOUNS', 'personName', 'namesList', 'extractPersons',
     'extractPaid', 'splitAmounts', 'logExpense', 'fmtExpense', 'editTxn', 'onCallback', 'applyFieldValue',
     'handleConfirm'].map(declaration).join('\n'), bot);
   return { bot, writes, messages };
@@ -92,7 +94,7 @@ test('editing a logged split reports the same share it records', async () => {
 
 test('one-tap split replaces previous partners in both preview and booked transfers', async () => {
   const { bot, writes } = fixture();
-  await bot.onCallback({ id: 'tap', data: 'e:do:split', message: { chat: { id: 42 }, message_id: 77 } });
+  await bot.onCallback({ id: 'tap', from: { id: 42 }, data: 'e:do:split', message: { chat: { id: 42 }, message_id: 77 } });
   const parsed = bot.confirming[42].parsed;
   assert.equal(parsed.person, 'Ryan');
   assert.deepEqual(Array.from(parsed.persons), ['Ryan']);
@@ -103,7 +105,7 @@ test('one-tap split replaces previous partners in both preview and booked transf
 
 test('selecting a payer clears the old forward-split list', async () => {
   const { bot } = fixture();
-  await bot.onCallback({ id: 'tap', data: 'e:do:person', message: { chat: { id: 42 }, message_id: 77 } });
+  await bot.onCallback({ id: 'tap', from: { id: 42 }, data: 'e:do:person', message: { chat: { id: 42 }, message_id: 77 } });
   assert.equal(bot.confirming[42].parsed.paid, true);
   assert.deepEqual(Array.from(bot.confirming[42].parsed.persons), []);
 });

@@ -193,4 +193,20 @@ await test('transport does not expose API secrets in errors',async()=>{
   const g=createGeminiGenerate({apiKey:'secret-key',models:['fake'],fetchImpl:async()=>({ok:false,status:401})});
   await assert.rejects(()=>g({contents:[],declarations:[],system:'test',signal:AbortSignal.timeout(1000)}),e=>!e.message.includes('secret-key'));
 });
+await test('opted-in channel date correction is isolated, staged, and applied once',async()=>{
+  const f=fakeActual();f.data.transaction[0].date='2026-09-09';
+  const a=createAgent({tools:createActualTools(f.api),allowedChatId:42,allowedChatIds:[-42],
+    generate:script(content('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{date:'2026-09-08'}}]}),answer('Ready'),
+      req=>{assert.ok(!JSON.stringify(req.contents).includes('Sept 8th'));return answer('Private chat');})});
+  a.remember(-42,'Receipt t1 has date 2026-09-09.');
+  const p=await a.message(-42,'This should be Sept 8th');
+  assert.ok(p.planId);assert.equal(f.writes.length,0);
+  assert.equal(a.pending(42),null);
+  await assert.rejects(()=>a.message(-99,'show my budget'),/not authorized/);
+  await a.confirm(42,p.planId);assert.equal(f.writes.length,0);
+  await a.message(42,'Hello');
+  await a.confirm(-42,p.planId);await a.confirm(-42,p.planId);
+  assert.equal(f.data.transaction[0].date,'2026-09-08');assert.equal(f.writes.length,1);
+  assert.deepEqual(f.writes[0].args,['t1',{date:'2026-09-08'}]);
+});
 console.log(`test_agent: ${checks} checks passed`);
