@@ -209,6 +209,17 @@ function extractPerson(text) {
   const m = (text || '').match(/\bsplit\s+(?:with|w\/?)\s+([a-z][\w'-]*)/i);
   return m ? m[1] : null;
 }
+// Split a value into a list of clean names: array, or a string like "alice, bob and carol".
+function namesList(v) {
+  if (Array.isArray(v)) return v.map(personName).filter(Boolean);
+  if (!v) return [];
+  return String(v).split(/\s*(?:,|&|\+|\band\b)\s*/i).map(personName).filter(Boolean);
+}
+// "split with alice, bob and carol" -> ["Alice","Bob","Carol"]; bare "split" -> []. Single-person callers use [0].
+function extractPersons(text) {
+  const m = (text || '').match(/\bsplit\s+(?:with|w\/?)\s+([a-z][\w'-]*(?:\s*(?:,|&|\+|\band\b)\s*[a-z][\w'-]*)*)/i);
+  return m ? namesList(m[1]) : [];
+}
 const SPLIT_RE = /\bsplit\b|\bhalf\b|\bhalves\b|\/2\b|#split/i;
 
 // Words that are never a person's name (they're directives/filler) — so "split paid" can't make a
@@ -274,7 +285,7 @@ function parseCaption(caption) {
   // what you wrote it was ("neutrogena face cleanser"), not the plumbing.
   const cardTokens = [...(matchedAlias ? matchedAlias.split(/\s+/) : []), ...(cardAccount ? cardAccount.toLowerCase().split(/\s+/) : [])];
   const notes = stripControlWords(text, cardTokens);
-  return { notes, split, paid: !!paidInfo, person, cardAccount };
+  return { notes, split, paid: !!paidInfo, person, persons: paidInfo ? [] : extractPersons(text), cardAccount };
 }
 
 // Free-text expense, e.g. "12.50 starbucks on amex split w ryan" — needs a leading
@@ -303,7 +314,7 @@ function parseFreeText(text) {
   const seg = rest.split(',');
   const merchant = clean(seg[0]) || clean(rest) || 'Manual entry';
   const notes = seg.length > 1 ? clean(seg.slice(1).join(', ')) : '';
-  return { amount, split, paid: !!paidInfo, person, cardAccount, merchant, items: [], notes };
+  return { amount, split, paid: !!paidInfo, person, persons: paidInfo ? [] : extractPersons(rest), cardAccount, merchant, items: [], notes };
 }
 
 // Regex handles the terse form ("12.50 starbucks on amex"); anything descriptive
@@ -317,7 +328,13 @@ async function parseExpense(text) {
   // so answering the prompt can learn it — regardless of how tersely the card was worded.
   const noCard = ft && !ft.cardAccount && !ft.paid;
   if (ft && !descriptive && !noCard) return ft;
-  if (/\d/.test(text)) { const g = await geminiFreeText(text); if (g === false) return null; if (g) return g; }
+  if (/\d/.test(text)) {
+    const g = await geminiFreeText(text);
+    if (g === false) return null;
+    // Gemini's schema returns a single person; recover any "split with A, B and C" list from the
+    // literal text so multi-person splits survive the descriptive path.
+    if (g) { if (g.split && !g.paid) { const list = extractPersons(text); if (list.length) g.persons = list; } return g; }
+  }
   return ft; // Gemini unavailable -> fall back to the regex result
 }
 
@@ -438,24 +455,40 @@ async function resolveOwedAccount(person) {
   ACCT[want] = ACCT[want] || newId;
   return want;
 }
-async function logExpense({ accountName, total, payee, notes, category, date, split, splitAccountName, splitPersonName }) {
+// Resolve (creating as needed) the "Owed by {name}" account for each person, index-aligned.
+async function resolveOwedAccounts(persons) {
+  const out = [];
+  for (const p of persons) out.push(await resolveOwedAccount(p));
+  return out;
+}
+// Keep recorded amounts and displayed shares identical; your share takes the cents remainder.
+function splitAmounts(total, nOthers) {
+  const cents = Math.round(Number(total) * 100);
+  const each = Math.round(cents / (nOthers + 1));
+  return { each, mine: cents - each * nOthers };
+}
+// Forward split: you paid the whole charge; others owe you an equal share. The charge is one txn on
+// your card, cut into subtransactions: your share (categorized) + one transfer sub per other person
+// (routed to their "Owed by {name}" account). Everyone splits equally, you included, so an N-other
+// split is (N+1) equal parts. Accepts either arrays (splitPersons/splitAccounts, index-aligned) or
+// the legacy single splitPersonName/splitAccountName.
+async function logExpense({ accountName, total, payee, notes, category, date, split, splitAccountName, splitPersonName, splitPersons, splitAccounts }) {
   const acctId = ACCT[accountName];
   if (!acctId) throw new Error(`No account named "${accountName}" in Actual`);
   const cents = Math.round(Number(total) * 100);
   const catId = CAT[category] || null;
   const txn = { account: acctId, date, amount: -cents, payee_name: payee, notes, cleared: false };
   if (split) {
-    const half = Math.round(cents / 2);
-    const owedAcct = ACCT[splitAccountName];
-    const transferPayee = owedAcct ? TRANSFER_PAYEE[owedAcct] : null;
-    if (transferPayee) {
-      txn.subtransactions = [
-        { amount: -half, category: catId, notes: 'your share' },
-        { amount: -(cents - half), payee: transferPayee, notes: `owed by ${splitPersonName}` },
-      ];
+    const persons = (splitPersons && splitPersons.length) ? splitPersons : (splitPersonName ? [splitPersonName] : []);
+    const accounts = (splitAccounts && splitAccounts.length) ? splitAccounts : (splitAccountName ? [splitAccountName] : []);
+    const parts = persons.map((name, i) => { const id = ACCT[accounts[i]]; return { name, transferPayee: id ? TRANSFER_PAYEE[id] : null }; });
+    if (parts.length && parts.every((p) => p.transferPayee)) {
+      const { each, mine } = splitAmounts(total, parts.length);
+      const subs = parts.map((p) => ({ amount: -each, payee: p.transferPayee, notes: `owed by ${p.name}` }));
+      txn.subtransactions = [{ amount: -mine, category: catId, notes: 'your share' }, ...subs];
     } else {
-      txn.category = catId; // fallback: no transfer payee found, log whole + tag
-      txn.notes = `${notes} [SPLIT w/ ${splitPersonName} — settle manually]`;
+      txn.category = catId; // fallback: a transfer payee was missing, log whole + tag
+      txn.notes = `${notes} [SPLIT w/ ${persons.join(', ')} — settle manually]`;
     }
   } else {
     txn.category = catId;
@@ -537,15 +570,20 @@ function safeDate(d) {
 }
 
 // One-line-per-field "key: value" layout, shared by the confirm preview and the logged receipts.
-function fmtExpense({ total, merchant, category, account, split, paid, person, note, date, hideSplit }) {
+function fmtExpense({ total, merchant, category, account, split, paid, person, persons, note, date, hideSplit }) {
   const half = (Number(total) / 2).toFixed(2);
+  const people = (persons && persons.length) ? persons : (person ? [person] : []);
+  const share = (splitAmounts(total, people.length).mine / 100).toFixed(2);
   const L = [`Amount: $${Number(total).toFixed(2)}`, `Merchant: ${merchant}`, `Category: ${category}`];
   if (paid) {
     L.push(`Paid by: ${person} (you owe $${half})`);
     L.push(`Account: ${owedAccountFor(person)}`);
   } else {
     if (account) L.push(`Card: ${account}`);
-    if (!hideSplit) L.push(`Split: ${split ? `50/50 w/ ${person} — your share $${half}` : 'no'}`);
+    const how = people.length > 1
+      ? `${people.length + 1} ways w/ ${people.join(', ')} — your share $${share}`
+      : `50/50 w/ ${people[0]} — your share $${share}`;
+    if (!hideSplit) L.push(`Split: ${split ? how : 'no'}`);
   }
   if (note) L.push(`Note: ${note}`);
   if (date) L.push(`Date: ${date}`);
@@ -577,10 +615,11 @@ async function finalize(chatId, receipt, parsed, accountName) {
     txnId = r.owedTxnId || r.cardTxnId;
     rec = { id: txnId, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account: accountName, ownerPaid: true, owedCents: myCents, date, total, payee: receipt.merchant, category, notes, person, ts: Date.now() };
   } else {
-    if (parsed.split) rememberSplitPerson(person);
-    const splitAccountName = parsed.split ? await resolveOwedAccount(person) : null;
-    txnId = await logExpense({ accountName, total, payee: receipt.merchant, notes, category, date, split: parsed.split, splitAccountName, splitPersonName: person });
-    rec = { id: txnId, account: accountName, date, total, payee: receipt.merchant, category, notes, split: parsed.split, person, ts: Date.now() };
+    const persons = (parsed.persons && parsed.persons.length) ? parsed.persons.map(personName).filter(Boolean) : [person];
+    if (parsed.split) persons.forEach(rememberSplitPerson);
+    const splitAccounts = parsed.split ? await resolveOwedAccounts(persons) : [];
+    txnId = await logExpense({ accountName, total, payee: receipt.merchant, notes, category, date, split: parsed.split, splitPersons: persons, splitAccounts });
+    rec = { id: txnId, account: accountName, date, total, payee: receipt.merchant, category, notes, split: parsed.split, person: persons[0], persons, ts: Date.now() };
   }
   if (txnId) lastTxn[chatId] = rec;
   let header, body;
@@ -589,7 +628,7 @@ async function finalize(chatId, receipt, parsed, accountName) {
     body = fmtExpense({ total, merchant: receipt.merchant, category, account: `${accountName} (${person}'s)`, note: desc, hideSplit: true }) + oweLine + `\nDate: ${date}`;
     header = `✅ Logged — ${person} paid`;
   } else {
-    body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, note: desc, date });
+    body = fmtExpense({ total, merchant: receipt.merchant, category, account: accountName, split: parsed.split, paid: parsed.paid, person, persons: parsed.persons, note: desc, date });
     header = '✅ Logged';
   }
   const sentId = await send(chatId, `${header}\n${body}`, txnId ? loggedKb() : undefined);
@@ -607,7 +646,7 @@ async function rerenderLogged(chatId, mid, rec) {
     const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: `${rec.account} (${rec.person}'s)`, note: displayNote(rec.notes), hideSplit: true });
     text = `✅ Logged — ${rec.person} paid\n${body}${tail}\nDate: ${rec.date}`;
   } else {
-    const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, note: displayNote(rec.notes), date: rec.date });
+    const body = fmtExpense({ total: rec.total, merchant: rec.payee, category: rec.category, account: rec.account, split: rec.split, paid: rec.reverse, person: rec.person, persons: rec.persons, note: displayNote(rec.notes), date: rec.date });
     text = `${rec.reverse ? '🔁' : '✅'} Logged\n${body}`;
   }
   await tg('editMessageText', { chat_id: chatId, message_id: mid, text, reply_markup: loggedKb() }).catch(() => {});
@@ -678,11 +717,12 @@ async function applyFieldValue(chatId, text) {
       if (!acct) return await send(chatId, `No account matching "${value}". Retry with a card alias or exact name.`);
       c.account = acct;
     } else if (ef.field === 'split') {
-      const person = personName(value) || cap(cfg.defaults.splitPerson);
-      c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
-      rememberSplitPerson(person);
+      const persons = namesList(value);
+      if (!persons.length) persons.push(cap(cfg.defaults.splitPerson));
+      c.parsed = { ...c.parsed, split: true, splitDecided: true, person: persons[0], persons };
+      persons.forEach(rememberSplitPerson);
     } else if (ef.field === 'person') { // reverse split: who paid
-      c.parsed = { ...c.parsed, paid: true, person: personName(value) || cap(cfg.defaults.splitPerson) };
+      c.parsed = { ...c.parsed, paid: true, person: personName(value) || cap(cfg.defaults.splitPerson), persons: [] };
     }
     return await rerenderConfirm(chatId);
   }
@@ -770,7 +810,7 @@ async function handleVoiceEdit(chatId, msg) {
 // confirm=true (manual DM): preview + wait for yes. confirm=false (relay/poorton): log directly.
 async function handleFreeText(chatId, ft, confirm = true) {
   const receipt = { merchant: ft.merchant, total: ft.amount, card_last4: '', date: '', line_items: ft.items || [] };
-  const parsed = { notes: ft.notes || '', split: ft.split, paid: ft.paid, person: ft.person };
+  const parsed = { notes: ft.notes || '', split: ft.split, paid: ft.paid, person: ft.person, persons: ft.persons || [] };
   // Every expense now needs a card — including "X paid", which books the full charge on the card they
   // used so it reconciles. Prompt for it (whose card, for the paid case) if the message didn't name one.
   if (!ft.cardAccount) {
@@ -800,7 +840,7 @@ function confirmText(receipt, parsed, account) {
   const person = cap(parsed.person || cfg.defaults.splitPerson);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   const note = parsed.notes || items; // your description wins over receipt line-items
-  return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, note })}`;
+  return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, persons: parsed.persons, note })}`;
 }
 // Resolve a typed category to its exact Actual name (case-insensitive), or null.
 function resolveCategory(want) {
@@ -838,11 +878,13 @@ function fieldMenuKb(reverse) {
 // Split sub-menu: one-tap with your usual person, or pick someone else. (Paid-by mirror for reverse.)
 function splitSubKb(reverse) {
   const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
-  return { inline_keyboard: [
+  const rows = [
     [{ text: reverse ? `👤 ${who} paid` : `➗ Split 50/50 w/ ${who}`, callback_data: reverse ? 'e:do:person' : 'e:do:split' }],
-    [{ text: '➗ Someone else…', callback_data: reverse ? 'e:set:person' : 'e:set:split' }],
-    [{ text: '🔙 Back', callback_data: 'e:menu' }],
-  ] };
+    [{ text: reverse ? '👤 Someone else…' : '➗ Split with others…', callback_data: reverse ? 'e:set:person' : 'e:set:split' }],
+  ];
+  if (!reverse) rows.push([{ text: '↩️ Remove split', callback_data: 'e:do:unsplit' }]);
+  rows.push([{ text: '🔙 Back', callback_data: 'e:menu' }]);
+  return { inline_keyboard: rows };
 }
 // Category picker: every Actual category as a tappable button (2 per row), + type-it fallback.
 function catPickerKb() {
@@ -881,7 +923,7 @@ async function handleConfirm(chatId, text) {
     const person = cap(text.trim().replace(/^split\s+(?:with|w\/?)\s+/i, '').trim());
     if (!person) { await send(chatId, "Didn't catch a name — try again, or tap ✅/❌."); return true; }
     c.awaitSplitName = false;
-    c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
+    c.parsed = { ...c.parsed, split: true, splitDecided: true, person, persons: [person] };
     rememberSplitPerson(person);
     await rerenderConfirm(chatId);
     return true;
@@ -958,6 +1000,13 @@ function learnCardAlias(token, account) {
   saveCardmap();
   return true;
 }
+// Persist a learned card->account mapping: by the Shortcut's card name (alias) and/or its last-4,
+// so the next tap of the same card resolves without asking.
+function rememberCard(p, account) {
+  if (p.cardKey) cardmap.aliases[p.cardKey] = account;
+  if (p.last4) cardmap.byLast4[p.last4] = account;
+  if (p.cardKey || p.last4) saveCardmap();
+}
 async function handleCardAnswer(chatId, text) {
   const p = pending[chatId];
   const raw = text.trim();
@@ -976,6 +1025,7 @@ async function handleCardAnswer(chatId, text) {
   // "➕ Other" path: this reply is a brand-new account name.
   if (p.awaitNewAccount) {
     const account = await createNamedAccount(raw);
+    if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
     if (p.cardToken) learnCardAlias(p.cardToken, account);
     const defaultPerson = cap(lastSplitPerson() || cfg.defaults.splitPerson);
@@ -984,6 +1034,8 @@ async function handleCardAnswer(chatId, text) {
   }
   const account = resolveAccount(raw);
   if (account) {
+    // A tap from the Shortcut (ingest): remember the card->account mapping, then log the charge.
+    if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
     const learned = p.cardToken && learnCardAlias(p.cardToken, account);
     delete pending[chatId];
@@ -1028,13 +1080,13 @@ async function editTxn(chatId, rec, text) {
     if (rec.split && !rec.reverse && !rec.ownerPaid) {
       // Forward split: the txn is a split PARENT (its category lives on the "your share" sub).
       // Writing a category onto the parent would collapse the split — rebuild it instead.
-      const person = personName(rec.person) || cap(cfg.defaults.splitPerson);
-      const splitAccountName = await resolveOwedAccount(person);
+      const persons = (rec.persons && rec.persons.length) ? rec.persons : [personName(rec.person) || cap(cfg.defaults.splitPerson)];
+      const splitAccounts = await resolveOwedAccounts(persons);
       await api.deleteTransaction(id);
-      const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: name, date: rec.date, split: true, splitAccountName, splitPersonName: person });
+      const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: name, date: rec.date, split: true, splitPersons: persons, splitAccounts });
       rebindTxn(id, { ...rec, id: newId, category: name });
       persistTxns();
-      return send(chatId, `✏️ Category → ${name} (kept split w/ ${person})`);
+      return send(chatId, `✏️ Category → ${name} (kept split w/ ${persons.join(', ')})`);
     }
     await api.updateTransaction(id, { category: CAT[name] }); await api.sync();
     rec.category = name;
@@ -1058,19 +1110,32 @@ async function editTxn(chatId, rec, text) {
     persistTxns();
     return send(chatId, `✅ ${person} paid — full charge on ${rec.account}, your $${(rec.total / 2).toFixed(2)} → ${owedName}.`);
   }
-  // Forward split: you paid, they owe you half. "split" or "split with NAME".
+  // Remove a split: rebuild as a plain full-amount charge on your card, keeping category/note.
+  if (/^(?:un[\s-]?split|no[\s-]?split|remove[\s-]?split|undo[\s-]?split)$/.test(lc)) {
+    if (!rec.split) return send(chatId, 'Not split — nothing to remove.');
+    if (rec.reverse || rec.ownerPaid) return send(chatId, "This is a “they paid” entry — reply “delete”, then re-log it as your own charge.");
+    await api.deleteTransaction(id);
+    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: false });
+    rebindTxn(id, { ...rec, id: newId, split: false, person: null, persons: [] });
+    persistTxns();
+    return send(chatId, `↩️ Split removed — full $${Number(rec.total).toFixed(2)} on ${rec.account}.`);
+  }
+  // Forward split: you paid, others owe you an equal share. "split", "split with NAME",
+  // or "split with A, B and C" (equal (N+1)-way split, you included).
   const sp = lc.match(/^(?:split|half|\/2)(?:\s+(?:with|w\/?)\s+(.+))?$/);
   if (sp) {
     if (rec.split) return send(chatId, 'Already split.');
-    const person = personName(sp[1] || rec.person) || cap(cfg.defaults.splitPerson);
-    rememberSplitPerson(person);
-    const splitAccountName = await resolveOwedAccount(person);
-    // Actual can't add subtransactions in place; rebuild the txn as a 50/50 split.
+    const persons = namesList(sp[1]);
+    if (!persons.length) persons.push(personName(rec.person) || cap(cfg.defaults.splitPerson));
+    persons.forEach(rememberSplitPerson);
+    const splitAccounts = await resolveOwedAccounts(persons);
+    // Actual can't add subtransactions in place; rebuild the txn as a split.
     await purgeLegs(rec);
-    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true, splitAccountName, splitPersonName: person });
-    rebindTxn(id, { ...rec, id: newId, spendTxnId: undefined, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, split: true, person });
+    const newId = await logExpense({ accountName: rec.account, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: true, splitPersons: persons, splitAccounts });
+    rebindTxn(id, { ...rec, id: newId, spendTxnId: undefined, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, split: true, person: persons[0], persons });
     persistTxns();
-    return send(chatId, `✂️ Split 50/50 w/ ${person} (your share $${(rec.total / 2).toFixed(2)}).`);
+    const share = (splitAmounts(rec.total, persons.length).mine / 100).toFixed(2);
+    return send(chatId, `✂️ Split w/ ${persons.join(', ')} (your share $${share}).`);
   }
   // Change the card/account. "card amex" (or "account …"). Rebuild on the new account, keeping split.
   const cardM = lc.match(/^(?:card|account)\s+(.+)$/);
@@ -1078,11 +1143,11 @@ async function editTxn(chatId, rec, text) {
     if (rec.reverse) return send(chatId, "This one's a reverse split (they paid) — no card to change.");
     const acct = resolveAccount(cardM[1].trim());
     if (!acct) return send(chatId, `No account matching "${cardM[1].trim()}". Try a card alias or exact name.`);
-    const cardPerson = personName(rec.person) || cap(cfg.defaults.splitPerson);
-    const splitAccountName = rec.split ? await resolveOwedAccount(cardPerson) : null;
+    const persons = rec.split ? ((rec.persons && rec.persons.length) ? rec.persons : [personName(rec.person) || cap(cfg.defaults.splitPerson)]) : [];
+    const splitAccounts = rec.split ? await resolveOwedAccounts(persons) : [];
     await purgeLegs(rec); // clear any owner-paid card+owed legs so changing the card leaves no orphan
-    const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitAccountName, splitPersonName: cardPerson });
-    rebindTxn(id, { ...rec, id: newId, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, account: acct });
+    const newId = await logExpense({ accountName: acct, total: rec.total, payee: rec.payee, notes: rec.notes || '', category: rec.category, date: rec.date, split: rec.split, splitPersons: persons, splitAccounts });
+    rebindTxn(id, { ...rec, id: newId, cardTxnId: undefined, owedTxnId: undefined, ownerPaid: false, account: acct, persons });
     persistTxns();
     return send(chatId, `💳 Card → ${acct}`);
   }
@@ -1243,13 +1308,18 @@ async function onCallback(cq) {
       const c = confirming[chatId];
       if (c && c.promptMid === mid) { // pending preview
         c.parsed = data === 'e:do:person'
-          ? { ...c.parsed, paid: true, split: true, splitDecided: true, person: who }
-          : { ...c.parsed, paid: false, split: true, splitDecided: true, person: who };
+          ? { ...c.parsed, paid: true, split: true, splitDecided: true, person: who, persons: [] }
+          : { ...c.parsed, paid: false, split: true, splitDecided: true, person: who, persons: [who] };
         await rerenderConfirm(chatId);
       } else if (msgTxn[mid]) { // logged receipt
         await editTxn(chatId, msgTxn[mid], data === 'e:do:person' ? `${who} paid` : `split w/ ${who}`);
         await rerenderLogged(chatId, mid, msgTxn[mid]);
       } else await send(chatId, "That one's too old to edit by button — reply to it instead.");
+    } else if (data === 'e:do:unsplit') { // remove a split
+      const c = confirming[chatId];
+      if (c && c.promptMid === mid) { c.parsed = { ...c.parsed, split: false, splitDecided: true, person: null, persons: [] }; await rerenderConfirm(chatId); }
+      else if (msgTxn[mid]) { await editTxn(chatId, msgTxn[mid], 'unsplit'); await rerenderLogged(chatId, mid, msgTxn[mid]); }
+      else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data.startsWith('e:set:')) { // a field was picked -> ask for the new value
       const field = data.slice(6);
       const c = confirming[chatId];
@@ -1260,7 +1330,7 @@ async function onCallback(cq) {
       const cur = kind === 'pending'
         ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'merchant' ? (c.receipt.merchant || '') : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
         : (field === 'cat' ? rec.category : field === 'merchant' ? rec.payee : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
-      const prompts = { cat: 'Send the new category', merchant: 'Send the new merchant name', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
+      const prompts = { cat: 'Send the new category', merchant: 'Send the new merchant name', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send one or more names (e.g. "alice, bob")', person: 'Who paid? Send a name' };
       // Plain message (no force_reply — Telegram silently drops force_reply in channels, which read as
       // "nothing happened"). editField is set, so your very next message is taken as the value.
       await send(chatId, `✏️ ${prompts[field] || 'Send the new value'}${cur ? `\n(currently: ${cur})` : ''}`);
@@ -1350,14 +1420,23 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   const merchant = (d.merchant || 'Apple Pay').toString().trim() || 'Apple Pay';
   const paid = !!d.paid; // reverse: someone else paid, you owe your half
   const account = (d.card && resolveAccount(String(d.card))) || (d.last4 && cardmap.byLast4[d.last4]) || null;
-  if (!account) throw new Error(`couldn't match card "${d.card || d.last4 || '?'}"`); // full charge always lands on a card now
+  if (!account) {
+    // Unknown card (a tap from the Shortcut we haven't seen). Ask once, then remember the mapping
+    // (keyed by the card name the Shortcut sends and/or its last-4) so future taps resolve silently.
+    if (!chat) throw new Error(`couldn't match card "${d.card || d.last4 || '?'}"`);
+    pending[chat] = { ingest: d, cardKey: d.card ? String(d.card).trim().toLowerCase() : null, last4: d.last4 || null };
+    const label = d.card ? `"${d.card}"` : (d.last4 ? `****${d.last4}` : 'that card');
+    await send(chat, `New card ${label} ($${amount.toFixed(2)} at ${merchant}).\nWhich account is it? I'll remember it.`, cardKb());
+    return { pending: true };
+  }
   const date = safeDate(d.date);
   const split = !!d.split;
   let notes = (d.note || '').toString().trim();
   if (d.last4) notes += (notes ? ' ' : '') + `[card ****${d.last4}]`;
   notes = (notes + ' [apple pay]').trim();
   const category = guessCategory({ merchant, line_items: [] }, notes);
-  const person = personName(d.with || d.person) || cap(cfg.defaults.splitPerson);
+  const splitPersons = namesList(d.with || d.person);
+  const person = splitPersons[0] || cap(cfg.defaults.splitPerson);
   const noteText = (d.note || '').toString().trim(); // human note, without the [card]/[apple pay] tags
   // "someone else paid" = the payer named in d.paid/d.with, or (for a normal charge) the card's owner.
   const payer = paid ? person : ownerOf(account);
@@ -1373,10 +1452,11 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     id = r.owedTxnId || r.cardTxnId;
     rec = { id, cardTxnId: r.cardTxnId, owedTxnId: r.owedTxnId, account, ownerPaid: true, owedCents: myCents, date, total: amount, payee: merchant, category, notes, person: payer, ts: Date.now() };
   } else {
-    if (split) rememberSplitPerson(person);
-    const splitAccountName = split ? await resolveOwedAccount(person) : null;
-    id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitAccountName, splitPersonName: person });
-    rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person, ts: Date.now() };
+    const people = split ? (splitPersons.length ? splitPersons : [person]) : [];
+    if (split) people.forEach(rememberSplitPerson);
+    const splitAccounts = split ? await resolveOwedAccounts(people) : [];
+    id = await logExpense({ accountName: account, total: amount, payee: merchant, notes, category, date, split, splitPersons: people, splitAccounts });
+    rec = { id, account, date, total: amount, payee: merchant, category, notes, split, person: people[0] || person, persons: people, ts: Date.now() };
   }
   if (id && chat) lastTxn[chat] = rec;
   let header, body;
@@ -1385,7 +1465,7 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
     body = fmtExpense({ total: amount, merchant, category, account: `${account} (${rec.person}'s)`, note: noteText, hideSplit: true }) + oweLine + `\nDate: ${date}`;
     header = `⚡ Logged — ${rec.person} paid`;
   } else {
-    body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, note: noteText, date });
+    body = fmtExpense({ total: amount, merchant, category, account, split, paid, person, persons: rec.persons, note: noteText, date });
     header = `${paid ? '🔁' : '⚡'} Logged`;
   }
   const sentId = chat ? await send(chat, `${header}\n${body}`, id ? loggedKb() : undefined) : null;
