@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ToolError } from './actual-tools.mjs';
+import { RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
 
 export const isAgentRequest = text => /\?|^(?:(?:hey|hi)[, ]+)?(?:please\s+)?(?:how|what|when|where|why|which|who|show|list|find|search|compare|summari[sz]e|tell|can|could|would|should|do|did|does|is|are|was|were|change|move|transfer|set|increase|decrease|add|create|rename|merge|close|reopen|delete|remove|clear|reconcile|update|rebalance|budget|sync|also|instead|actually|make|put)\b/i.test(text.trim());
 export const isReceiptEdit = text => /^(?:(?:category|cat|card|account|merchant|payee)\s+.+|notes?\s*[:=][\s\S]*|delete|undo|remove|(?:un|no|remove|undo)[\s-]?split|split(?:\s+(?:with|w\/?)\s+.+)?|half|\/2|(?:\w+)\s+paid)$/i.test(text.trim());
@@ -20,29 +21,48 @@ Answer concisely in plain Telegram text. Explain what you found, or that a compl
 
 export function createGeminiGenerate({ apiKey, models, fetchImpl = globalThis.fetch }) {
   return async ({ contents, declarations, system, signal }) => {
-    let code='unavailable';
+    let failure = new Error('Gemini is unavailable.');
+    let retryDelay = 0;
     // Preserve signatures by keeping the same model after it has emitted tool calls.
     const candidates = contents.some(c => c.role === 'model' && c.parts?.some(p => p.functionCall)) ? models.slice(0,1) : models;
     for(const model of candidates) {
-      for(let attempt=0;attempt<2;attempt++) {
-        signal.throwIfAborted();
-        try {
-          const r=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-            method:'POST',headers:{'Content-Type':'application/json','X-goog-api-key':apiKey},signal,
-            body:JSON.stringify({systemInstruction:{parts:[{text:system}]},contents,tools:[{functionDeclarations:declarations}],
-              generationConfig:{maxOutputTokens:8192},toolConfig:{functionCallingConfig:{mode:'AUTO'}}}),
-          });
-          if(!r.ok) {code=`HTTP ${r.status}`;if(r.status!==429&&r.status<500) break;continue;}
-          const data=await r.json(); const candidate=data.candidates?.[0];
-          if(candidate?.finishReason&&candidate.finishReason!=='STOP') throw new Error('Gemini response was incomplete or blocked');
-          if(!candidate?.content?.parts?.length) throw new Error('Gemini returned no answer');
-          // Pin a fallback before returning its first signed function-call content.
-          if(models[0]!==model) models=[model];
-          return candidate.content;
-        } catch(e) {if(signal.aborted) throw e;code='connection failed';}
+      if (signal.aborted) throw new RetryableError('Gemini request timed out.');
+      let r;
+      try {
+        r=await fetchImpl(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+          method:'POST',headers:{'Content-Type':'application/json','X-goog-api-key':apiKey},signal,
+          body:JSON.stringify({systemInstruction:{parts:[{text:system}]},contents,tools:[{functionDeclarations:declarations}],
+            generationConfig:{maxOutputTokens:8192},toolConfig:{functionCallingConfig:{mode:'AUTO'}}}),
+        });
+      } catch {
+        failure = new RetryableError('Gemini connection unavailable.', retryDelay);
+        continue;
       }
+      if(!r.ok) {
+        if (r.status === 429 || r.status >= 500) {
+          retryDelay = Math.max(retryDelay, retryAfterMs(r));
+          failure = new RetryableError(`Gemini HTTP ${r.status}.`, retryDelay);
+        } else {
+          if (r.status === 401 || r.status === 403) throw new Error(`Gemini HTTP ${r.status}.`);
+          if (!(failure instanceof RetryableError)) failure = new Error(`Gemini HTTP ${r.status}.`);
+        }
+        continue;
+      }
+      let data;
+      try { data=await r.json(); }
+      catch { failure = new RetryableError('Gemini returned an incomplete response.', retryDelay); continue; }
+      const candidate=data.candidates?.[0];
+      if (data.promptFeedback?.blockReason || (candidate?.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason))) {
+        throw new Error('Gemini could not answer this request.');
+      }
+      if (candidate?.finishReason === 'MAX_TOKENS' || !candidate?.content?.parts?.length) {
+        failure = new RetryableError('Gemini returned an incomplete response.', retryDelay); continue;
+      }
+      // Pin a fallback before returning its first signed function-call content.
+      if(models[0]!==model) models=[model];
+      return candidate.content;
     }
-    throw new Error(`Gemini ${code}. Please try again.`);
+    throw failure;
   };
 }
 
@@ -99,17 +119,23 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
   return {
     pending(chatId) {return clone(chat(chatId).pending);},
     remember(chatId,text) {const c=chat(chatId);remember(c,'user',text);save();},
-    async message(chatId,text) {return exclusive(chatId,async c=>{
+    async message(chatId,text,options={}) {return exclusive(chatId,async c=>{
       if(typeof text!=='string'||!text.trim()) return {text:'Send a question or tell me what to change in Actual.'};
       if(text.length>8000) return {text:'Please shorten the request to 8,000 characters.'};
       const old=c.pending;
       c.pending=null; // Revisions invalidate every older callback even if reasoning later fails.
-      remember(c,'user',text);save();
+      const request = options.request || {};
+      if (!request.contents) remember(c,'user',text);
+      save();
       const signal=AbortSignal.timeout(timeoutMs);
-      const contents=clone(c.history);
-      const system=INSTRUCTIONS+`\nToday: ${new Intl.DateTimeFormat('en-CA',{timeZone:timezone,dateStyle:'short'}).format(new Date(now()))}. Currency: ${currency}.`+
-        (c.references.length?'\nRecent entity references (re-read values): '+JSON.stringify(c.references):'')+
-        (old?'\nPrevious pending plan (invalidated; restage the full revised plan if requested): '+JSON.stringify(old.operations.map(o=>({domain:o.domain,action:o.action,id:o.id,fields:o.fields,preview:o.preview}))):'');
+      if (!request.contents) {
+        request.contents=clone(c.history);
+        request.system=INSTRUCTIONS+`\nToday: ${new Intl.DateTimeFormat('en-CA',{timeZone:timezone,dateStyle:'short'}).format(new Date(options.receivedAt ?? now()))}. Currency: ${currency}.`+
+          (c.references.length?'\nRecent entity references (re-read values): '+JSON.stringify(c.references):'')+
+          (old?'\nPrevious pending plan (invalidated; restage the full revised plan if requested): '+JSON.stringify(old.operations.map(o=>({domain:o.domain,action:o.action,id:o.id,fields:o.fields,preview:o.preview}))):'');
+        options.checkpoint?.();
+      }
+      const contents=clone(request.contents), system=request.system;
       const draft=[];let invalid=false;
       try {
         for(let round=0;round<8;round++) {
@@ -120,7 +146,8 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
             const answer=(content.parts||[]).filter(p=>!p.thought).map(p=>p.text||'').join('\n').trim();
             if(draft.length) {
               if(invalid) throw new Error('Some proposed changes were invalid. Please clarify the request; nothing has changed.');
-              await until(tools.validate(draft),signal);
+              try { await until(tools.validate(draft),signal); }
+              catch (e) { throw e instanceof ToolError ? e : new RetryableError('Actual is temporarily unavailable.'); }
               const p={id:randomUUID().replaceAll('-',''),created:now(),status:'pending',operations:draft,completed:[],refs:{}};
               p.operations.forEach((op,i)=>op.executionKey=p.id+'-'+i);
               const preview=previewText(p);
@@ -146,7 +173,9 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
                 rememberReferences(c,output);
               }
             } catch(e) {
+              if (e instanceof QueueStorageError) throw e;
               if(signal.aborted) throw e;
+              if (options.retryFailures && !(e instanceof ToolError)) throw new RetryableError('Actual is temporarily unavailable.');
               if(call.name.startsWith('propose_')) invalid=true;
               output={error:e instanceof ToolError?e.message:'Actual operation failed. Please narrow or retry the request.'};
             }
@@ -156,6 +185,11 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
         }
         throw new Error('I reached the tool limit. Please narrow the request. Nothing was changed.');
       } catch(e) {
+        if (e instanceof QueueStorageError) throw e;
+        if (options.retryFailures && !(e instanceof ToolError)) {
+          c.pending=null;save();
+          throw signal.aborted ? new RetryableError('The request timed out.') : e;
+        }
         c.pending=null;const text=signal.aborted?'The request timed out. Nothing was changed. Please retry.':e instanceof ToolError?e.message:/Gemini|large|limit|invalid|No answer/.test(e.message)?e.message:'I could not complete this request. Nothing was changed. Please retry.';
         remember(c,'model',text);save();return {text};
       }

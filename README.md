@@ -40,6 +40,7 @@ names); commit only the `*.example.json` templates.
 - `bot.mjs` — Telegram long-poll, receipts, voice transcription, expense workflows, and agent routing.
 - `agent.mjs` — Gemini tool loop, short conversation memory and confirmed plans.
 - `actual-tools.mjs` — validated Actual queries, reports and mutation proposals.
+- `retry-queue.mjs` — durable Telegram inbox, delayed retries and dead letters.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
 
@@ -81,7 +82,7 @@ Destructive account/category/payee changes are presented separately from edits t
 types. Split-parent structural changes remain in the existing receipt split workflow; the
 agent can edit child categories/notes without collapsing the split.
 
-Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs`,
+Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs tools/test_retry.mjs`,
 and `node bot.mjs selftest` (use synthetic
 config/cardmap files for selftest, which exercises card-map learning).
 Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
@@ -93,6 +94,28 @@ the OS temporary directory for diagnosis.
 The API client is pinned to `26.8.1`, matching the deployed Actual server. A newer budget may
 reject an older client with `out-of-sync-migrations`; update the pin to the server's version
 and run the smoke check before restarting production.
+
+## Automatic retries
+
+Authorized Telegram text, voice and photo messages are saved before acknowledging delivery.
+Temporary Gemini/Telegram failures (429, 5xx, timeouts and interrupted connections) retry after
+1, 5 and 15 minutes, then hourly, honoring longer `Retry-After` delays. Model fallback remains,
+but there are no immediate repeated calls to the same model. Terse receipt parsing still works
+without Gemini; failed AI interpretation is queued rather than converted into a guessed expense.
+The bot shows one “Queued — I’ll retry automatically” status, updating it when processing finishes.
+Transcripts, receipt references and the original request date/context survive restarts. Messages
+stay ordered within each chat, and buttons wait while that chat has queued work. Other chats and
+Telegram polling continue. Agent changes still need the owner's existing Confirm button.
+
+The queue is `actual-data/message-queue.json` (under the configured `actual.dataDir`, mode 0600).
+It contains private message/financial context and Telegram attachment IDs, not downloaded media
+or API keys. Completed payloads are removed. After 24 hours, or on a permanent failure, the
+payload remains with `status: "dead"` for inspection, with one notification and no further retries.
+Any failure/restart after an Actual mutation started is also held there: its outcome may be
+uncertain, so it is never replayed automatically. Inspect Actual before attempting that work again;
+do not reset an uncertain job to pending. HTTP `/ingest` and confirmation execution retain their
+existing workflows and are not automatically replayed. Preserve the queue file if it is corrupt;
+the bot stops rather than silently discarding it. Run only one bot process per queue/token.
 
 ## Deploy
 On an always-on host with network access to the Actual server (e.g. a Proxmox LXC). The repo is

@@ -1,14 +1,25 @@
 // Telegram receipt logger -> Actual Budget
 // Flow: photo+caption -> Gemini vision extracts receipt JSON -> caption parsed in code
 //       -> route to card account (explicit alias > receipt last-4 > ask) -> write to Actual -> reply.
-import * as api from '@actual-app/api';
+import * as actualApi from '@actual-app/api';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createActualTools } from './actual-tools.mjs';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
+import { createRetryQueue, guardActualWrites, RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
+
+const messageContext = new AsyncLocalStorage();
+const currentMessage = () => messageContext.getStore();
+let messageQueue;
+function checkpointMessage(fields) {
+  const job = currentMessage();
+  if (job) messageQueue.checkpoint(job, fields);
+}
+const api = guardActualWrites(actualApi, () => checkpointMessage({ unsafe: true }));
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(fs.readFileSync(path.join(__dir, 'config.json'), 'utf8'));
@@ -45,11 +56,11 @@ const isRelay = chatId => !!cfg.telegram.relayChannelId && String(chatId) === St
 const isAllowedChat = chatId => !!cfg.telegram.allowedChatId && (String(chatId) === String(cfg.telegram.allowedChatId) || isRelay(chatId));
 const isOwner = userId => !!cfg.telegram.allowedChatId && String(userId) === String(cfg.telegram.allowedChatId);
 const agentFor = chatId => isAllowedChat(chatId) && (!isRelay(chatId) || cfg.agent?.relayEnabled === true) ? budgetAgent : null;
-// Telegram polling is sequential; ingest shares this queue during confirmations.
+// The retry worker, callbacks and ingest share serialized Actual access.
 let actualQueue = Promise.resolve();
 const serializeActual = fn => {
   const guarded = () => {
-    if (agentTools?.hasPendingWrite()) throw new Error('An earlier Actual write is still pending; please wait before retrying.');
+    if (agentTools?.hasPendingWrite()) throw new RetryableError('An earlier Actual write is still pending.');
     return fn();
   };
   const next = actualQueue.then(guarded, guarded);
@@ -80,22 +91,37 @@ async function sendAgentResult(chatId, result) {
 async function runAgent(chatId, text, rec = null) {
   if (!budgetAgent) return send(chatId, 'The budget assistant is unavailable. Please try again shortly.');
   if (!agentFor(chatId)) return send(chatId, 'Send budget questions to my authorized direct chat.');
-  if (rec) budgetAgent.remember(chatId, `Receipt reference: ${JSON.stringify({ id: rec.id, cardTxnId: rec.cardTxnId, owedTxnId: rec.owedTxnId, date: rec.date, accountName: rec.account, payeeName: rec.payee })}`);
+  const job = currentMessage();
+  if (job && !job.agent) checkpointMessage({ agent: { text, rec, request: {} } });
+  if (job?.agent.result) return sendAgentResult(chatId, job.agent.result);
+  if (rec && !job?.agent.request.contents) budgetAgent.remember(chatId, `Receipt reference: ${JSON.stringify({ id: rec.id, cardTxnId: rec.cardTxnId, owedTxnId: rec.owedTxnId, date: rec.date, accountName: rec.account, payeeName: rec.payee })}`);
   const p = budgetAgent.pending(chatId);
   if (p && /^(?:yes|confirm|ok|okay)$/i.test(text.trim())) return sendAgentResult(chatId, { text: 'Please use Confirm on the full plan above to apply it.', planId: p.id });
   if (p && /^(?:no|cancel)$/i.test(text.trim())) return sendAgentResult(chatId, await budgetAgent.cancel(chatId, p.id));
-  return sendAgentResult(chatId, await budgetAgent.message(chatId, text));
+  const result = await budgetAgent.message(chatId, text, job ? {
+    request: job.agent.request, retryFailures: true, receivedAt: job.receivedAt,
+    checkpoint: () => checkpointMessage({}),
+  } : {});
+  if (job) checkpointMessage({ agent: { ...job.agent, result } });
+  return sendAgentResult(chatId, result);
 }
 
 // ---------- Telegram helpers ----------
 async function tg(method, params) {
-  const r = await fetch(`${TG}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params || {}),
-    signal: AbortSignal.timeout(method === 'getUpdates' ? 65_000 : 20_000),
-  });
-  return r.json();
+  let r, data;
+  try {
+    r = await fetch(`${TG}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params || {}),
+      signal: AbortSignal.timeout(method === 'getUpdates' ? 65_000 : 20_000),
+    });
+    data = await r.json();
+  } catch { throw new RetryableError('Telegram connection unavailable.', r ? retryAfterMs(r) : 0); }
+  if (r.status === 429 || r.status >= 500 || data.error_code === 429 || data.error_code >= 500) {
+    throw new RetryableError('Telegram is temporarily unavailable.', Math.max(retryAfterMs(r), (data.parameters?.retry_after || 0) * 1000));
+  }
+  return data;
 }
 async function send(chatId, text, reply_markup) {
   const r = await tg('sendMessage', { chat_id: chatId, text, ...(reply_markup ? { reply_markup } : {}) });
@@ -139,12 +165,20 @@ async function react(chatId, messageId, emoji) {
   if (r && r.ok === false) console.error('react failed:', r.description);
 }
 async function downloadPhoto(fileId) {
+  return downloadTelegramFile(fileId);
+}
+async function downloadTelegramFile(fileId, mime) {
   const f = await tg('getFile', { file_id: fileId });
-  const filePath = f.result.file_path;
-  const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`, { signal: AbortSignal.timeout(30_000) });
-  const buf = Buffer.from(await r.arrayBuffer());
-  const mime = filePath.endsWith('.png') ? 'image/png' : 'image/jpeg';
-  return { buf, mime };
+  const filePath = f.result?.file_path;
+  if (!filePath) throw new Error('Telegram attachment is unavailable.');
+  let r, buf;
+  try {
+    r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`, { signal: AbortSignal.timeout(30_000) });
+    buf = Buffer.from(await r.arrayBuffer());
+  } catch { throw new RetryableError('Telegram attachment download interrupted.'); }
+  if (r.status === 429 || r.status >= 500) throw new RetryableError('Telegram attachment temporarily unavailable.', retryAfterMs(r));
+  if (!r.ok) throw new Error('Telegram attachment is unavailable.');
+  return { buf, mime: mime || (filePath.endsWith('.png') ? 'image/png' : 'image/jpeg') };
 }
 
 // ---------- Gemini extractor (pluggable: swap this fn for Claude/local later) ----------
@@ -170,24 +204,32 @@ const GEMINI_TIMEOUT_MS = 60_000;
 async function geminiGenerate(parts, schema) {
   const body = { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', responseSchema: schema } };
   const signal = AbortSignal.timeout(GEMINI_TIMEOUT_MS);
-  let lastErr = 'unknown';
+  let failure = new Error('Gemini unavailable.');
+  let retryDelay = 0;
   for (const model of GEMINI_MODELS) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body), signal });
-        if (r.status === 429 || r.status >= 500) { lastErr = `${model} HTTP ${r.status}`; await sleep(700 * (attempt + 1)); continue; }
-        const d = await r.json();
-        const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!t) { lastErr = `${model}: ${JSON.stringify(d).slice(0, 150)}`; break; } // bad response -> try next model
-        return JSON.parse(t);
-      } catch (e) {
-        if (signal.aborted) throw new Error(`Gemini timed out after ${GEMINI_TIMEOUT_MS / 1000}s`);
-        lastErr = `${model}: ${e.message}`; await sleep(700);
-      }
+    if (signal.aborted) throw new RetryableError(`Gemini timed out after ${GEMINI_TIMEOUT_MS / 1000}s`);
+    let r;
+    try {
+      r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': GEMINI_KEY }, body: JSON.stringify(body), signal });
+    } catch {
+      if (signal.aborted) throw new RetryableError(`Gemini timed out after ${GEMINI_TIMEOUT_MS / 1000}s`);
+      failure = new RetryableError('Gemini connection unavailable.', retryDelay); continue;
     }
+    if (r.status === 429 || r.status >= 500) {
+      retryDelay = Math.max(retryDelay, retryAfterMs(r));
+      failure = new RetryableError(`Gemini HTTP ${r.status}.`, retryDelay); continue;
+    }
+    if (r.status === 401 || r.status === 403) throw new Error(`Gemini HTTP ${r.status}.`);
+    if (!r.ok) { if (!(failure instanceof RetryableError)) failure = new Error(`Gemini HTTP ${r.status}.`); continue; }
+    try {
+      const d = await r.json();
+      const t = d?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!t) throw new Error('No answer');
+      return JSON.parse(t);
+    } catch { failure = new RetryableError('Gemini returned an incomplete response.', retryDelay); }
   }
-  throw new Error('Gemini unavailable (' + lastErr + ')');
+  throw failure;
 }
 async function extractReceipt(buf, mime) {
   return geminiGenerate(
@@ -363,7 +405,10 @@ async function geminiFreeText(text) {
   let o;
   try {
     o = await geminiGenerate([{ text: `Determine whether this message logs a new expense (isExpense). For questions, commands, budget changes or other conversation, set isExpense=false and total=0. Otherwise extract the expense. Put only the store/payee name in "merchant" and purchased items in "items". Message: ${JSON.stringify(text)}` }], FREETEXT_SCHEMA);
-  } catch { return null; } // Gemini down across all models -> caller falls back to the regex parse
+  } catch (e) {
+    if (currentMessage()) throw e; // Do not turn an unavailable model into a guessed expense.
+    return null; // Keep the legacy regex fallback outside the durable message worker.
+  }
   if (o.isExpense === false) return false;
   const amount = Math.abs(Number(o.total));
   if (!amount || !isFinite(amount)) return null;
@@ -389,7 +434,10 @@ async function parseVoice(buf, mime) {
       [{ text: 'Transcribe this voice note verbatim into "text". If it logs a new expense, set isExpense=true and fill expense fields. Questions, instructions to change records or budgets, and general conversation have isExpense=false and total=0 even when amounts are mentioned. Only set split/paid if actually said.' },
        { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
       VOICE_SCHEMA);
-  } catch { return { transcript: '', ft: null }; }
+  } catch (e) {
+    if (currentMessage()) throw e;
+    return { transcript: '', ft: null };
+  }
   const transcript = (o.text || '').trim();
   if (o.isExpense === false || isAgentRequest(transcript)) return { transcript, ft: null };
   const amount = Math.abs(Number(o.total));
@@ -538,6 +586,8 @@ const ownerPending = {}; // chatId -> { receipt, parsed, account, owner }  (a ch
 const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
 const msgTxn = {}; // chatId:messageId -> rec (Telegram message IDs are only unique within a chat)
 function receiptFor(chatId, mid) {
+  const job = currentMessage();
+  if (job?.chatId === chatId && job.context?.replyMid === mid) return job.context.replyTxn;
   const scoped = msgTxn[`${chatId}:${mid}`];
   if (scoped) return scoped;
   // Old links are safe only when they identify this chat's known latest receipt.
@@ -567,7 +617,7 @@ function loadTxns() {
   } catch (e) { console.error('loadTxns:', e.message); }
 }
 
-function todayISO() { return new Date().toISOString().slice(0, 10); }
+function todayISO() { return new Date(currentMessage()?.receivedAt ?? Date.now()).toISOString().slice(0, 10); }
 // Gemini reads a well-formed but wrong YEAR off some receipts ("2023-08-26" for a 2026 charge),
 // which buries the txn years back in Actual where you never see it. A shape check isn't enough —
 // only trust a receipt date inside a plausible window, else fall back to today.
@@ -754,13 +804,18 @@ async function applyFieldValue(chatId, text) {
 async function handlePhoto(chatId, msg) {
   delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId]; // a fresh receipt supersedes any unanswered prompt
   const fileId = msg.photo[msg.photo.length - 1].file_id; // largest
-  const statusMid = await send(chatId, '📸 reading receipt…');
+  const statusMid = await progressMessage(chatId, '📸 reading receipt…');
   let receipt;
   try {
-    const { buf, mime } = await downloadPhoto(fileId);
-    receipt = await extractReceipt(buf, mime);
+    receipt = currentMessage()?.receipt;
+    if (!receipt) {
+      const { buf, mime } = await downloadPhoto(fileId);
+      receipt = await extractReceipt(buf, mime);
+      checkpointMessage({ receipt });
+    }
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: '📸 Receipt read.' }).catch(() => {});
   } catch (e) {
+    if (currentMessage()) throw e;
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: "⚠️ Couldn't read that receipt." }).catch(() => {});
     throw e;
   }
@@ -783,24 +838,25 @@ async function handlePhoto(chatId, msg) {
 
 // Download a Telegram voice/audio note, run it through Gemini, and replace the progress message.
 async function transcribeVoiceNote(chatId, msg) {
-  const statusMid = await send(chatId, '🎙 transcribing…');
+  const statusMid = await progressMessage(chatId, '🎙 transcribing…');
   try {
     const v = msg.voice || msg.audio;
-    const f = await tg('getFile', { file_id: v.file_id });
-    const r = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${f.result.file_path}`, { signal: AbortSignal.timeout(30_000) });
-    const buf = Buffer.from(await r.arrayBuffer());
+    const { buf } = await downloadTelegramFile(v.file_id, v.mime_type || 'audio/ogg');
     const result = await parseVoice(buf, v.mime_type || 'audio/ogg');
     const text = result.transcript ? `🎙 Heard: "${result.transcript}"` : "Couldn't make out the voice note — try again, or type it.";
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text }).catch(() => {});
     return result;
   } catch (e) {
+    if (currentMessage()) throw e;
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: "⚠️ Couldn't transcribe that voice note." }).catch(() => {});
     throw e;
   }
 }
 // Voice note -> one Gemini call -> structured expense (+ transcript) -> the normal confirm/split flow.
 async function handleVoice(chatId, msg) {
-  const { transcript, ft } = await transcribeVoiceNote(chatId, msg);
+  const voice = currentMessage()?.voice || await transcribeVoiceNote(chatId, msg);
+  checkpointMessage({ voice });
+  const { transcript, ft } = voice;
   if (!transcript) return;
   return dispatch(chatId, { ...msg, voice: undefined, audio: undefined, text: transcript }, ft);
 }
@@ -1211,6 +1267,7 @@ async function onRelayPost(post) {
     await react(id, post.message_id, REACT_DONE);
   } catch (e) {
     await react(id, post.message_id, '');
+    if (currentMessage()) throw e;
     await send(id, '⚠️ relay error: ' + e.message).catch(() => {});
     console.error('relay', e);
   }
@@ -1355,6 +1412,7 @@ async function onUpdate(u) {
     await react(chatId, msg.message_id, REACT_DONE);
   } catch (e) {
     await react(chatId, msg.message_id, '');
+    if (currentMessage()) throw e;
     await send(chatId, '⚠️ ' + (e.message || String(e)));
     console.error(e);
   }
@@ -1394,10 +1452,70 @@ async function dispatch(chatId, msg, voiceExpense) {
   if (confirming[chatId] && await handleConfirm(chatId, msg.text)) return;
   if (pending[chatId]) return await handleCardAnswer(chatId, msg.text);
   if (msg.reply_to_message) return send(chatId, 'I cannot safely identify that older receipt. Tell me its merchant, amount and date so I can find it before proposing changes.');
-  if (!isRelay(chatId) && lastTxn[chatId] && Date.now() - lastTxn[chatId].ts < EDIT_WINDOW_MS && isReceiptEdit(msg.text)) return await editLast(chatId, msg.text);
+  const previous = currentMessage()?.context ? currentMessage().context.lastTxn : lastTxn[chatId];
+  if (!isRelay(chatId) && previous && (currentMessage()?.receivedAt ?? Date.now()) - previous.ts < EDIT_WINDOW_MS && isReceiptEdit(msg.text)) return await editTxn(chatId, previous, msg.text);
   const ft = voiceExpense !== undefined ? voiceExpense : await parseExpense(msg.text);
   if (ft) return await handleFreeText(chatId, ft);
-  return runAgent(chatId, msg.text, lastTxn[chatId]);
+  return runAgent(chatId, msg.text, previous);
+}
+
+async function progressMessage(chatId, text) {
+  const job = currentMessage();
+  if (job?.progressMid) return job.progressMid;
+  const mid = await send(chatId, text);
+  checkpointMessage({ progressMid: mid });
+  return mid;
+}
+
+async function messageQueueStatus(job, status) {
+  if (!isAllowedChat(job.chatId)) return;
+  const text = status === 'queued' ? '⏳ Queued — I’ll retry automatically. No need to resend.'
+    : status === 'done' ? '✅ Queued request processed.'
+    : job.reason === 'write-outcome-uncertain'
+      ? '⚠️ A budget write may have completed. Saved for inspection; I will not repeat it automatically.'
+      : '⚠️ I could not finish this request. It is saved in the dead-letter queue for inspection.';
+  if (job.progressMid) {
+    const result = await tg('editMessageText', { chat_id: job.chatId, message_id: job.progressMid, text });
+    if (result?.ok !== false) return;
+  }
+  const mid = await send(job.chatId, text);
+  // Completion has already removed this job; other statuses retain the notification ID.
+  if (status !== 'done') messageQueue.checkpoint(job, { progressMid: mid });
+}
+
+async function processMessageJob(job) {
+  if (!isAllowedChat(job.chatId)) throw new Error('Chat is no longer authorized.');
+  return serializeActual(() => messageContext.run(job, async () => {
+    const msg = job.payload.message || job.payload.channel_post;
+    if (!job.context) {
+      checkpointMessage({ receivedAt: msg.date ? msg.date * 1000 : job.createdAt, context: {
+        lastTxn: lastTxn[job.chatId] || null, replyMid: msg.reply_to_message?.message_id,
+        replyTxn: msg.reply_to_message ? receiptFor(job.chatId, msg.reply_to_message.message_id) : null,
+        workflow: [pending, confirming, ownerPending, editField].map(map => map[job.chatId] || null),
+      } });
+    }
+    // A delayed agent request resumes its original interpretation, not a newer receipt/plan.
+    if (job.agent) return runAgent(job.chatId, job.agent.text, job.agent.rec);
+    [pending, confirming, ownerPending, editField].forEach((map, i) => {
+      const value = job.context.workflow[i];
+      if (value) map[job.chatId] = structuredClone(value); else delete map[job.chatId];
+    });
+    return onUpdate(job.payload);
+  }));
+}
+
+async function acceptUpdate(update) {
+  if (update.update_id < messageQueue.offset) return;
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    if (messageQueue.hasPending(cq.message?.chat?.id)) {
+      await tg('answerCallbackQuery', { callback_query_id: cq.id, text: 'An earlier message is queued. I’ll finish it before handling changes.', show_alert: true });
+    } else await serializeActual(() => onCallback(cq));
+    messageQueue.acknowledge(update.update_id);
+    return;
+  }
+  const msg = update.message || update.channel_post;
+  messageQueue.acknowledge(update.update_id, msg?.chat?.id, msg && isAllowedChat(msg.chat.id) ? update : undefined);
 }
 
 // ---------- HTTP ingest (Apple Pay / Shortcuts POST here; NOT via Telegram) ----------
@@ -1515,24 +1633,28 @@ async function main() {
   budgetAgent = cfg.agent?.enabled === false ? null : initAgent();
   console.log('Accounts:', Object.keys(ACCT).join(', '));
   loadTxns(); // restore reply->txn links so edits survive restarts
+  messageQueue = createRetryQueue({ filePath: path.resolve(__dir, cfg.actual.dataDir, 'message-queue.json'), onStatus: messageQueueStatus });
+  const work = () => messageQueue.runOne(processMessageJob).catch(e => {
+    console.error('message queue stopped:', e.message);
+    process.exit(1); // Never acknowledge newer messages after a queue storage failure.
+  });
+  setInterval(work, 1000).unref();
+  void work();
   if (cardmap.lastSplitPerson && !personName(cardmap.lastSplitPerson)) { delete cardmap.lastSplitPerson; saveCardmap(); } // scrub a poisoned partner name
   startIngest();
   if (!cfg.telegram.allowedChatId) console.log('WARNING: allowedChatId not set — bot will respond to anyone who messages it. Run `npm run chatid` and set it in config.json.');
   console.log('Bot running. Long-polling Telegram…');
-  let offset = 0;
   for (;;) {
     try {
-      const res = await tg('getUpdates', { offset, timeout: 50 });
+      const res = await tg('getUpdates', { offset: messageQueue.offset, timeout: 50 });
       for (const u of res.result || []) {
-        offset = u.update_id + 1;
-        try { await serializeActual(() => onUpdate(u)); }
-        catch (e) {
-          const chatId = u.message?.chat?.id || u.callback_query?.message?.chat?.id;
-          if (String(chatId) === String(cfg.telegram.allowedChatId)) await send(chatId, 'Actual is still finishing an earlier write. Please wait, then retry.').catch(() => {});
-          console.error('update processing failed', e.message);
-        }
+        await acceptUpdate(u);
       }
-    } catch (e) { console.error('poll error', e.message); await sleep(3000); }
+      void work();
+    } catch (e) {
+      if (e instanceof QueueStorageError) throw e;
+      console.error('poll error', e.message); await sleep(3000);
+    }
   }
 }
 // `node bot.mjs selftest` — checks core behavior without touching Telegram/Actual.
@@ -1613,8 +1735,9 @@ async function selftest() {
     requests.push({ url: String(url), options });
     if (String(url).endsWith('/sendMessage')) return { json: async () => ({ ok: true, result: { message_id: 77 } }) };
     if (String(url).endsWith('/getFile')) return { json: async () => ({ ok: true, result: { file_path: fixture === 'voice' ? 'voice.ogg' : 'receipt.jpg' } }) };
-    if (String(url).includes('/file/bot')) return { arrayBuffer: async () => Buffer.from(fixture) };
+    if (String(url).includes('/file/bot')) return { ok: true, status: 200, arrayBuffer: async () => Buffer.from(fixture) };
     if (String(url).includes('generativelanguage.googleapis.com')) return {
+      ok: true,
       status: 200,
       json: async () => ({ candidates: [{ content: { parts: [{ text: JSON.stringify(fixture === 'voice'
         ? voiceFixture

@@ -2,9 +2,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
+import os from 'node:os';
+import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { test } from 'node:test';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from '../agent.mjs';
 import { createActualTools } from '../actual-tools.mjs';
+import { createRetryQueue, RetryableError, guardActualWrites } from '../retry-queue.mjs';
 
 const source = fs.readFileSync(new URL('../bot.mjs', import.meta.url), 'utf8');
 function declaration(name) {
@@ -20,6 +24,7 @@ function fixture() {
   const rec = { id: 'receipt-fixture', date: '2026-09-09', account: 'Scotiabank VI', payee: 'Shop', notes: 'Eggs and butter on sale', ts: Date.now() };
   const bot = vm.createContext({
     console: { log() {}, error() {} },
+    currentMessage: () => undefined, checkpointMessage: () => {},
     cfg: { telegram: { allowedChatId: 42, relayChannelId: -42 }, agent: { relayEnabled: true }, defaults: {} },
     budgetAgent: {
       pending: () => null,
@@ -51,6 +56,101 @@ function fixture() {
 }
 const post = (text, reply = true) => ({ chat: { id: -42, type: 'channel' }, message_id: 92, text,
   ...(reply ? { reply_to_message: { message_id: 91 } } : {}) });
+
+function queuedFixture(t) {
+  const f = fixture(), dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-queue-routing-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let now = Date.parse('2026-09-10T21:57:00Z');
+  const storage = new AsyncLocalStorage();
+  Object.assign(f.bot, {
+    structuredClone, Buffer, messageContext: storage, currentMessage: () => storage.getStore(),
+    checkpointMessage: fields => { const job = storage.getStore(); if (job) f.bot.messageQueue.checkpoint(job, fields); },
+    serializeActual: fn => fn(),
+  });
+  vm.runInContext(['progressMessage', 'messageQueueStatus', 'processMessageJob', 'acceptUpdate'].map(declaration).join('\n'), f.bot);
+  f.reload = () => f.bot.messageQueue = createRetryQueue({ filePath: path.join(dir, 'queue.json'), now: () => now, onStatus: f.bot.messageQueueStatus });
+  f.advance = ms => now += ms;
+  f.run = () => f.bot.messageQueue.runOne(f.bot.processMessageJob);
+  f.reload();
+  return f;
+}
+
+test('voice-to-agent 429 queues once, resumes after restart without retranscribing or retargeting', async t => {
+  const f = queuedFixture(t); let transcripts = 0, attempts = 0;
+  f.bot.transcribeVoiceNote = async () => { transcripts++; return { transcript: "Remember Sam's card ending 1234", ft: null }; };
+  f.bot.budgetAgent.message = async (_chat, text, options) => {
+    f.calls.push(text);
+    if (++attempts === 1) throw new RetryableError('Gemini HTTP 429.');
+    assert.equal(options.retryFailures, true);
+    return { text: 'Ready for confirmation', planId };
+  };
+  await f.bot.acceptUpdate({ update_id: 1, channel_post: { ...post(undefined), voice: { file_id: 'voice' } } });
+  await f.run();
+  assert.equal(f.bot.messageQueue.jobs[0].status, 'retry');
+  assert.equal(f.messages.filter(m => /Queued/.test(m.text)).length, 1);
+  assert.ok(f.messages.every(m => !/429|Please try again/.test(m.text)));
+  f.bot.lastTxn[-42] = { id: 'newer-unrelated-receipt' };
+  f.bot.msgTxn['-42:91'] = f.bot.lastTxn[-42];
+  f.reload(); f.advance(60_000); await f.run();
+  assert.equal(transcripts, 1); assert.equal(attempts, 2);
+  assert.ok(f.references.every(r => !r.text.includes('newer-unrelated')));
+  assert.equal(f.bot.messageQueue.jobs.length, 0);
+  assert.equal(f.messages.filter(m => m.keyboard).length, 1);
+  assert.deepEqual(f.writes, []);
+});
+
+test('photo extraction and voice transcription failures reach the durable worker', async t => {
+  for (const kind of ['photo', 'voice']) {
+    const f = queuedFixture(t); let attempts = 0;
+    Object.assign(f.bot, {
+      cardmap: { byLast4: { '1234': 'Card' } }, parseCaption: () => ({}), ownerOf: () => null,
+      downloadPhoto: async () => ({ buf: Buffer.from('test'), mime: 'image/jpeg' }),
+      downloadTelegramFile: async () => ({ buf: Buffer.from('test') }),
+      RECEIPT_SCHEMA: {}, VOICE_SCHEMA: {},
+      geminiGenerate: async () => {
+        if (++attempts === 1) throw new RetryableError('Gemini HTTP 503.');
+        return kind === 'photo' ? { merchant: 'Shop', total: 6.98, card_last4: '1234' } : { text: 'Show the budget', isExpense: false };
+      },
+    });
+    vm.runInContext(['handlePhoto', 'extractReceipt', 'transcribeVoiceNote', 'parseVoice'].map(declaration).join('\n'), f.bot);
+    const media = kind === 'photo' ? { photo: [{ file_id: 'photo' }] } : { voice: { file_id: 'voice' } };
+    await f.bot.acceptUpdate({ update_id: 1, channel_post: { chat: { id: -42 }, message_id: 1, ...media } });
+    await f.run();
+    assert.equal(f.bot.messageQueue.jobs[0].status, 'retry');
+    f.advance(60_000); await f.run();
+    assert.equal(attempts, 2); assert.equal(f.bot.messageQueue.jobs.length, 0);
+    assert.equal(f.messages.filter(m => /reading receipt|transcribing/.test(m.text)).length, 1);
+    assert.ok(f.messages.every(m => !/503|Couldn't|try again/.test(m.text)));
+  }
+});
+
+test('delivery failure after logging cannot duplicate the receipt', async t => {
+  const f = queuedFixture(t);
+  const api = guardActualWrites({ addTransactions: async () => f.writes.push('write') }, () => f.bot.checkpointMessage({ unsafe: true }));
+  f.bot.handlePhoto = async () => { await api.addTransactions(); throw new RetryableError('Telegram unavailable'); };
+  await f.bot.acceptUpdate({ update_id: 1, channel_post: { chat: { id: -42 }, message_id: 1, photo: [{ file_id: 'photo' }] } });
+  await f.run(); f.reload(); f.advance(60_000); await f.run();
+  assert.deepEqual(f.writes, ['write']);
+  assert.equal(f.bot.messageQueue.jobs[0].reason, 'write-outcome-uncertain');
+});
+
+test('queued requests retain the received date and cannot execute through buttons or another chat', async t => {
+  const f = queuedFixture(t);
+  vm.runInContext(declaration('todayISO'), f.bot);
+  f.bot.budgetAgent.message = async (_chat, _text, options) => {
+    assert.equal(f.bot.todayISO(), '2026-09-10');
+    assert.equal(options.receivedAt, Date.parse('2026-09-10T21:57:00Z'));
+    throw new RetryableError('429');
+  };
+  await f.bot.acceptUpdate({ update_id: 1, channel_post: { ...post('Show the budget'), date: Date.parse('2026-09-10T21:57:00Z') / 1000 } });
+  await f.run();
+  await f.bot.acceptUpdate({ update_id: 2, callback_query: { id: 'tap', from: { id: 42 }, data: `ag:y:${planId}`, message: { chat: { id: -42 } } } });
+  assert.deepEqual(f.confirmations, []);
+  assert.match(f.requests.at(-1).params.text, /earlier message is queued/);
+  await f.bot.acceptUpdate({ update_id: 3, message: { chat: { id: 7 }, text: 'Show the budget' } });
+  assert.equal(f.bot.messageQueue.jobs.length, 1);
+  f.advance(3_600_000); await f.run();
+});
 
 test('screenshot exchange reaches the channel agent without appending notes', async () => {
   const f = fixture();

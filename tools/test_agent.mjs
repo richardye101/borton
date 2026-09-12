@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createActualTools, ToolError } from '../actual-tools.mjs';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from '../agent.mjs';
+import { RetryableError } from '../retry-queue.mjs';
 
 const copy=x=>structuredClone(x);
 function fakeActual() {
@@ -216,5 +217,17 @@ await test('date-only updates discard echoed unchanged transaction fields',async
   await t.validate(ops);assert.equal(f.writes.length,0);
   const noop=await t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{cleared:false}}]});
   assert.deepEqual(noop[0].fields,{cleared:false});
+});
+await test('retry discards partial drafts and still requires exactly one owner confirmation',async()=>{
+  const f=fakeActual(),request={};
+  const change=content('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{date:'2026-09-08'}}]});
+  const a=createAgent({tools:createActualTools(f.api),allowedChatId:42,
+    generate:script(change,()=>{throw new RetryableError('429');},change,answer('Ready'))});
+  await assert.rejects(()=>a.message(42,'Change the date to Sept 8th',{request,retryFailures:true}),RetryableError);
+  assert.equal(a.pending(42),null);assert.equal(f.writes.length,0);
+  const p=await a.message(42,'Change the date to Sept 8th',{request,retryFailures:true});
+  assert.equal(a.pending(42).operations.length,1);assert.equal(f.writes.length,0);
+  await a.confirm(42,p.planId);await a.confirm(42,p.planId);
+  assert.equal(f.writes.length,1);assert.equal(f.data.transaction[0].date,'2026-09-08');
 });
 console.log(`test_agent: ${checks} checks passed`);

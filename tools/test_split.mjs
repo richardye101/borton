@@ -20,6 +20,7 @@ function fixture() {
   const writes = [], messages = [];
   const bot = vm.createContext({
     console,
+    currentMessage: () => undefined, checkpointMessage: () => {},
     isReceiptEdit,
     cfg: { defaults: { splitPerson: 'Ryan' }, telegram: { allowedChatId: 42 } },
     ACCT: { Card: 'card', Alice: 'a', Bob: 'b', Carol: 'c', Ryan: 'r' },
