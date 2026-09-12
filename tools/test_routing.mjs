@@ -260,13 +260,130 @@ test('channel field edits and new accounts stage plans instead of writing anonym
   f.bot.editField[-42] = { kind: 'logged', field: 'note', mid: 91 };
   await f.bot.applyFieldValue(-42, 'corrected note');
   assert.equal(f.calls.at(-1).text, 'note: corrected note');
-  f.bot.pending[-42] = { awaitNewAccount: true };
+  f.bot.pending[-42] = { awaitNewAccount: true, receipt: { merchant: 'Flower Shop', total: 7.35, date: '2026-09-09' }, parsed: {} };
+  Object.assign(f.bot, { safeDate: date => date, maybeAutoSplit: (_r, p) => p, guessCategory: () => 'Gifts' });
   await f.bot.handleCardAnswer(-42, 'New Card');
-  assert.match(f.calls.at(-1).text, /Create an Actual account named "New Card"/);
+  assert.match(f.calls.at(-1).text, /"New Card"/);
+  assert.match(f.calls.at(-1).text, /same plan/i);
+  assert.match(f.calls.at(-1).text, /Flower Shop/);
+  assert.match(f.calls.at(-1).text, /7\.35/);
+  assert.doesNotMatch(f.calls.at(-1).text, /Do not log the pending receipt yet/);
+  assert.equal(f.bot.pending[-42], undefined);
   f.bot.pending[-42] = { ingest: { amount: 6.98 } };
   f.bot.resolveAccount = () => 'Card'; f.bot.cardKb = () => ({});
   await f.bot.handleCardAnswer(-42, 'Card');
   assert.match(f.messages.at(-1).text, /verify the owner/);
+  assert.deepEqual(f.writes, []);
+});
+
+test('new-account receipt survives retry and restart; one owner confirmation logs it exactly once', async t => {
+  const f = queuedFixture(t), dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-account-receipt-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const accounts = [], transactions = [], prompts = [];
+  const api = {
+    sync: async () => {}, getAccounts: async () => structuredClone(accounts),
+    getCategories: async () => [{ id: 'gifts', name: 'Gifts' }],
+    getPayees: async () => [{ id: 'flowers', name: 'Flower Shop' }],
+    createAccount: async fields => { f.writes.push('account'); accounts.push({ ...fields, id: 'new-card' }); return 'new-card'; },
+    addTransactions: async (_account, rows) => { f.writes.push('transaction'); transactions.push(...rows.map(row => ({ ...row, id: 'new-txn' }))); },
+    getTransactions: async () => structuredClone(transactions),
+  };
+  let turn = 0;
+  const generate = async ({ contents }) => {
+    const prompt = contents.find(c => c.role === 'user')?.parts[0].text;
+    prompts.push(prompt);
+    assert.match(prompt, /Flower Shop/);
+    assert.match(prompt, /7\.35/);
+    assert.match(prompt, /2026-09-09/);
+    const call = (name, args) => ({ role: 'model', parts: [{ functionCall: { name, args } }] });
+    switch (++turn) {
+      case 1: throw new RetryableError('Gemini HTTP 503.');
+      case 2: return call('propose_account_change', { action: 'create', fields: { name: 'New Debit' }, ref: 'card' });
+      case 3: return { role: 'model', parts: [{ text: 'Account ready.' }] }; // Must not expose this incomplete plan.
+      case 4:
+        assert.match(contents.at(-1).parts[0].text, /receipt.*transaction/i);
+        return call('propose_transaction_changes', { changes: [{ action: 'create', fields: {
+          account: '$card', date: '2026-09-09', amount: -735, payee: 'flowers', category: 'gifts', notes: 'Birthday flowers',
+        } }] });
+      case 5: return { role: 'model', parts: [{ text: 'Both ready.' }] };
+      default: throw new Error('Unexpected model call');
+    }
+  };
+  const reloadAgent = () => f.bot.budgetAgent = createAgent({ tools: createActualTools(api), generate,
+    allowedChatId: 42, allowedChatIds: [-42], statePath: path.join(dir, 'agent.json') });
+  reloadAgent();
+  Object.assign(f.bot, { safeDate: date => date, maybeAutoSplit: (_r, p) => p, guessCategory: () => 'Gifts', refreshActualMaps: async () => {} });
+  vm.runInContext(declaration('handleCardAnswer'), f.bot);
+  f.bot.pending[-42] = { awaitNewAccount: true, receipt: { merchant: 'Flower Shop', total: 7.35, date: '2026-09-09' }, parsed: { notes: 'Birthday flowers' } };
+  await f.bot.acceptUpdate({ update_id: 1, channel_post: post('New Debit', false) });
+  await f.run();
+  assert.equal(f.bot.messageQueue.jobs[0].status, 'retry');
+  assert.deepEqual(f.writes, []);
+  f.reload(); reloadAgent(); f.advance(60_000); await f.run();
+  assert.equal(new Set(prompts).size, 1, 'Retries retain the original receipt, not the new account-name message alone');
+  const plan = f.bot.budgetAgent.pending(-42);
+  assert.equal(plan?.operations.length, 2);
+  assert.equal(f.bot.pending[-42], undefined);
+  assert.equal(f.bot.messageQueue.jobs.length, 0);
+  assert.equal(f.messages.filter(m => m.keyboard).length, 1);
+  assert.deepEqual(f.writes, []);
+  reloadAgent(); // Confirmation must survive a separate restart after staging.
+  const tap = { id: 'tap', from: { id: 42 }, data: `ag:y:${plan.id}`, message: { chat: { id: -42 }, message_id: 100 } };
+  await f.bot.onCallback({ ...tap, from: { id: 7 } });
+  assert.deepEqual(f.writes, []);
+  await f.bot.onCallback(tap);
+  assert.deepEqual(f.writes, ['account', 'transaction']);
+  assert.equal(transactions[0].account, 'new-card');
+  assert.equal(transactions[0].amount, -735);
+  assert.equal(transactions[0].notes, 'Birthday flowers');
+  reloadAgent(); await f.bot.onCallback(tap);
+  assert.deepEqual(f.writes, ['account', 'transaction']);
+});
+
+test('new-account handoff preserves Shortcut data and cannot leave a stale card-button write path', async () => {
+  const f = fixture();
+  Object.assign(f.bot, { safeDate: date => date, maybeAutoSplit: (_r, p) => p, guessCategory: () => 'Gifts' });
+  vm.runInContext(declaration('handleCardAnswer'), f.bot);
+  f.bot.pending[-42] = { awaitNewAccount: true, ingest: { amount: 7.35, merchant: 'Flower Shop', date: '2026-09-09',
+    note: 'Birthday flowers', last4: '1234', split: true, with: 'Sam' } };
+  await f.bot.handleCardAnswer(-42, 'New Card');
+  const text = f.calls.at(-1).text;
+  for (const value of ['7.35', 'Flower Shop', '2026-09-09', 'Birthday flowers', '1234', 'Sam']) assert.ok(text.includes(value));
+  assert.ok(text.includes('"split":true'));
+  assert.equal(f.bot.pending[-42], undefined);
+  await f.bot.onCallback({ id: 'tap', from: { id: 42 }, data: 'card:New Card', message: { chat: { id: -42 }, message_id: 100 } });
+  assert.deepEqual(f.writes, []);
+});
+
+test('live Gemini includes the new account and receipt in one plan using synthetic data', { skip: process.env.BORTON_LIVE_SMOKE !== '1' }, async () => {
+  const f = fixture();
+  Object.assign(f.bot, { safeDate: date => date, maybeAutoSplit: (_r, p) => p, guessCategory: () => 'Gifts' });
+  vm.runInContext(declaration('handleCardAnswer'), f.bot);
+  const api = {
+    getAccounts: async () => [], getTransactions: async () => [],
+    getPayees: async () => [{ id: 'flowers', name: 'Flower Shop' }],
+    getCategories: async () => [{ id: 'gifts', name: 'Gifts' }], getCategoryGroups: async () => [],
+  };
+  f.bot.budgetAgent = createAgent({ tools: createActualTools(api), allowedChatId: 42, allowedChatIds: [-42],
+    planOnly: true, now: () => Date.parse('2026-09-12T12:00:00Z'),
+    generate: createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY,
+      models: JSON.parse(process.env.BORTON_SMOKE_MODELS || '["gemini-flash-latest"]') }) });
+  f.bot.pending[-42] = { awaitNewAccount: true, receipt: { merchant: 'Flower Shop', total: 7.35, date: '2026-09-09' }, parsed: { notes: 'Birthday flowers' } };
+  await f.bot.handleCardAnswer(-42, 'New Debit');
+  const plan = f.bot.budgetAgent.pending(-42);
+  assert.ok(plan, `Expected a complete plan: ${f.messages.map(m => m.text).join('; ')}`);
+  const account = plan.operations.find(op => op.domain === 'account' && op.action === 'create');
+  const transaction = plan.operations.find(op => op.domain === 'transaction' && op.action === 'create');
+  assert.equal(plan.operations.length, 2);
+  assert.equal(account?.fields.name, 'New Debit');
+  assert.equal(account.initialBalance || 0, 0);
+  assert.ok(account.ref);
+  assert.equal(transaction?.fields.account, '$' + account.ref);
+  assert.equal(transaction.fields.amount, -735);
+  assert.equal(transaction.fields.date, '2026-09-09');
+  assert.equal(transaction.fields.payee, 'flowers');
+  assert.equal(transaction.fields.category, 'gifts');
+  assert.equal(transaction.fields.notes, 'Birthday flowers');
   assert.deepEqual(f.writes, []);
 });
 

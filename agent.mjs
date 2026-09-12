@@ -125,6 +125,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
       const old=c.pending;
       c.pending=null; // Revisions invalidate every older callback even if reasoning later fails.
       const request = options.request || {};
+      if (options.requireReceipt) request.requireReceipt = true;
       if (!request.contents) remember(c,'user',text);
       save();
       const signal=AbortSignal.timeout(timeoutMs);
@@ -146,6 +147,10 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
             const answer=(content.parts||[]).filter(p=>!p.thought).map(p=>p.text||'').join('\n').trim();
             if(draft.length) {
               if(invalid) throw new Error('Some proposed changes were invalid. Please clarify the request; nothing has changed.');
+              if (request.requireReceipt && !draft.some(op => op.domain === 'transaction' && op.action === 'create')) {
+                contents.push(content, {role:'user',parts:[{text:'The pending receipt transaction is missing. Stage it against the selected account in this same plan before presenting confirmation. Do not substitute an opening balance.'}]});
+                continue;
+              }
               try { await until(tools.validate(draft),signal); }
               catch (e) { throw e instanceof ToolError ? e : new RetryableError('Actual is temporarily unavailable.'); }
               const p={id:randomUUID().replaceAll('-',''),created:now(),status:'pending',operations:draft,completed:[],refs:{}};
