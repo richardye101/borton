@@ -24,6 +24,10 @@ const action = obj({ op: en('set','prepend-notes','append-notes','delete-transac
   options: obj({ splitIndex: { type: 'integer', minimum: 1 }, method: en('fixed-amount','fixed-percent','remainder') }) }, ['op','value']);
 const txnFields = obj({ account: id, date, amount: num, payee: nullable(id), category: nullable(id),
   notes: str(), cleared: bool, reconciled: bool });
+const receiptFields = obj({ account: id, date, amount: { ...num, minimum: 1, description: 'Full purchase total, positive integer cents.' },
+  merchant: str(), category: nullable(id), notes: str(), items: arr(str()), last4: { ...str('Remember this receipt card’s last four on the selected account after confirmation.'), pattern: '^\\d{4}$' }, cardAlias: str('Original card alias the user just matched to this account; remember after confirmation.'),
+  splitPersons: arr(str('Other people sharing equally with you. Empty array explicitly removes a split.'), 10),
+  paidBy: nullable(str('Person who paid; null explicitly means you paid.')), share: en('half','mine','theirs') });
 const fields = {
   account: obj({ name: str(), offbudget: bool }),
   category: obj({ name: str(), group_id: id, is_income: bool, hidden: bool }),
@@ -62,6 +66,10 @@ declare('propose_budget_change', 'Stage an absolute category budget amount/carry
 declare('propose_note_change', 'Stage replacement of an Actual note.', obj({ id, note: str() }, ['id','note']));
 declare('propose_bank_sync', 'Stage bank import/sync; may add or change transactions. Omit account for all eligible accounts.', obj({ account: id }));
 declare('propose_sync', 'Stage retry of cloud synchronization after an earlier sync failure.', obj({}));
+declare('get_receipt_context', 'Resolve saved card aliases/last-four/ownership and receipt category/split defaults. Read before logging a receipt or changing card memory.', obj({ card: str(), last4: str(), merchant: str(), notes: str(), items: arr(str()) }));
+declare('get_receipt', 'Read a receipt and all its linked card/debt/split entries from Actual, using an exact transaction ID.', obj({ id }, ['id']));
+declare('propose_receipt_change', 'Stage a complete receipt using the existing accounting workflow: create, edit, split, unsplit, change payer/card, or delete all linked entries. Amount is the POSITIVE full total in cents. Split shares and debt transfers are computed in code, never notes. Creates require account/date/amount/merchant. Updates preserve omitted fields. Needed payees and owed accounts are included in the preview.', obj({ action: en('create','update','delete'), id, fields: receiptFields }, ['action']));
+declare('propose_card_memory_change', 'Stage persistent card alias, last-four, owner or usual split-person memory. Only save facts the user asked to remember. owner:null means the card is yours.', obj({ account: id, alias: str(), last4: { ...str(), pattern: '^\\d{4}$' }, owner: nullable(str()), splitPerson: str() }));
 
 export class ToolError extends Error {}
 const fail = message => { throw new ToolError(message); };
@@ -106,15 +114,16 @@ const refsIn = o => typeof o === 'string' && /^\$[\w-]+$/.test(o) ? [o] : o && t
 const resolveRefs = (o, refs) => typeof o === 'string' && /^\$[\w-]+$/.test(o) ? (refs[o.slice(1)] || fail(`Unresolved reference ${o}`))
   : Array.isArray(o) ? o.map(v => resolveRefs(v, refs)) : o && typeof o === 'object' ? Object.fromEntries(Object.entries(o).map(([k,v]) => [k,resolveRefs(v,refs)])) : o;
 
-export function createActualTools(api, { currency = 'CAD' } = {}) {
+export function createActualTools(api, { currency = 'CAD', receipts } = {}) {
   const rawApi=api;let pendingWrite=false;
   // Actual's API has no cancellation signal. A timed-out write stays gated until it settles.
-  api=new Proxy(rawApi,{get(target,key){const value=target[key];if(typeof value!=='function'||key==='q')return value;
-    return (...args)=>new Promise((resolve,reject)=>{
-      const isWrite=!/^(get|aqlQuery)/.test(String(key));let timedOut=false;
+  const bounded=(fn,isWrite)=>new Promise((resolve,reject)=>{
+      let timedOut=false;
       const timer=setTimeout(()=>{timedOut=true;if(isWrite)pendingWrite=true;reject(new Error('Actual API timed out'));},isWrite?45_000:15_000);
-      Promise.resolve().then(()=>value(...args)).then(resolve,reject).finally(()=>{clearTimeout(timer);if(timedOut&&isWrite)pendingWrite=false;});
-    });}});
+      Promise.resolve().then(fn).then(resolve,reject).finally(()=>{clearTimeout(timer);if(timedOut&&isWrite)pendingWrite=false;});
+    });
+  api=new Proxy(rawApi,{get(target,key){const value=target[key];if(typeof value!=='function'||key==='q')return value;
+    return (...args)=>bounded(()=>value(...args),!/^(get|aqlQuery)/.test(String(key)));}});
   const list = async kind => {
     const rows=await api[getters[kind]]();
     // Actual's hidden:true selects hidden records; it does not mean "include hidden".
@@ -142,6 +151,8 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
         && (!args.query || `${t.payeeName} ${t.notes||''}`.toLowerCase().includes(args.query.toLowerCase())));
   };
   const record = async (kind, key) => {
+    if (kind === 'receipt_state') return receipts?.state();
+    if (kind === 'receipt') return receipts?.read(key);
     if (kind === 'transaction') {
       const { data } = await api.aqlQuery(api.q('transactions').filter({ id:key }).select('*'));
       const r = data[0]; return r ? pick({...r, date:String(r.date)}, columns.transaction) : null;
@@ -163,6 +174,10 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
   const read = async (name, args) => {
     const def = definitions.find(d => d.name === name && !name.startsWith('propose_'));
     if (!def) fail('Unknown read tool'); validateSchema(def.parameters,args);
+    if (name === 'get_receipt_context' || name === 'get_receipt') {
+      if (!receipts) fail('Receipt tools are not connected in this session');
+      return name === 'get_receipt' ? receipts.read(args.id) : receipts.context(args);
+    }
     if (name === 'find_transactions' || name === 'run_report') {
       const rows = await rowsFor(args);
       if (name === 'find_transactions') return { ...windowed(rows.map(t => pick(t,[...columns.transaction.filter(k => k!=='notes'), 'accountName','payeeName','categoryName',...(args.includeNotes?['notes']:[])])), { limit:args.limit }), unit:'cents' };
@@ -221,6 +236,25 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
       op.labels[key]=r.name||r.tag||r.date||key;
       op.snapshots.push({kind,key,hash:digest(r)}); return r;
     };
+    if (domain === 'receipt' || domain === 'card_memory') {
+      if (!receipts) fail('Receipt tools are not connected in this session');
+      op.snapshots.push({kind:'receipt_state',key:'current',hash:digest(receipts.state())});
+      const input = clone(domain === 'receipt' ? f : op);
+      for (const key of ['account','category']) if (input[key]) input[key] = (await watch(key,input[key])).name;
+      if (domain === 'receipt') {
+        if (action === 'create' && op.id || action !== 'create' && !op.id) fail('Create omits id; edit/delete requires a receipt ID');
+        if (action === 'delete' && Object.keys(f).length) fail('Delete does not accept fields');
+        if (action === 'update' && !Object.keys(f).length) fail('Update fields cannot be empty');
+        if (op.id) await watch('receipt',op.id);
+        const prepared = await receipts.prepare({action,id:op.id,fields:input,memory:previous.filter(o=>o.domain === 'card_memory').map(o=>o.recipe)});
+        op.recipe=prepared.recipe;op.preview=prepared.preview;
+        for (const [kind,ids] of Object.entries(prepared.watch || {})) for (const key of ids) await watch(kind,key);
+      } else {
+        op.recipe=await receipts.prepareMemory(input);op.preview=op.recipe.preview;
+      }
+      op.depends=refsIn(domain === 'receipt' ? pick(f,['account','category']) : pick(op,['account']));
+      return op;
+    }
     const target=op.id?await watch(domain,op.id):null;
     if(target&&domain==='transaction') for(const [key,kind] of Object.entries({account:'account',payee:'payee',category:'category'})) if(target[key]) await watch(kind,target[key]);
     if(fields[domain]) {
@@ -330,6 +364,8 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
     if(pendingWrite) fail('An earlier Actual write has not finished. Wait for it to settle before requesting a fresh plan.');
     const seen=new Set();const removed=new Set();
     for(const op of operations) {
+      if (op.domain === 'receipt' && op.id && operations.some(other => other !== op && (other.id === op.id || other.snapshots?.some(s => s.kind === 'transaction' && op.recipe?.oldIds?.includes(s.key))))) fail('Combine changes to the same receipt in one receipt operation');
+      if (op.domain === 'receipt' && op.action === 'create' && operations.some(other=>other !== op && other.domain === 'receipt' && other.action === 'create' && ['account','date','total','payee'].every(k=>other.recipe.rec[k] === op.recipe.rec[k]))) fail('The same receipt appears twice in this plan');
       for(const ref of op.depends) if(!seen.has(ref.slice(1))) fail('A create must precede its dependent changes');
       if(op.ref) seen.add(op.ref);
       for(const s of op.snapshots) {if(removed.has(s.kind+':'+s.key)) fail('A plan uses a record after deleting it'); const current=await record(s.kind,s.key); if(!current||digest(current)!==s.hash) fail('Actual data changed since the preview. Ask me to refresh the plan.');}
@@ -349,7 +385,13 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
     for(const k of ['account','category','group_id','payee']) if(op.fields[k]?.startsWith('$')) op.fields[k]=resolveRefs(op.fields[k],refs);
     if(op.domain==='rule') for(const r of [...(op.fields.conditions||[]),...(op.fields.actions||[])]) if(['account','category','category_group','payee'].includes(r.field)) r.value=resolveRefs(r.value,refs);
     const {domain,action,id}=op;const f=op.fields;let result;
-    if(domain==='transaction') {
+    if(domain==='receipt') {
+      const receipt = await bounded(()=>receipts.execute(clone(op.recipe), {account:op.fields.account}),true);
+      return {ok:true,domain,action,id:receipt?.id || id,receipt,oldId:id};
+    } else if(domain==='card_memory') {
+      await receipts.saveMemory(op.recipe);
+      return {ok:true,domain,action:'set'};
+    } else if(domain==='transaction') {
       if(action==='delete') result=await api.deleteTransaction(id);
       else if(action==='update') {
         result=await api.updateTransaction(id,f);
@@ -388,7 +430,7 @@ export function createActualTools(api, { currency = 'CAD' } = {}) {
   // Gemini's OpenAPI subset omits local-only bounds; validation still enforces them.
   const geminiSchema = s => s.anyOf ? { anyOf:s.anyOf.filter(x=>x.type!=='null').map(geminiSchema),...(s.anyOf.some(x=>x.type==='null')?{nullable:true}:{}) }
     : { type:s.type.toUpperCase(),...(s.description?{description:s.description}:{}),...(s.enum?{enum:s.enum}:{}),...(s.properties?{properties:Object.fromEntries(Object.entries(s.properties).map(([k,v])=>[k,geminiSchema(v)])),...(s.required.length?{required:s.required}:{})}:{}),...(s.items?{items:geminiSchema(s.items)}:{}) };
-  return {declarations:definitions.map(d=>({...d,parameters:geminiSchema(d.parameters)})),read,prepare,validate,execute,sync:()=>{
+  return {declarations:definitions.filter(d=>receipts || !/^(get_receipt|propose_receipt|propose_card_memory)/.test(d.name)).map(d=>({...d,parameters:geminiSchema(d.parameters)})),read,prepare,validate,execute,sync:()=>{
     if(pendingWrite) throw new Error('A prior Actual write is still pending');
     return api.sync();
   },hasPendingWrite:()=>pendingWrite};

@@ -17,6 +17,8 @@ Do not broaden a request. If updating a pending plan, re-propose the COMPLETE re
 When a create needs later references, set ref to a unique short name and use $name as an ID in subsequent calls. Keep dependent operations in order; deletes last. Do not mix destructive account/category/payee operations with edits to other object types.
 Any partial/uncertain execution must be inspected using reads before proposing remaining work. Never retry completed or uncertain operations blindly.
 Transaction updates are patches, not replacement records: include only changed fields. “This should be Sept 8th” on a receipt asks to change its date, not its notes. Never echo unchanged account, payee, category or amount fields into a date-only update.
+When receipt tools are available, use propose_receipt_change for receipt logging, edits, splits, payer changes and deletion, rather than assembling generic transactions. Read get_receipt_context to resolve saved card aliases, last four, ownership and defaults; get_receipt reads linked entries for edits. “Split with Tia” means splitPersons:["Tia"], NOT a note. Split persons exclude the user; the tool computes equal shares and rounding. paidBy names someone else who paid; share is half, mine or theirs. Omit paidBy to use saved ownership, or set null only when the user explicitly says they paid. Ask which share when an owner is known but no share was specified. Read Actual for duplicates before a create. Keep amount/date/card/category/notes from the receipt; never mark it cleared or reconciled without an explicit request.
+Use propose_card_memory_change when asked to remember a card alias, last four, ownership or usual split partner. Conversation history is not persistent card memory. A receipt and an explicit memory change may share one confirmed plan. Never save guessed mappings. Do not put split/card/payer instructions into notes; retain the purchase description.
 Short history and entity references supply context, not authoritative current values; re-read before changes. Never request or reveal credentials, raw database files, environment/config files or unrelated data.
 Answer concisely in plain Telegram text. Explain what you found, or that a complete plan is ready for confirmation. Stay scoped to Actual Budget; no web/shell/code execution is available.`;
 
@@ -127,6 +129,8 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
       c.pending=null; // Revisions invalidate every older callback even if reasoning later fails.
       const request = options.request || {};
       if (options.requireReceipt) request.requireReceipt = true;
+      if (options.receiptScope || options.requireReceipt || old?.operations.some(op=>op.domain === 'receipt')) request.receiptScope = true;
+      const receiptOnly = request.receiptScope && tools.declarations.some(d=>d.name === 'propose_receipt_change');
       if (!request.contents) remember(c,'user',text);
       save();
       const signal=AbortSignal.timeout(timeoutMs);
@@ -141,14 +145,14 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
       const draft=[];let invalid=false;
       try {
         for(let round=0;round<8;round++) {
-          const content=await until(generate({contents,declarations:tools.declarations.filter(d=>!readOnly||!d.name.startsWith('propose_')),system,signal}),signal);
+          const content=await until(generate({contents,declarations:tools.declarations.filter(d=>(!readOnly||!d.name.startsWith('propose_')) && (!receiptOnly || d.name !== 'propose_transaction_changes')),system,signal}),signal);
           if(JSON.stringify(content).length>64_000) throw new Error('The model response was too large. Please narrow the request.');
           const calls=(content.parts||[]).filter(p=>p.functionCall).map(p=>p.functionCall);
           if(!calls.length) {
             const answer=(content.parts||[]).filter(p=>!p.thought).map(p=>p.text||'').join('\n').trim();
             if(draft.length) {
               if(invalid) throw new Error('Some proposed changes were invalid. Please clarify the request; nothing has changed.');
-              if (request.requireReceipt && !draft.some(op => op.domain === 'transaction' && op.action === 'create')) {
+              if (request.requireReceipt && !draft.some(op => (receiptOnly ? op.domain === 'receipt' : ['transaction','receipt'].includes(op.domain)) && op.action === 'create')) {
                 contents.push(content, {role:'user',parts:[{text:'The pending receipt transaction is missing. Stage it against the selected account in this same plan before presenting confirmation. Do not substitute an opening balance.'}]});
                 continue;
               }
@@ -171,6 +175,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
             try {
               if(call.name.startsWith('propose_')) {
                 if(readOnly) throw new ToolError('This session only permits read tools');
+                if(receiptOnly && call.name === 'propose_transaction_changes') throw new ToolError('Use propose_receipt_change for this receipt so its split, ownership and links are preserved.');
                 const ops=await until(tools.prepare(call.name,call.args||{},draft),signal);
                 draft.push(...ops);output={staged:true,operations:ops.map(op=>({preview:op.preview,...(op.ref?{ref:'$'+op.ref}:{})})),message:'Awaiting user confirmation; no changes have executed.'};
               } else {
@@ -206,7 +211,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
     });},
     async confirm(chatId,planId) {return exclusive(chatId,async c=>{
       if(readOnly||planOnly) return {text:'This session cannot execute changes.'};
-      const prior=c.results.find(r=>r.id===planId);if(prior) return {text:prior.text};
+      const prior=c.results.find(r=>r.id===planId);if(prior) return {text:prior.text,completed:prior.completed};
       const p=c.pending;
       if(!p||p.id!==planId) return {text:'That plan was replaced, cancelled or already completed. Ask me for a fresh preview.'};
       if(now()-p.created>86_400_000) {c.pending=null;save();return {text:'This plan expired after 24 hours. Ask me for a fresh preview.'};}
@@ -228,7 +233,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
         '\n\n'+p.operations.map((op,i)=>`${i<p.completed.length?'✓':i===uncertain?'?':'—'} ${i+1}. ${op.preview}`).join('\n\n')+
         (syncFailed?'\n\nCloud sync failed. Changes may only be local; ask me to retry sync.':'\n\nCloud sync completed.');
       c.results.push({id:p.id,text,completed:p.completed,uncertain,syncFailed});c.results=c.results.slice(-100);c.pending=null;c.references=[];
-      remember(c,'model',text);save();return {text,changed:true};
+      remember(c,'model',text);save();return {text,changed:true,completed:p.completed,uncertain};
     });},
   };
 }

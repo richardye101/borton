@@ -79,10 +79,17 @@ Confirmed plans are sequential, not atomic. A failure reports completed, uncerta
 unattempted steps. Interrupted writes are never automatically replayed. Ask the bot to inspect
 Actual before requesting a new plan. It checks snapshots again before applying changes.
 Destructive account/category/payee changes are presented separately from edits to other object
-types. Split-parent structural changes remain in the existing receipt split workflow; the
-agent can edit child categories/notes without collapsing the split.
+types. The agent's `propose_receipt_change` tool uses the same receipt writers as photos and
+deterministic text: equal multi-person splits, debt transfers, payer half/all-mine/all-theirs,
+and split/unsplit or card/payer edits. Its preview shows each share and any new owed accounts.
+Rebuilds preserve cleared status; reconciled/custom structures require explicit inspection.
+`get_receipt_context` exposes scoped card mappings, ownership and category/split defaults;
+`propose_card_memory_change` saves explicit alias/last-four/owner/partner changes only after
+confirmation. Receipt links are refreshed after agent writes instead of being erased.
+Receipt rebuilds can involve several Actual writes inside one confirmed step: a failure stops
+the plan as uncertain and is never blindly replayed. Regex fallback and queued retries remain.
 
-Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs tools/test_retry.mjs`,
+Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs tools/test_retry.mjs tools/test_receipt_agent.mjs`,
 and `node bot.mjs selftest` (use synthetic
 config/cardmap files for selftest, which exercises card-map learning).
 Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
