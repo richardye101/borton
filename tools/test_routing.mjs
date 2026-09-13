@@ -50,7 +50,7 @@ function fixture() {
     applyFieldValue: async () => {}, handleCardAnswer: async () => {},
   });
   vm.runInContext(['isRelay', 'isAllowedChat', 'isOwner', 'agentFor', 'receiptFor',
-    'runAgent', 'sendAgentResult', 'editTxn', 'handleConfirm', 'handleVoice', 'dispatch',
+    'runAgent', 'runReplyAgent', 'sendAgentResult', 'editTxn', 'handleConfirm', 'handleVoice', 'dispatch',
     'onRelayPost', 'onUpdate', 'onCallback'].map(declaration).join('\n'), bot);
   return { bot, rec, writes, requests, messages, calls, confirmations, references };
 }
@@ -242,7 +242,96 @@ test('an unlinked reply cannot silently target the latest receipt', async () => 
   await f.bot.onRelayPost({ ...post('This should be Sept 8th'), reply_to_message: { message_id: 999 } });
   assert.deepEqual(f.writes, []);
   assert.deepEqual(f.references, []);
-  assert.match(f.messages.at(-1).text, /cannot safely identify/);
+  assert.equal(f.calls.length, 1);
+  assert.doesNotMatch(f.calls[0].text, /receipt-fixture|Shop|Scotiabank/);
+  assert.match(f.calls[0].text, /quoted message/i);
+});
+
+test('quoted receipt text reaches the agent for text, voice and pending-plan replies', async () => {
+  const quoted = '{ “amount”: $7.35,“merchant”:Tinas 4 Ever Flowers,“card”: Tangerine Client Card}';
+  for (const mode of ['text', 'voice', 'pending']) {
+    const f = fixture();
+    if (mode === 'pending') f.bot.budgetAgent.pending = () => ({ id: planId });
+    f.bot.transcribeVoiceNote = async () => ({ transcript: 'Can you log this', ft: null });
+    const msg = { ...post('Can you log this'), reply_to_message: { message_id: 999, date: 1789244640, text: quoted } };
+    if (mode === 'voice') { msg.voice = { file_id: 'voice' }; delete msg.text; }
+    await f.bot.onRelayPost(msg);
+    assert.equal(f.calls.length, 1);
+    for (const value of ['Can you log this', '7.35', 'Tinas 4 Ever Flowers', 'Tangerine Client Card']) assert.ok(f.calls[0].text.includes(value), mode + ': ' + value);
+    assert.match(f.calls[0].text, /check.*already.*logged/i);
+    assert.deepEqual(f.references, []);
+    assert.deepEqual(f.writes, []);
+    assert.ok(f.messages.every(m => !/cannot safely identify/i.test(m.text)));
+  }
+});
+
+test('quoted receipt photo is read once and retained through agent retries', async t => {
+  const f = queuedFixture(t); let downloads = 0, attempts = 0;
+  f.bot.downloadPhoto = async () => { downloads++; return { buf: Buffer.from('receipt'), mime: 'image/jpeg' }; };
+  f.bot.extractReceipt = async () => ({ merchant: 'Flower Shop', total: 7.35, date: '2026-09-12' });
+  f.bot.budgetAgent.message = async (_chat, text) => {
+    f.calls.push(text);
+    assert.match(text, /Flower Shop/);
+    assert.match(text, /7\.35/);
+    if (++attempts === 1) throw new RetryableError('Gemini HTTP 503.');
+    return { text: 'Ready', planId };
+  };
+  await f.bot.acceptUpdate({ update_id: 1, channel_post: { ...post('Log this on New Debit'),
+    reply_to_message: { message_id: 999, date: 1789244640, photo: [{ file_id: 'original-photo' }], caption: 'Birthday flowers' } } });
+  await f.run();
+  assert.equal(f.bot.messageQueue.jobs[0]?.status, 'retry');
+  f.reload(); f.advance(60_000); await f.run();
+  assert.equal(downloads, 1);
+  assert.equal(attempts, 2);
+  assert.equal(new Set(f.calls).size, 1);
+  assert.equal(f.bot.messageQueue.jobs.length, 0);
+  assert.deepEqual(f.writes, []);
+});
+
+test('Telegram quote fragments are included without mistaking a reply for a new account name', async () => {
+  const f = fixture();
+  f.bot.pending[-42] = { awaitNewAccount: true };
+  await f.bot.onRelayPost({ ...post('Log this', false), quote: { text: '$7.35 Flower Shop' },
+    reply_to_message: { message_id: 999, text: 'Can you log this', quote: { text: 'New Debit, 2026-09-12' } } });
+  assert.match(f.calls[0].text, /7\.35 Flower Shop/);
+  assert.match(f.calls[0].text, /New Debit/);
+  assert.equal(f.bot.pending[-42].awaitNewAccount, true);
+  assert.deepEqual(f.writes, []);
+});
+
+test('live Gemini logs a missing quoted receipt but recognizes an already logged one', { skip: process.env.BORTON_LIVE_SMOKE !== '1' }, async () => {
+  for (const exists of [false, true]) {
+    const f = fixture(); let transactionReads = 0;
+    const transaction = { id: 'existing-flower-receipt', account: 'debit', amount: -735, date: '2026-09-12', payee: 'flowers', category: 'gifts' };
+    const api = {
+      getAccounts: async () => [{ id: 'debit', name: 'New Debit', closed: false, offbudget: false }],
+      getPayees: async () => [{ id: 'flowers', name: 'Flower Shop' }],
+      getCategories: async () => [{ id: 'gifts', name: 'Gifts' }], getCategoryGroups: async () => [],
+      getTransactions: async (_account, start, end) => { transactionReads++; return exists && start <= transaction.date && end >= transaction.date ? [{ ...transaction }] : []; },
+    };
+    f.bot.budgetAgent = createAgent({ tools: createActualTools(api), allowedChatId: 42, allowedChatIds: [-42],
+      planOnly: true, now: () => Date.parse('2026-09-12T12:00:00Z'),
+      generate: createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY,
+        models: JSON.parse(process.env.BORTON_SMOKE_MODELS || '["gemini-flash-latest"]') }) });
+    await f.bot.onRelayPost({ ...post('Can you log this'), reply_to_message: { message_id: 999, date: 1789244640,
+      text: '{ “amount”: $7.35, “merchant”: Flower Shop, “card”: New Debit, “date”: 2026-09-12 }' } });
+    assert.ok(transactionReads > 0, 'Check Actual before logging: ' + f.messages.at(-1)?.text);
+    const plan = f.bot.budgetAgent.pending(-42);
+    if (exists) {
+      assert.equal(plan, null, 'Do not stage a duplicate charge');
+      assert.match(f.messages.at(-1).text, /already|exists|recorded/i);
+    } else {
+      assert.ok(plan, f.messages.at(-1).text);
+      assert.equal(plan.operations.length, 1);
+      assert.equal(plan.operations[0].domain, 'transaction');
+      assert.equal(plan.operations[0].action, 'create');
+      assert.equal(plan.operations[0].fields.amount, -735);
+      assert.equal(plan.operations[0].fields.account, 'debit');
+      assert.equal(plan.operations[0].fields.payee, 'flowers');
+      assert.equal(plan.operations[0].fields.date, '2026-09-12');
+    }
+    assert.deepEqual(f.writes, []);
+  }
 });
 
 test('replying to another receipt while a plan is pending supplies the new reference', async () => {
