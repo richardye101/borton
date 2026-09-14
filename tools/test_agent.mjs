@@ -22,8 +22,8 @@ function fakeActual() {
   const write=(name,args,fn)=>{writes.push({name,args:copy(args)});count++;if(count===failAt)throw Error('simulated API failure');return fn?.();};
   const api={
     sync:async()=>{},getBudgetMonths:async()=>['2026-09'],getBudgetMonth:async()=>copy(data.budget),
-    q:()=>({filter(v){this.where=v;return this;},select(){return this;}}),
-    aqlQuery:async q=>({data:copy(data.transaction.filter(t=>t.id===q.where.id))}),
+    q:()=>({filter(v){this.where=v;return this;},select(){return this;},options(v){this.opts=v;return this;}}),
+    aqlQuery:async q=>({data:copy(data.transaction.filter(t=>t.id===q.where.id && (q.opts?.splits==='all' || !t.is_parent)))}),
     getTransactions:async(a,start,end)=>copy(data.transaction.filter(t=>t.account===a&&t.date>=start&&t.date<=end)),
     getAccountBalance:async a=>data.transaction.filter(t=>t.account===a).reduce((s,t)=>s+t.amount,0),
     getNote:async id=>data.note[id]===undefined?null:{id,note:data.note[id]},
@@ -217,6 +217,18 @@ await test('date-only updates discard echoed unchanged transaction fields',async
   await t.validate(ops);assert.equal(f.writes.length,0);
   const noop=await t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{cleared:false}}]});
   assert.deepEqual(noop[0].fields,{cleared:false});
+});
+await test('exact transaction reads include split parents without relaxing split edit validation',async()=>{
+  const f=fakeActual(),t=createActualTools(f.api);
+  f.data.transaction[0].is_parent=true;
+  f.data.transaction.push({id:'child',account:'a',date:'2026-09-01',amount:-1000,payee:'p',category:'food',is_child:true,parent_id:'t1'});
+  const ops=await t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{date:'2026-09-08'}}]});
+  await t.validate(ops);assert.equal(f.writes.length,0);
+  await assert.rejects(t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'t1',fields:{amount:-2000}}]}),/split parent/);
+  await assert.rejects(t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'child',fields:{date:'2026-09-08'}}]}),/individual children/);
+  await assert.rejects(t.prepare('propose_transaction_changes',{changes:[{action:'update',id:'missing',fields:{date:'2026-09-08'}}]}),/Unknown transaction ID/);
+  f.data.transaction[0].amount=-2000;
+  await assert.rejects(t.validate(ops),/changed/);assert.equal(f.writes.length,0);
 });
 await test('retry discards partial drafts and still requires exactly one owner confirmation',async()=>{
   const f=fakeActual(),request={};

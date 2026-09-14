@@ -136,7 +136,7 @@ async function agentReceiptContext({ card, last4, merchant = '', notes = '', ite
 async function readAgentReceipt(id) {
   await refreshActualMaps();
   const stored = [...Object.values(msgTxn), ...Object.values(lastTxn)].find(r => [r.id,r.cardTxnId,r.owedTxnId,r.spendTxnId].includes(id));
-  const fetchRow = async key => (await api.aqlQuery(api.q('transactions').filter({ id: key }).select('*'))).data[0];
+  const fetchRow = async key => (await api.aqlQuery(api.q('transactions').filter({ id: key }).select('*').options({ splits:'all' }))).data[0];
   let root = await fetchRow(stored?.cardTxnId || id);
   if (!root) return null;
   if (root.is_child) root = await fetchRow(root.parent_id);

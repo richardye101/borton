@@ -485,7 +485,7 @@ test('live Gemini stages the screenshot date correction using synthetic budget d
     getCategories: async () => [{ id: 'food-fixture', name: 'Groceries' }],
     getCategoryGroups: async () => [],
     getTransactions: async (_account, start, end) => transaction.date >= start && transaction.date <= end ? [{ ...transaction }] : [],
-    q: () => ({ filter(where) { this.where = where; return this; }, select() { return this; } }),
+    q: () => ({ filter(where) { this.where = where; return this; }, select() { return this; }, options(v) { this.opts = v; return this; } }),
     aqlQuery: async q => ({ data: q.where.id === transaction.id ? [{ ...transaction }] : [] }),
   };
   f.bot.budgetAgent = createAgent({ tools: createActualTools(api), allowedChatId: 42, allowedChatIds: [-42],

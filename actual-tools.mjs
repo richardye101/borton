@@ -154,7 +154,8 @@ export function createActualTools(api, { currency = 'CAD', receipts } = {}) {
     if (kind === 'receipt_state') return receipts?.state();
     if (kind === 'receipt') return receipts?.read(key);
     if (kind === 'transaction') {
-      const { data } = await api.aqlQuery(api.q('transactions').filter({ id:key }).select('*'));
+      // Exact IDs must resolve parents and children; ActualQL's default hides split parents.
+      const { data } = await api.aqlQuery(api.q('transactions').filter({ id:key }).select('*').options({ splits:'all' }));
       const r = data[0]; return r ? pick({...r, date:String(r.date)}, columns.transaction) : null;
     }
     if (kind === 'note') return { id:key, note:(await api.getNote(key))?.note ?? null };

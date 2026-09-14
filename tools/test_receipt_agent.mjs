@@ -25,8 +25,9 @@ function fixture() {
   const api={
     getAccounts:async()=>structuredClone(accounts), getCategories:async({hidden=false}={})=>hidden?[]:structuredClone(categories),
     getPayees:async()=>structuredClone(payees), sync:async()=>{},
-    q:()=>({filter(v){this.where=v;return this;},select(){return this;}}),
-    aqlQuery:async q=>({data:structuredClone(rows.filter(r=>r.id===q.where.id))}),
+    q:()=>({filter(v){this.where=v;return this;},select(){return this;},options(v){this.opts=v;return this;}}),
+    // ActualQL defaults to inline splits, which hides parent records even for exact IDs.
+    aqlQuery:async q=>({data:structuredClone(rows.filter(r=>r.id===q.where.id && (q.opts?.splits==='all' || !r.is_parent)))}),
     getTransactions:async(account,start,end)=>structuredClone(rows.filter(r=>r.account===account&&r.date>=start&&r.date<=end&&!r.is_child).map(r=>({...r,...(r.is_parent?{subtransactions:rows.filter(c=>c.parent_id===r.id)}:{})}))),
     createAccount:async f=>{const id='account-'+ ++serial;accounts.push({...f,id});payees.push({id:'transfer-'+id,name:'Transfer: '+f.name,transfer_acct:id});writes.push({createAccount:f.name});return id;},
     addTransactions:async(account,txns)=>{
@@ -335,6 +336,34 @@ test('ordinary receipt edits preserve transaction IDs, cleared state and import 
   const plan=await f.tools.prepare('propose_receipt_change',{action:'update',id:first.id,fields:{date:'2026-09-08',notes:'New note',merchant:'Updated Shop'}});
   const result=await f.apply(plan);assert.equal(result.id,first.id);assert.equal(row.imported_id,imported);assert.equal(row.cleared,true);assert.equal(row.reconciled,true);
   assert.equal(row.date,'2026-09-08');assert.equal(row.notes,'New note');assert.ok(!f.writes.some(w=>w.delete));
+});
+
+test('split receipt date corrections resolve parent and child IDs and preserve the linked accounting',async()=>{
+  const f=fixture();const first=await f.apply(await f.stage({date:'2026-09-14',amount:1480,merchant:'Loblaws',splitPersons:['Tia']}));
+  const child=f.rows.find(r=>r.parent_id===first.id);
+  assert.equal((await f.api.aqlQuery(f.api.q('transactions').filter({id:first.id}).select('*'))).data.length,0);
+  for(const id of [first.id,child.id]) {
+    const receipt=await f.tools.read('get_receipt',{id});
+    assert.equal(receipt.rec.id,first.id);assert.deepEqual(Array.from(receipt.rec.persons),['Tia']);
+    assert.equal(receipt.entries.length,4);
+  }
+  const before=structuredClone(f.rows),writes=f.writes.length;let round=0;
+  const agent=createAgent({tools:f.tools,allowedChatId:42,generate:async request=>{
+    if(++round===1)return {role:'model',parts:[{functionCall:{name:'get_receipt',args:{id:first.id}}}]};
+    if(round===2) {
+      assert.equal(request.contents.at(-1).parts[0].functionResponse.response.result.rec.id,first.id);
+      return {role:'model',parts:[{functionCall:{name:'propose_receipt_change',args:{action:'update',id:first.id,fields:{date:'2026-09-13'}}}}]};
+    }
+    return {role:'model',parts:[{text:'Ready'}]};
+  }});
+  agent.remember(42,`Receipt ${first.id}: Loblaws, September 14. This is from sept 13th.`);
+  const plan=await agent.message(42,'Try it again',{receiptScope:true});assert.ok(plan.planId);assert.equal(round,3);
+  assert.deepEqual(agent.pending(42).operations[0].fields,{date:'2026-09-13'});assert.equal(f.writes.length,writes);
+  assert.equal((await agent.confirm(42,plan.planId)).uncertain,null);
+  assert.deepEqual(f.rows,before.map(r=>r.id===first.id?{...r,date:'2026-09-13'}:r));
+  assert.deepEqual(f.writes.slice(writes),[{update:first.id}]);
+  assert.equal(f.bot.lastTxn[42].date,'2026-09-13');assert.equal(f.bot.lastTxn[42].split,true);
+  await agent.confirm(42,plan.planId);assert.equal(f.writes.length,writes+1);
 });
 
 test('same-plan owner memory informs receipt planning; cancellation writes nothing',async()=>{
