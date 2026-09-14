@@ -37,17 +37,20 @@ export function createGeminiGenerate({ apiKey, models, fetchImpl = globalThis.fe
           body:JSON.stringify({systemInstruction:{parts:[{text:system}]},contents,tools:[{functionDeclarations:declarations}],
             generationConfig:{maxOutputTokens:8192},toolConfig:{functionCallingConfig:{mode:'AUTO'}}}),
         });
-      } catch {
-        failure = new RetryableError('Gemini connection unavailable.', retryDelay);
+      } catch (cause) {
+        failure = new RetryableError('Gemini connection unavailable.', retryDelay, { cause });
         continue;
       }
       if(!r.ok) {
+        let detail = '';
+        try { const data = await r.json(); if (typeof data.error?.message === 'string') detail = data.error.message.slice(0, 4000); } catch {}
+        const cause = new Error(`${model}: HTTP ${r.status}${detail ? ': ' + detail : ''}`);
         if (r.status === 429 || r.status >= 500) {
           retryDelay = Math.max(retryDelay, retryAfterMs(r));
-          failure = new RetryableError(`Gemini HTTP ${r.status}.`, retryDelay);
+          failure = new RetryableError(`Gemini HTTP ${r.status}.`, retryDelay, { cause });
         } else {
-          if (r.status === 401 || r.status === 403) throw new Error(`Gemini HTTP ${r.status}.`);
-          if (!(failure instanceof RetryableError)) failure = new Error(`Gemini HTTP ${r.status}.`);
+          if (r.status === 401 || r.status === 403) throw new Error(`Gemini HTTP ${r.status}.`, { cause });
+          if (!(failure instanceof RetryableError)) failure = new Error(`Gemini HTTP ${r.status}.`, { cause });
         }
         continue;
       }
@@ -56,7 +59,9 @@ export function createGeminiGenerate({ apiKey, models, fetchImpl = globalThis.fe
       catch { failure = new RetryableError('Gemini returned an incomplete response.', retryDelay); continue; }
       const candidate=data.candidates?.[0];
       if (data.promptFeedback?.blockReason || (candidate?.finishReason && !['STOP', 'MAX_TOKENS'].includes(candidate.finishReason))) {
-        throw new Error('Gemini could not answer this request.');
+        throw new Error('Gemini could not answer this request.', {
+          cause: new Error(`${model}: ${data.promptFeedback?.blockReason || candidate.finishReason}`),
+        });
       }
       if (candidate?.finishReason === 'MAX_TOKENS' || !candidate?.content?.parts?.length) {
         failure = new RetryableError('Gemini returned an incomplete response.', retryDelay); continue;
@@ -117,10 +122,53 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
     const walk=v=>{if(!v||typeof v!=='object')return;if(v.id&&typeof v.id==='string') found.push(Object.fromEntries(['id','name','tag','date','account','accountName','payee','payeeName','category','categoryName'].filter(k=>v[k]!==undefined).map(k=>[k,v[k]])));for(const x of Object.values(v))if(typeof x==='object')walk(x);};
     walk(value);c.references=[...new Map([...c.references,...found].map(r=>[r.id,r])).values()].slice(-50);
   }
-  const previewText = p => `Ready for confirmation — ${p.operations.length} change(s), amounts in ${currency}.\n\n`+
-    p.operations.map((op,i)=>`${i+1}. ${op.preview}`).join('\n\n')+'\n\nConfirm applies this entire plan once. Cancel discards it. You can describe revisions before confirming.';
+  const previewText = p => (p.operations.length === 1 && p.operations[0].domain === 'receipt'
+    ? p.operations[0].preview
+    : `${p.operations.length} changes · ${currency}\n\n`+p.operations.map((op,i)=>`${i+1}. ${op.preview}`).join('\n\n'))+
+    '\n\nConfirm to apply · Cancel to discard. You can revise before confirming.';
+  function stagePlan(c, operations) {
+    const p={id:randomUUID().replaceAll('-',''),created:now(),status:'pending',operations,completed:[],refs:{}};
+    p.operations.forEach((op,i)=>op.executionKey=p.id+'-'+i);
+    const preview=previewText(p);
+    if(preview.length>24_000) throw new Error('This plan is too large to review clearly. Please narrow the changes.');
+    c.pending=p;remember(c,'model','Plan awaiting confirmation: '+p.operations.map(o=>o.preview).join('\n'));save();
+    return {text:preview,planId:p.id};
+  }
   return {
     pending(chatId) {return clone(chat(chatId).pending);},
+    bindMessage(chatId, planId, messageId) {
+      const p=chat(chatId).pending;
+      if(p?.id===planId && p.status==='pending') {p.messageId=messageId;save();}
+    },
+    // Button choices are already structured: use the same tool validation/confirmation, no LLM round trip.
+    async receiptChange(chatId, {planId, id, action='update', fields={}}) {return exclusive(chatId,async c=>{
+      if(readOnly) return {text:'This session only permits read tools.'};
+      const old=c.pending, operations=planId ? clone(old?.operations || []) : [];
+      const index=operations.findIndex(op=>op.domain==='receipt');
+      if(planId && (old?.id!==planId || old.status!=='pending' || now()-old.created>86_400_000 ||
+          operations.filter(op=>op.domain==='receipt').length!==1 || operations[index].action==='delete')) {
+        return {text:'That preview expired or was replaced. Use the latest receipt buttons.'};
+      }
+      const previous=planId ? operations[index] : null;
+      const saved={...previous?.fields};
+      if(previous?.action==='create') {
+        const r=previous.recipe.rec;
+        Object.assign(saved,{date:r.date,amount:Math.round(r.total*100),merchant:r.payee,notes:r.notes,
+          category:saved.category ?? previous.snapshots.find(s=>s.kind==='category')?.key ?? null,
+          splitPersons:r.persons || [],paidBy:r.ownerPaid ? r.person : null});
+        if(r.ownerPaid) saved.share=r.owedCents===0?'theirs':r.owedCents===Math.round(r.total*100)?'mine':'half';
+      }
+      const args={action:previous?.action || action,...((previous?.id || id) ? {id:previous?.id || id} : {}),
+        fields:{...saved,...fields}};
+      if(fields.paidBy===null) delete args.fields.share;
+      c.pending=null;save(); // Old confirmation buttons cannot execute a superseded edit.
+      const signal=AbortSignal.timeout(timeoutMs);
+      const prepared=await until(tools.prepare('propose_receipt_change',args,planId ? operations.slice(0,index) : []),signal);
+      if(planId) operations.splice(index,1,...prepared); else operations.push(...prepared);
+      await until(tools.validate(operations),signal);
+      remember(c,'user','Receipt button request: '+JSON.stringify(args));
+      return stagePlan(c,operations);
+    });},
     remember(chatId,text) {const c=chat(chatId);remember(c,'user',text);save();},
     async message(chatId,text,options={}) {return exclusive(chatId,async c=>{
       if(typeof text!=='string'||!text.trim()) return {text:'Send a question or tell me what to change in Actual.'};
@@ -151,19 +199,14 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
           if(!calls.length) {
             const answer=(content.parts||[]).filter(p=>!p.thought).map(p=>p.text||'').join('\n').trim();
             if(draft.length) {
-              if(invalid) throw new Error('Some proposed changes were invalid. Please clarify the request; nothing has changed.');
+              if(invalid) throw new Error('Some proposed changes were invalid. Please clarify the request; nothing has changed.', { cause: invalid });
               if (request.requireReceipt && !draft.some(op => (receiptOnly ? op.domain === 'receipt' : ['transaction','receipt'].includes(op.domain)) && op.action === 'create')) {
                 contents.push(content, {role:'user',parts:[{text:'The pending receipt transaction is missing. Stage it against the selected account in this same plan before presenting confirmation. Do not substitute an opening balance.'}]});
                 continue;
               }
               try { await until(tools.validate(draft),signal); }
-              catch (e) { throw e instanceof ToolError ? e : new RetryableError('Actual is temporarily unavailable.'); }
-              const p={id:randomUUID().replaceAll('-',''),created:now(),status:'pending',operations:draft,completed:[],refs:{}};
-              p.operations.forEach((op,i)=>op.executionKey=p.id+'-'+i);
-              const preview=previewText(p);
-              if(preview.length>24_000) throw new Error('This plan is too large to review clearly. Please narrow the changes.');
-              c.pending=p;remember(c,'model','Plan awaiting confirmation: '+p.operations.map(o=>o.preview).join('\n'));save();
-              return {text:preview,planId:p.id};
+              catch (e) { throw e instanceof ToolError ? e : new RetryableError('Actual is temporarily unavailable.', 0, { cause: e }); }
+              return stagePlan(c,draft);
             }
             if(!answer) throw new Error('No answer was returned. Please try again.');
             remember(c,'model',answer);save();return {text:answer};
@@ -186,8 +229,8 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
             } catch(e) {
               if (e instanceof QueueStorageError) throw e;
               if(signal.aborted) throw e;
-              if (options.retryFailures && !(e instanceof ToolError)) throw new RetryableError('Actual is temporarily unavailable.');
-              if(call.name.startsWith('propose_')) invalid=true;
+              if (options.retryFailures && !(e instanceof ToolError)) throw new RetryableError('Actual is temporarily unavailable.', 0, { cause: e });
+              if(call.name.startsWith('propose_')) invalid=e;
               output={error:e instanceof ToolError?e.message:'Actual operation failed. Please narrow or retry the request.'};
             }
             responses.push({functionResponse:{name:call.name,...(call.id?{id:call.id}:{}),response:{result:output}}});
@@ -211,7 +254,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
     });},
     async confirm(chatId,planId) {return exclusive(chatId,async c=>{
       if(readOnly||planOnly) return {text:'This session cannot execute changes.'};
-      const prior=c.results.find(r=>r.id===planId);if(prior) return {text:prior.text,completed:prior.completed};
+      const prior=c.results.find(r=>r.id===planId);if(prior) return {text:prior.text,completed:prior.completed,uncertain:prior.uncertain,syncFailed:prior.syncFailed};
       const p=c.pending;
       if(!p||p.id!==planId) return {text:'That plan was replaced, cancelled or already completed. Ask me for a fresh preview.'};
       if(now()-p.created>86_400_000) {c.pending=null;save();return {text:'This plan expired after 24 hours. Ask me for a fresh preview.'};}
@@ -233,7 +276,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
         '\n\n'+p.operations.map((op,i)=>`${i<p.completed.length?'✓':i===uncertain?'?':'—'} ${i+1}. ${op.preview}`).join('\n\n')+
         (syncFailed?'\n\nCloud sync failed. Changes may only be local; ask me to retry sync.':'\n\nCloud sync completed.');
       c.results.push({id:p.id,text,completed:p.completed,uncertain,syncFailed});c.results=c.results.slice(-100);c.pending=null;c.references=[];
-      remember(c,'model',text);save();return {text,changed:true,completed:p.completed,uncertain};
+      remember(c,'model',text);save();return {text,changed:true,completed:p.completed,uncertain,syncFailed};
     });},
   };
 }

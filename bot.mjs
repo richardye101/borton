@@ -82,17 +82,43 @@ function initAgent({ readOnly = false, planOnly = false } = {}) {
     currency: cfg.defaults.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto' });
 }
 async function sendAgentResult(chatId, result) {
+  if (result.uncertain === null && typeof result.syncFailed === 'boolean' && result.completed?.some(c=>c.result?.domain==='receipt')) {
+    const sync = result.syncFailed ? '⚠️ Saved locally; cloud sync failed. Ask me to retry sync.' : 'Synced ✓';
+    for (const c of result.completed) {
+      const change=c.result, r=change?.receipt;
+      const rec=r && [lastTxn[chatId],...Object.entries(msgTxn).filter(([k])=>k.startsWith(`${chatId}:`)).map(([,v])=>v)].find(v=>v?.id===r.id&&!v.stale);
+      const text=r ? `✅ ${change.action==='create'?'Logged':'Updated'}\n${receiptSummary(r)}`
+        : `${change?.action==='delete'?'🗑':'✓'} ${c.preview.split('\n')[0]}`;
+      const chunks=(text+'\n'+sync+(result.warning?'\n⚠️ '+result.warning:'')).match(/[\s\S]{1,3400}/gu);
+      for (let i=0;i<chunks.length;i++) {
+        const mid=await send(chatId,chunks[i],rec && i===chunks.length-1 ? loggedKb() : undefined);
+        if(mid && rec) {msgTxn[`${chatId}:${mid}`]=rec;persistTxns();}
+      }
+    }
+    return;
+  }
+  const plan=result.planId && budgetAgent?.pending(chatId);
+  const editable=!!plan && plan.id===result.planId && plan.operations.filter(op=>op.domain==='receipt'&&op.action!=='delete').length===1 && plan.operations.filter(op=>op.domain==='receipt').length===1;
   const chunks = result.text.match(/[\s\S]{1,3400}/gu) || ['No response.'];
   for (let i = 0; i < chunks.length; i++) {
-    const keyboard = result.planId && i === chunks.length - 1 ? { inline_keyboard: [[
-      { text: 'Confirm', callback_data: `ag:y:${result.planId}` },
-      { text: 'Cancel', callback_data: `ag:n:${result.planId}` },
-    ]] } : undefined;
+    const keyboard = result.planId && i === chunks.length - 1 ? agentConfirmKb(result.planId,editable) : undefined;
     const mid = await send(chatId, chunks[i], keyboard);
-    const records = (result.completed || []).map(c => c.result?.receipt).filter(Boolean)
-      .map(r => [...Object.values(lastTxn),...Object.values(msgTxn)].find(current => current.id === r.id && !current.stale)).filter(Boolean);
-    if (mid && records.length === 1 && i === chunks.length - 1) { msgTxn[`${chatId}:${mid}`] = records[0]; persistTxns(); }
+    if(mid && editable && i===chunks.length-1) budgetAgent.bindMessage(chatId,result.planId,mid);
   }
+}
+
+function receiptSummary(r) {
+  const money=cents=>new Intl.NumberFormat('en-CA',{style:'currency',currency:cfg.defaults.currency || 'CAD'}).format(cents/100);
+  const lines=[`${money(Math.round(r.total*100))} · ${r.payee}`,`${r.account} · ${r.date}`];
+  if(r.ownerPaid) lines.push(`${r.person} paid · You owe ${money(r.owedCents)} → ${owedAccountFor(r.person)} (${r.category || 'Uncategorized'})`);
+  else if(r.customSplit) lines.push('Custom split amounts unchanged.');
+  else if(r.split) {
+    const people=r.persons?.length ? r.persons : [r.person];
+    const {mine,each}=splitAmounts(r.total,people.length);
+    lines.push(`Your share: ${money(mine)} → ${r.category || 'Uncategorized'}`,...people.map(p=>`${p}: ${money(each)} → ${owedAccountFor(p)}`));
+  } else lines.push(r.category || 'Uncategorized');
+  if(r.notes) lines.push(`Note: ${r.notes}`);
+  return lines.join('\n');
 }
 
 // The agent stages these operations; execution reuses the same receipt writers as photos/text.
@@ -168,7 +194,7 @@ async function prepareAgentReceipt({ action, id, fields: f, memory = [] }) {
   for (const m of memory) if (m.account === r.account && m.owner !== undefined) context.account = {...context.account,owner:m.owner};
   if (!old && f.category === undefined) r.category = context.category.name;
   if (r.category && !CAT[r.category]) throw new ToolError(`Category ${r.category} was not found. Choose an existing category.`);
-  if (!old) r.notes = context.notes;
+  if (!old && f.notes === undefined) r.notes = context.notes;
   if (f.last4 && !r.notes.includes(`[card ****${f.last4}]`)) r.notes += `${r.notes ? ' ' : ''}[card ****${f.last4}]`;
   const normalize = name => { const p = personName(name); if (!p || PRONOUNS.has(p.toLowerCase())) throw new ToolError('Use a person’s name, not a pronoun or split instruction.'); return p; };
   const people = (f.splitPersons ?? (old ? old.persons : context.splitPersons) ?? []).map(normalize);
@@ -190,17 +216,14 @@ async function prepareAgentReceipt({ action, id, fields: f, memory = [] }) {
     if (matches.length) { accountIds.push(matches[0].id); if (name !== r.account && matches[0].offbudget) throw new ToolError(`Debt account ${name} must be on budget.`); }
     else if (name !== r.account) missing.push(name);
   }
-  const money = cents => new Intl.NumberFormat('en-CA',{style:'currency',currency:cfg.defaults.currency || 'CAD'}).format(cents/100);
-  const lines = [`${patch ? 'Update' : action === 'update' ? 'Replace' : 'Log'} receipt: ${r.payee}`,`Card: ${r.account} — ${money(Math.round(r.total*100))}`,`Date: ${r.date}`,`Notes: ${r.notes || '(none)'}`];
-  if (r.ownerPaid) lines.push(`${payer} paid; your share: ${money(r.owedCents)} → ${owedAccountFor(payer)} (${r.category || 'Uncategorized'})`);
-  else if (patch && old?.customSplit) lines.push('Existing custom split amounts are unchanged.');
-  else if (r.split) { const {each,mine}=splitAmounts(r.total,people.length); lines.push(`Your share: ${money(mine)} → ${r.category || 'Uncategorized'}`,...people.map(p=>`${p}: ${money(each)} → ${owedAccountFor(p)}`)); }
-  else lines.push(`Category: ${r.category || 'Uncategorized'}`);
+  r.customSplit=!!(patch && old?.customSplit);
+  const lines = [`${patch ? 'Update' : action === 'update' ? 'Replace' : 'Log'} receipt\n${receiptSummary(r)}`];
+  if(patch && f.notes==='') lines.push('Note: cleared');
   lines.push(...missing.map(n=>`Create on-budget account: ${n}`));
   if (!(await api.getPayees()).some(p => p.name.toLowerCase() === r.payee.toLowerCase())) lines.push(`Create payee: ${r.payee}`);
   const cardMemory = f.last4 || f.cardAlias ? await prepareCardMemory({account:r.account,last4:f.last4,alias:f.cardAlias}) : null;
   if (cardMemory) lines.push(cardMemory.preview);
-  if (old) lines.push(patch ? 'Updates the existing entries in place; IDs and bank-import metadata are preserved.' : 'Replaces the linked entries; unrelated transactions are unchanged.');
+  if (old && !patch) lines.push('Replaces linked entries only.');
   return { recipe: { action, old, oldIds, rec:r, cardMemory, ...(patch ? {patch:Object.keys(f),entries:before.entries} : {}) }, preview:lines.join('\n'), watch: { account:accountIds, category:r.category ? [CAT[r.category]] : [], transaction:before?.entries.map(r=>r.id) || [] } };
 }
 
@@ -356,7 +379,14 @@ async function send(chatId, text, reply_markup) {
 }
 // Inline-keyboard widgets (tappable buttons -> callback_query).
 const YESNO_KB = { inline_keyboard: [[{ text: '✅ Yes', callback_data: 'c:y' }, { text: '❌ No', callback_data: 'c:n' }]] };
-function cardKb() {
+function cardKb(edit = false) {
+  if (edit) {
+    const accounts=ACCOUNTS.filter(a=>!a.closed&&!isHelperAccount(a.name));
+    const rows=[];
+    for(let i=0;i<accounts.length;i+=2) rows.push(accounts.slice(i,i+2).map(a=>({text:a.name,callback_data:`ea:${a.id}`})));
+    rows.push([{text:'✏️ Type it',callback_data:'e:type:card'},{text:'🔙 Back',callback_data:'e:menu'}]);
+    return {inline_keyboard:rows};
+  }
   // Offer real, open accounts straight from Actual (so the list stays current),
   // minus the internal split-tracking accounts (Owed by … / …'s spend). Falls
   // back to the cardmap aliases if Actual hasn't loaded yet.
@@ -830,7 +860,8 @@ function persistTxns() {
   try {
     const cutoff = Date.now() - 30 * 864e5; // keep ~30 days
     const prune = (m) => Object.fromEntries(Object.entries(m).filter(([, r]) => r && (r.ts || 0) > cutoff));
-    fs.writeFileSync(TXN_STORE, JSON.stringify({ lastTxn: prune(lastTxn), msgTxn: prune(msgTxn) }));
+    fs.writeFileSync(TXN_STORE, JSON.stringify({ lastTxn: prune(lastTxn), msgTxn: prune(msgTxn),
+      editField:Object.fromEntries(Object.entries(editField).filter(([,e])=>e.kind==='agent'&&e.ts>Date.now()-864e5)) }));
   } catch (e) { console.error('persistTxns:', e.message); }
 }
 function loadTxns() {
@@ -839,6 +870,7 @@ function loadTxns() {
     const d = JSON.parse(fs.readFileSync(TXN_STORE, 'utf8'));
     Object.assign(lastTxn, d.lastTxn || {});
     Object.assign(msgTxn, d.msgTxn || {});
+    Object.assign(editField,Object.fromEntries(Object.entries(d.editField || {}).filter(([,e])=>e.kind==='agent'&&e.ts>Date.now()-864e5)));
     console.log(`Restored txn map: ${Object.keys(msgTxn).length} message links, ${Object.keys(lastTxn).length} chats.`);
   } catch (e) { console.error('loadTxns:', e.message); }
 }
@@ -988,6 +1020,21 @@ async function applyFieldValue(chatId, text) {
   const ef = editField[chatId];
   delete editField[chatId];
   const value = text.trim();
+  if (ef.kind === 'agent') {
+    persistTxns();
+    try {
+      await refreshActualMaps();
+      if(ef.field==='card') {
+        const name=resolveAccount(value);if(!name) throw new ToolError('Choose an existing card or account.');
+        return await receiptCardChoice(chatId,ef,ACCT[name]);
+      }
+      return await stageReceiptButton(chatId,ef,receiptFieldPatch(ef.field,value));
+    } catch(e) {
+      if(!(e instanceof ToolError)) throw e;
+      editField[chatId]=ef;persistTxns();
+      return send(chatId,e.message+' Try another value, or use the receipt buttons.');
+    }
+  }
   if (ef.kind === 'pending') {
     const c = confirming[chatId];
     if (!c) return await send(chatId, 'That preview expired — send the expense again.');
@@ -1137,6 +1184,13 @@ function confirmKb() {
     { text: '❌ No', callback_data: 'c:n' },
   ]] };
 }
+function agentConfirmKb(planId, editable = true) {
+  return {inline_keyboard:[[
+    {text:'✅ Confirm',callback_data:`ag:y:${planId}`},
+    ...(editable ? [{text:'✏️ Edit',callback_data:'e:menu'}] : []),
+    {text:'❌ Cancel',callback_data:`ag:n:${planId}`},
+  ]]};
+}
 // Logged receipt: dismiss the buttons, edit a field, or delete.
 function loggedKb() {
   return { inline_keyboard: [[
@@ -1147,30 +1201,34 @@ function loggedKb() {
 }
 // Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
 // Category / Split / Paid-by open their own sub-menu (one thing per row → no truncation).
-function fieldMenuKb(reverse) {
+function fieldMenuKb(reverse, all = false) {
   const rows = [[{ text: '🏷 Category', callback_data: 'e:sub:cat' }, { text: '🏬 Merchant', callback_data: 'e:set:merchant' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
   rows.push(reverse
     ? [{ text: '👤 Paid by…', callback_data: 'e:sub:person' }]
     : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split…', callback_data: 'e:sub:split' }]);
+  if(all && !reverse) rows.push([{text:'👤 Paid by…',callback_data:'e:sub:person'}]);
   rows.push([{ text: '🔙 Back', callback_data: 'e:back' }]);
   return { inline_keyboard: rows };
 }
 // Split sub-menu: one-tap with your usual person, or pick someone else. (Paid-by mirror for reverse.)
-function splitSubKb(reverse) {
-  const who = lastSplitPerson() || cap(cfg.defaults.splitPerson);
+function splitSubKb(reverse, rec = null) {
+  const who = reverse && rec?.ownerPaid ? rec.person : lastSplitPerson() || cap(cfg.defaults.splitPerson);
   const rows = [
-    [{ text: reverse ? `👤 ${who} paid` : `➗ Split 50/50 w/ ${who}`, callback_data: reverse ? 'e:do:person' : 'e:do:split' }],
+    [{ text: reverse ? `👤 ${who} paid${rec ? ' · half mine' : ''}` : `➗ Split 50/50 w/ ${who}`,
+      callback_data: rec ? `e:${reverse?'paid':'split'}:${encodeURIComponent(who)}` : reverse ? 'e:do:person' : 'e:do:split' }],
     [{ text: reverse ? '👤 Someone else…' : '➗ Split with others…', callback_data: reverse ? 'e:set:person' : 'e:set:split' }],
   ];
+  if(reverse && rec?.ownerPaid) rows.push([{text:'🙋 All mine',callback_data:'e:share:mine'},{text:`🧍 All ${who}'s`,callback_data:'e:share:theirs'}]);
+  if(reverse && rec) rows.push([{text:'🙋 I paid',callback_data:'e:paid:me'}]);
   if (!reverse) rows.push([{ text: '↩️ Remove split', callback_data: 'e:do:unsplit' }]);
   rows.push([{ text: '🔙 Back', callback_data: 'e:menu' }]);
-  return { inline_keyboard: rows };
+  return { inline_keyboard: rec ? rows.map(row=>row.filter(b=>Buffer.byteLength(b.callback_data)<=64)).filter(row=>row.length) : rows };
 }
 // Category picker: every Actual category as a tappable button (2 per row), + type-it fallback.
-function catPickerKb() {
+function catPickerKb(stable = false) {
   const names = Object.keys(CAT);
   const rows = [];
-  for (let i = 0; i < names.length; i += 2) rows.push(names.slice(i, i + 2).map((n, j) => ({ text: n, callback_data: `ec:${i + j}` })));
+  for (let i = 0; i < names.length; i += 2) rows.push(names.slice(i, i + 2).map((n, j) => ({ text: n, callback_data: `ec:${stable ? CAT[n] : i + j}` })));
   rows.push([{ text: '✏️ Type it', callback_data: 'e:set:cat' }, { text: '🔙 Back', callback_data: 'e:menu' }]);
   return { inline_keyboard: rows };
 }
@@ -1517,6 +1575,110 @@ async function onRelayPost(post) {
 }
 
 // Inline-button taps arrive as callback_query (works in DMs and channels).
+function agentReceiptTarget(chatId, mid) {
+  const plan=agentFor(chatId)?.pending(chatId);
+  if(plan?.messageId===mid) {
+    const receipts=plan.operations.filter(op=>op.domain==='receipt');
+    if(plan.status!=='pending'||Date.now()-plan.created>864e5||receipts.length!==1||!receipts[0].recipe?.rec) return null;
+    return {mid,planId:plan.id,rec:receipts[0].recipe.rec};
+  }
+  const rec=receiptFor(chatId,mid);
+  return rec ? {mid,id:rec.id,rec} : null;
+}
+
+async function stageReceiptButton(chatId, target, fields = {}, action = 'update') {
+  const current=agentReceiptTarget(chatId,target.mid);
+  if(!current || current.planId!==target.planId || current.id!==target.id) return send(chatId,'That receipt changed or its preview expired. Use its latest buttons.');
+  const result=await budgetAgent.receiptChange(chatId,{planId:current.planId,id:current.id,fields,action});
+  if(result.planId) {
+    delete editField[chatId];persistTxns();
+    if(target.planId) await dropKb(chatId,target.mid);
+  }
+  return sendAgentResult(chatId,result);
+}
+
+function receiptFieldPatch(field, value) {
+  if(field==='note') return {notes:value};
+  if(!value) throw new ToolError('Please supply a value.');
+  if(field==='merchant') return {merchant:value};
+  if(field==='cat') {
+    const name=resolveCategory(value);if(!name) throw new ToolError('Choose an existing category.');
+    return {category:CAT[name]};
+  }
+  if(field==='card') {
+    const name=resolveAccount(value);if(!name) throw new ToolError('Choose an existing card or account.');
+    return {account:ACCT[name]};
+  }
+  if(field==='split') {
+    const people=namesList(value);if(!people.length) throw new ToolError('Send the names to split with.');
+    return {paidBy:null,splitPersons:people};
+  }
+  if(field==='person') return /^(me|myself|i)$/i.test(value) ? {paidBy:null,splitPersons:[]} : {paidBy:value,splitPersons:[],share:'half'};
+  throw new ToolError('Unknown receipt field.');
+}
+
+async function receiptCardChoice(chatId, target, id, share) {
+  const account=ACCOUNTS.find(a=>a.id===id&&!a.closed);
+  if(!account) throw new ToolError('That account changed. Open the card picker again.');
+  const owner=ownerOf(account.name);
+  if(owner && !share) {
+    const keyboard=ownerKb(owner);
+    for(const b of keyboard.inline_keyboard.flat()) b.callback_data=b.callback_data==='op:cancel' ? 'e:back' : `e:cardshare:${id}:${b.callback_data.slice(3)}`;
+    await tg('editMessageReplyMarkup',{chat_id:chatId,message_id:target.mid,reply_markup:keyboard});
+    await send(chatId,`${owner}'s ${account.name} — choose your share on the receipt buttons.`);
+    return;
+  }
+  return stageReceiptButton(chatId,target,{account:id,paidBy:owner || null,...(owner ? {splitPersons:[],share:share==='split'?'half':share} : {})});
+}
+
+async function agentReceiptButton(chatId, mid, data) {
+  if(!agentFor(chatId) || !/^(e:|ec:|ea:)/.test(data)) return false;
+  // Keep the existing deterministic pre-log preview working when it owns this message.
+  if(confirming[chatId]?.promptMid===mid) return false;
+  if(data==='e:ok') {if(editField[chatId]?.mid===mid) delete editField[chatId];persistTxns();await dropKb(chatId,mid);return true;}
+  const target=agentReceiptTarget(chatId,mid);
+  if(!target) {await dropKb(chatId,mid);await send(chatId,'That receipt or preview expired. Reply to it for a fresh plan.');return true;}
+  let keyboard;
+  if(data==='e:menu') keyboard=fieldMenuKb(false,true);
+  else if(data==='e:back') keyboard=target.planId ? agentConfirmKb(target.planId) : loggedKb();
+  else if(data==='e:sub:cat') {await refreshActualMaps();keyboard=catPickerKb(true);}
+  else if(data==='e:set:card') {await refreshActualMaps();keyboard=cardKb(true);}
+  else if(data==='e:sub:split'||data==='e:sub:person') keyboard=splitSubKb(data==='e:sub:person',target.rec);
+  if(keyboard) {
+    if(editField[chatId]?.mid===mid) {delete editField[chatId];persistTxns();}
+    await tg('editMessageReplyMarkup',{chat_id:chatId,message_id:mid,reply_markup:keyboard});return true;
+  }
+  if(data.startsWith('e:set:')||data==='e:type:card') {
+    const field=data==='e:type:card'?'card':data.slice(6);
+    if(!['cat','card','merchant','note','split','person'].includes(field)) return true;
+    editField[chatId]={kind:'agent',mid,planId:target.planId,id:target.id,field,ts:Date.now()};persistTxns();
+    await send(chatId,`✏️ Send the new ${FIELD_LABEL[field] || field}.${field==='person'?' Your share defaults to half; you can adjust it before confirming.':''}`);
+    return true;
+  }
+  let fields,action='update';
+  if(data.startsWith('ec:')) {
+    await refreshActualMaps();const id=data.slice(3);
+    if(!Object.values(CAT).includes(id)) throw new ToolError('That category changed. Open the category picker again.');
+    fields={category:id};
+  } else if(data.startsWith('ea:')) {
+    await refreshActualMaps();const id=data.slice(3);
+    if(!ACCOUNTS.some(a=>a.id===id&&!a.closed)) throw new ToolError('That account changed. Open the card picker again.');
+    await receiptCardChoice(chatId,target,id);return true;
+  } else if(data.startsWith('e:cardshare:')) {
+    await refreshActualMaps();const [, ,id,share]=data.split(':');
+    if(!['split','mine','theirs'].includes(share)) throw new ToolError('Choose half, all yours or all theirs.');
+    await receiptCardChoice(chatId,target,id,share);return true;
+  } else if(data.startsWith('e:split:')) fields=receiptFieldPatch('split',decodeURIComponent(data.slice(8)));
+  else if(data.startsWith('e:paid:')) fields=receiptFieldPatch('person',decodeURIComponent(data.slice(7)));
+  else if(data.startsWith('e:share:') && target.rec.ownerPaid) fields={share:data.slice(8)};
+  else if(data==='e:do:split') fields=receiptFieldPatch('split',lastSplitPerson());
+  else if(data==='e:do:person') fields=receiptFieldPatch('person',lastSplitPerson());
+  else if(data==='e:do:unsplit') fields={paidBy:null,splitPersons:[]};
+  else if(data==='e:del' && !target.planId) {action='delete';fields={};}
+  if(fields) await stageReceiptButton(chatId,target,fields,action);
+  return true;
+}
+
 async function onCallback(cq) {
   const chatId = cq.message?.chat?.id;
   const mid = cq.message?.message_id;
@@ -1528,13 +1690,15 @@ async function onCallback(cq) {
   await tg('answerCallbackQuery', { callback_query_id: cq.id }).catch(() => {});
   if (data.startsWith('ag:') && !agentFor(chatId)) return;
   try {
+    if(await agentReceiptButton(chatId,mid,data)) return;
     if (data.startsWith('ag:')) {
       if (!budgetAgent) return;
       const [, choice, planId] = data.split(':');
       if (!/^[a-f0-9]{32}$/.test(planId || '') || !['y','n'].includes(choice)) return;
       const result = choice === 'y' ? await budgetAgent.confirm(chatId, planId) : await budgetAgent.cancel(chatId, planId);
+      if(!budgetAgent.pending(chatId) && editField[chatId]?.planId===planId) {delete editField[chatId];persistTxns();}
       if (result.changed) {
-        try { await refreshActualMaps(); } catch { result.text += '\nReceipt account lookup could not refresh; restart the bot after Actual recovers.'; }
+        try { await refreshActualMaps(); } catch { result.warning='Receipt account lookup could not refresh; restart the bot after Actual recovers.'; result.text += '\n'+result.warning; }
         await refreshReceiptLinks(chatId,result);
       }
       if (!budgetAgent.pending(chatId)) await dropKb(chatId, mid);
@@ -1662,6 +1826,8 @@ async function dispatch(chatId, msg, voiceExpense) {
   if (msg.photo) return await handlePhoto(chatId, msg);
   if (msg.voice || msg.audio) return await handleVoice(chatId, msg);
   if (!msg.text) return;
+  // Explicit field replies must beat pending-plan natural-language routing.
+  if (editField[chatId]?.kind==='agent') return applyFieldValue(chatId,msg.text);
   const isReply = !!(msg.reply_to_message || msg.quote || msg.external_reply);
   if (agentFor(chatId)?.pending(chatId)) return isReply ? runReplyAgent(chatId, msg) : runAgent(chatId, msg.text);
   // "own wealthsimple = Tia" marks a card as someone else's (charges on it then ask how to split);
@@ -1872,7 +2038,8 @@ async function main() {
   budgetAgent = cfg.agent?.enabled === false ? null : initAgent();
   console.log('Accounts:', Object.keys(ACCT).join(', '));
   loadTxns(); // restore reply->txn links so edits survive restarts
-  messageQueue = createRetryQueue({ filePath: path.resolve(__dir, cfg.actual.dataDir, 'message-queue.json'), onStatus: messageQueueStatus });
+  messageQueue = createRetryQueue({ filePath: path.resolve(__dir, cfg.actual.dataDir, 'message-queue.json'), onStatus: messageQueueStatus,
+    secrets: [TELEGRAM_TOKEN, GEMINI_KEY, ACTUAL_PASSWORD, process.env.INGEST_SECRET] });
   const work = () => messageQueue.runOne(processMessageJob).catch(e => {
     console.error('message queue stopped:', e.message);
     process.exit(1); // Never acknowledge newer messages after a queue storage failure.

@@ -21,6 +21,7 @@ function fixture() {
   const bot = vm.createContext({
     console,
     currentMessage: () => undefined, checkpointMessage: () => {},
+    agentFor: () => null,
     isReceiptEdit,
     cfg: { defaults: { splitPerson: 'Ryan' }, telegram: { allowedChatId: 42 } },
     ACCT: { Card: 'card', Alice: 'a', Bob: 'b', Carol: 'c', Ryan: 'r' },
@@ -45,7 +46,7 @@ function fixture() {
     persistTxns: () => {},
   });
   vm.runInContext(['isRelay', 'isAllowedChat', 'isOwner', 'cap', 'NON_NAMES', 'PRONOUNS', 'personName', 'namesList', 'extractPersons',
-    'extractPaid', 'splitAmounts', 'logExpense', 'fmtExpense', 'editTxn', 'onCallback', 'applyFieldValue',
+    'extractPaid', 'splitAmounts', 'logExpense', 'fmtExpense', 'editTxn', 'agentReceiptButton', 'onCallback', 'applyFieldValue',
     'handleConfirm'].map(declaration).join('\n'), bot);
   return { bot, writes, messages };
 }

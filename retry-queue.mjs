@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export class RetryableError extends Error {
-  constructor(message, retryAfterMs = 0) {
-    super(message);
+  constructor(message, retryAfterMs = 0, options) {
+    super(message, options);
     this.retryAfterMs = Number.isFinite(retryAfterMs) ? Math.max(0, retryAfterMs) : 0;
   }
 }
@@ -27,7 +27,29 @@ const DAY = 86_400_000;
 const DELAYS = [60_000, 300_000, 900_000, 3_600_000];
 const open = job => job.status === 'pending' || job.status === 'retry' || job.status === 'running';
 
-export function createRetryQueue({ filePath, now = Date.now, onStatus = async () => {} }) {
+// Keep diagnostics, not arbitrary SDK response/request objects (which may contain credentials).
+function errorDetails(error, secrets, depth = 0) {
+  const clean = (value, limit) => {
+    let text = String(value);
+    for (const secret of secrets.filter(v => typeof v === 'string' && v)) {
+      for (const value of [secret, encodeURIComponent(secret)]) text = text.replaceAll(value, '[redacted]');
+    }
+    return text.replace(/https?:\/\/[^\s"'<>]+/gi, '[URL redacted]')
+      .replace(/\b(?:Bearer|Basic)\s+[^\s,"'}]+/gi, '[authorization redacted]')
+      .replace(/\b(api[-_]?key|x-goog-api-key|token|password|secret|authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1=[redacted]')
+      .slice(0, limit);
+  };
+  const details = {
+    name: clean(error instanceof Error ? error.constructor.name : 'Error', 128),
+    message: clean(error?.message ?? (typeof error === 'string' ? error : 'Unknown error'), 1024),
+  };
+  if (typeof error?.code === 'string' || typeof error?.code === 'number') details.code = clean(error.code, 128);
+  if (typeof error?.stack === 'string') details.stack = clean(error.stack, 4096);
+  if (error?.cause != null && depth < 2) details.cause = errorDetails(error.cause, secrets, depth + 1);
+  return details;
+}
+
+export function createRetryQueue({ filePath, now = Date.now, onStatus = async () => {}, secrets = [] }) {
   // ponytail: one process and a small JSON queue; use SQLite if backlog size makes rewrites costly.
   let state = { version: 1, offset: 0, jobs: [] };
   let busy = false;
@@ -94,15 +116,19 @@ export function createRetryQueue({ filePath, now = Date.now, onStatus = async ()
           await process(job);
         } catch (e) {
           if (e instanceof QueueStorageError) throw e;
+          job.lastErrorDetails = errorDetails(e, secrets);
+          job.lastError = job.lastErrorDetails.message;
           if (!job.unsafe && e instanceof RetryableError && now() - job.createdAt < DAY) {
             job.status = 'retry';
             job.nextAt = now() + Math.max(DELAYS[Math.min(job.attempts - 1, DELAYS.length - 1)], e.retryAfterMs);
-            job.reason = 'temporary-service-failure'; job.lastError = e.message;
-            save(); await notify(job, 'queued');
+            job.reason = 'temporary-service-failure';
           } else {
             dead(job, job.unsafe ? 'write-outcome-uncertain' : 'non-retryable-failure');
-            save(); await notify(job, 'dead');
           }
+          save();
+          console.error('Message processing failed:', JSON.stringify({ id: job.id, attempts: job.attempts,
+            status: job.status, reason: job.reason, error: job.lastErrorDetails }));
+          await notify(job, job.status === 'retry' ? 'queued' : 'dead');
           return true;
         }
         // Persist completion before notifying; a delivery failure must not replay a budget write.

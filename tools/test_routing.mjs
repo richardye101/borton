@@ -50,7 +50,7 @@ function fixture() {
     applyFieldValue: async () => {}, handleCardAnswer: async () => {},
   });
   vm.runInContext(['isRelay', 'isAllowedChat', 'isOwner', 'agentFor', 'receiptFor',
-    'runAgent', 'runReplyAgent', 'sendAgentResult', 'editTxn', 'handleConfirm', 'handleVoice', 'dispatch',
+    'runAgent', 'runReplyAgent', 'sendAgentResult', 'agentConfirmKb', 'agentReceiptButton', 'editTxn', 'handleConfirm', 'handleVoice', 'dispatch',
     'onRelayPost', 'onUpdate', 'onCallback'].map(declaration).join('\n'), bot);
   return { bot, rec, writes, requests, messages, calls, confirmations, references };
 }

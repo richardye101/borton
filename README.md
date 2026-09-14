@@ -58,6 +58,12 @@ keyboard. Only Confirm executes it. Describe a revision to replace the plan and 
 the old buttons. Plans expire after 24 hours. Direct receipt workflows retain their existing
 confirmations; the new plan requirement applies to agent operations.
 
+Receipt messages use a compact amount/merchant, card/date, share and note summary. Successful
+receipts restore **OK / Edit / Delete**; Edit includes category, merchant, note, card, split and
+payer/share choices. While the agent is enabled, these buttons stage validated changes without
+calling Gemini, then require one Confirm. They stay bound to that receipt (or pending preview),
+including across restarts. Sync failures and uncertain writes remain explicit.
+
 The agent requires `telegram.allowedChatId`, set to the owner's private Telegram chat/user ID.
 To enable it in the configured `telegram.relayChannelId`, explicitly set `agent.relayEnabled`
 to `true`. Channel subscribers can see its budget replies and plans; only the owner's Telegram

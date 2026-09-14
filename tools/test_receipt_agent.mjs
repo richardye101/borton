@@ -1,6 +1,8 @@
 // Exercise the real receipt bridge and writers without Telegram or a real budget.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import vm from 'node:vm';
 import { test } from 'node:test';
 import { createActualTools, ToolError } from '../actual-tools.mjs';
@@ -60,7 +62,7 @@ function fixture() {
   });
   vm.runInContext(['cap','owedAccountFor','NON_NAMES','PRONOUNS','GENERIC_CARD_WORDS','personName','namesList','extractPerson','extractPersons','extractPaid','stripControlWords','parseCaption','guessCategory','maybeAutoSplit','resolveAccount','ownerOf','lastSplitPerson','rememberSplitPerson',
     'refreshActualMaps','resolvePayeeId','resolveOwedAccount','resolveOwedAccounts','splitAmounts','logExpense','logOwnerPaid','purgeLegs','rebindTxn',
-    'agentReceiptContext','readAgentReceipt','prepareAgentReceipt','executeAgentReceipt','prepareCardMemory','applyCardMemory','refreshReceiptLinks'].map(declaration).join('\n'),bot);
+    'receiptSummary','agentReceiptContext','readAgentReceipt','prepareAgentReceipt','executeAgentReceipt','prepareCardMemory','applyCardMemory','refreshReceiptLinks'].map(declaration).join('\n'),bot);
   const receipts={state:()=>({cardmap:bot.cardmap,defaults:bot.cfg.defaults}),context:bot.agentReceiptContext,read:bot.readAgentReceipt,
     prepare:bot.prepareAgentReceipt,execute:bot.executeAgentReceipt,prepareMemory:bot.prepareCardMemory,saveMemory:bot.applyCardMemory};
   const tools=createActualTools(api,{receipts});
@@ -68,6 +70,159 @@ function fixture() {
   const apply=async plan=>{await tools.validate(plan);const refs={};const completed=[];for(const op of plan)completed.push({result:await tools.execute(op,refs)});await bot.refreshReceiptLinks(42,{completed});return completed.at(-1).result;};
   return {api,accounts,categories,payees,rows,writes,bot,tools,stage,apply,saved:()=>saved,failDelete:()=>failDelete=true};
 }
+
+function receiptUI(f, options = {}) {
+  const messages=[],requests=[];
+  f.nextMessageId ||= 100;
+  const agent=createAgent({tools:f.tools,allowedChatId:42,allowedChatIds:[-42],
+    generate:async()=>assert.fail('Receipt buttons must not call Gemini'),...options});
+  Object.assign(f.bot,{
+    Buffer,budgetAgent:agent,confirming:{},editField:{},pending:{},ownerPending:{},
+    isHelperAccount:n=>n.startsWith('Owed by '),
+    send:async(chat,text,keyboard)=>{const mid=f.nextMessageId++;messages.push({mid,chat,text,keyboard});return mid;},
+    tg:async(method,params)=>{requests.push({method,params});if(method==='editMessageReplyMarkup') {const m=messages.find(m=>m.mid===params.message_id);if(m)m.keyboard=params.reply_markup;}return {ok:true};},
+    dropKb:async(_chat,mid)=>{const m=messages.find(m=>m.mid===mid);if(m)m.keyboard=undefined;},
+  });
+  Object.assign(f.bot.cfg,{telegram:{allowedChatId:42,relayChannelId:-42},agent:{relayEnabled:true}});
+  if(!f.bot.agentReceiptTarget) vm.runInContext(['isRelay','isAllowedChat','isOwner','agentFor','receiptFor','agentConfirmKb','loggedKb','fieldMenuKb','splitSubKb','catPickerKb','cardKb','ownerKb','resolveCategory','FIELD_LABEL',
+    'sendAgentResult','agentReceiptTarget','stageReceiptButton','receiptFieldPatch','receiptCardChoice','agentReceiptButton','applyFieldValue','onCallback','dispatch'].map(declaration).join('\n'),f.bot);
+  const tap=(data,mid,from=42,chat=42)=>f.bot.onCallback({id:'tap',data,from:{id:from},message:{chat:{id:chat},message_id:mid}});
+  const start=async(fields={})=>{
+    const p=await agent.receiptChange(42,{action:'create',fields:{account:'card',date:'2026-09-12',amount:1694,merchant:'Winners 339',notes:'Dishwashing powder',...fields}});
+    await f.bot.sendAgentResult(42,p);return messages.at(-1);
+  };
+  const confirm=async()=>{const p=agent.pending(42);await tap(`ag:y:${p.id}`,p.messageId);return messages.at(-1);};
+  return {agent,messages,requests,tap,start,confirm,last:()=>messages.at(-1)};
+}
+
+test('compact receipt preview and success restore the complete button menu and exact split',async()=>{
+  const f=fixture(),ui=receiptUI(f),first=await ui.start();
+  assert.match(first.text,/Log receipt\n\$16\.94 · Winners 339/);
+  assert.ok(first.keyboard.inline_keyboard.flat().some(b=>b.text==='✏️ Edit'));
+  await ui.tap('e:menu',first.mid);
+  for(const label of ['Category','Merchant','Note','Card','Split','Paid by']) assert.ok(first.keyboard.inline_keyboard.flat().some(b=>b.text.includes(label)),label);
+  await ui.tap('e:back',first.mid);assert.ok(first.keyboard.inline_keyboard.flat().some(b=>b.callback_data.startsWith('ag:y:')));
+  await ui.tap('e:sub:split',first.mid);
+  const split=first.keyboard.inline_keyboard.flat().find(b=>b.text.includes('50/50'));
+  assert.match(split.text,/Tia/);await ui.tap(split.callback_data,first.mid);
+  assert.equal(f.writes.length,0);
+  const revised=ui.last();assert.match(revised.text,/Your share: \$8\.47 → Home\nTia: \$8\.47 → Owed by Tia/);
+  assert.match(revised.text,/Create on-budget account: Owed by Tia/);
+  const logged=await ui.confirm();assert.match(logged.text,/^✅ Logged/);assert.match(logged.text,/Synced ✓/);
+  assert.ok(logged.text.length<250,logged.text);
+  assert.doesNotMatch(logged.text,/Applied|Create payee|Confirm applies/);
+  assert.deepEqual(Array.from(logged.keyboard.inline_keyboard[0],b=>b.callback_data),['e:ok','e:menu','e:del']);
+  assert.equal(f.bot.msgTxn[`42:${logged.mid}`].id,f.bot.lastTxn[42].id);
+  await ui.tap('e:menu',logged.mid);await ui.tap('e:back',logged.mid);
+  assert.ok(logged.keyboard.inline_keyboard.flat().some(b=>b.callback_data==='e:del'));
+  await ui.tap('e:ok',logged.mid);assert.equal(logged.keyboard,undefined);
+});
+
+test('buttons and typed replies revise one pending receipt, invalidate old confirms and do not call Gemini',async()=>{
+  const f=fixture(),ui=receiptUI(f);const first=await ui.start();const oldId=ui.agent.pending(42).id;
+  await ui.tap('e:set:note',first.mid);
+  await f.bot.dispatch(42,{text:'Updated note'});
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.notes,'Updated note');
+  assert.notEqual(ui.agent.pending(42).id,oldId);assert.equal(f.writes.length,0);
+  await ui.tap(`ag:y:${oldId}`,first.mid);assert.equal(f.writes.length,0);
+  const mid=ui.agent.pending(42).messageId;
+  await ui.tap('e:sub:cat',mid);
+  f.categories.reverse();await f.bot.refreshActualMaps();
+  await ui.tap('ec:general',mid);
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.category,'General');
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.notes,'Updated note');
+  await ui.confirm();assert.equal(f.rows[0].category,'general');assert.equal(f.rows[0].notes,'Updated note');
+});
+
+test('note edits preserve the previewed category and split defaults instead of guessing again',async()=>{
+  const f=fixture(),ui=receiptUI(f);const m=await ui.start({merchant:'Shared Shop',notes:'home supplies'});
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.category,'Home');
+  await ui.tap('e:set:note',m.mid);await f.bot.dispatch(42,{text:'coffee'});
+  const rec=ui.agent.pending(42).operations[0].recipe.rec;
+  assert.equal(rec.category,'Home');assert.equal(rec.notes,'coffee');assert.deepEqual(Array.from(rec.persons),['Tia']);
+  await ui.tap('e:set:note',ui.last().mid);await f.bot.dispatch(42,{text:'Split with Tia is written on the box'});
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.notes,'Split with Tia is written on the box');
+});
+
+test('editing an older logged receipt targets its link, not the newest receipt, and deletion needs confirmation',async()=>{
+  const f=fixture(),ui=receiptUI(f);await ui.start({merchant:'Older receipt'});const old=await ui.confirm();const oldId=f.bot.msgTxn[`42:${old.mid}`].id;
+  await ui.start({merchant:'Newer receipt',amount:5000,category:'home'});await ui.confirm();const newerId=f.bot.lastTxn[42].id;
+  const writes=f.writes.length;
+  await ui.tap('ec:general',old.mid);assert.equal(f.writes.length,writes);assert.equal(ui.agent.pending(42).operations[0].id,oldId);
+  await ui.confirm();assert.equal(f.rows.find(r=>r.id===oldId).category,'general');assert.equal(f.rows.find(r=>r.id===newerId).category,'home');
+  await ui.tap('e:del',old.mid);assert.ok(f.rows.some(r=>r.id===oldId));
+  await ui.confirm();assert.ok(!f.rows.some(r=>r.id===oldId));assert.ok(f.rows.some(r=>r.id===newerId));
+  assert.equal(ui.last().keyboard,undefined);
+});
+
+test('card, payer, half/mine/theirs, split/unsplit and typed merchant controls stage complete changes',async()=>{
+  const f=fixture(),ui=receiptUI(f);let message=await ui.start({splitPersons:['Tia']});
+  await ui.tap('e:set:card',message.mid);assert.ok(message.keyboard.inline_keyboard.flat().some(b=>b.callback_data==='ea:tia-card'));
+  await ui.tap('ea:tia-card',message.mid);assert.ok(message.keyboard.inline_keyboard.flat().some(b=>b.callback_data==='e:cardshare:tia-card:mine'));
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.account,'Wealthsimple VIP');
+  await ui.tap('e:cardshare:tia-card:mine',message.mid);
+  let r=ui.agent.pending(42).operations[0].recipe.rec;assert.equal(r.owedCents,1694);assert.equal(r.account,'Tia Mastercard');assert.equal(r.persons.length,0);
+  await ui.tap('e:share:theirs',ui.last().mid);assert.equal(ui.agent.pending(42).operations[0].recipe.rec.owedCents,0);
+  await ui.tap('e:paid:Tia',ui.last().mid);assert.equal(ui.agent.pending(42).operations[0].recipe.rec.owedCents,847);
+  await ui.tap('ea:card',ui.last().mid);r=ui.agent.pending(42).operations[0].recipe.rec;assert.equal(r.ownerPaid,false);
+  await ui.tap('e:set:split',ui.last().mid);await f.bot.dispatch(42,{text:'Tia and Sam'});
+  assert.deepEqual(Array.from(ui.agent.pending(42).operations[0].recipe.rec.persons),['Tia','Sam']);
+  await ui.tap('e:do:unsplit',ui.last().mid);assert.equal(ui.agent.pending(42).operations[0].recipe.rec.split,false);
+  await ui.tap('e:set:merchant',ui.last().mid);await f.bot.dispatch(42,{text:'Renamed shop'});
+  assert.equal(ui.agent.pending(42).operations[0].recipe.rec.payee,'Renamed shop');assert.equal(f.writes.length,0);
+  await ui.confirm();assert.equal(f.rows.length,1);
+});
+
+test('receipt buttons enforce owner, chat, expired target and cancellation boundaries',async()=>{
+  const f=fixture(),ui=receiptUI(f);const m=await ui.start(),p=ui.agent.pending(42);
+  await ui.tap('e:paid:Tia',m.mid,999);assert.equal(ui.agent.pending(42).id,p.id);
+  await ui.tap('e:paid:Tia',m.mid,42,-42);assert.equal(ui.agent.pending(42).id,p.id);
+  await ui.tap('e:set:note',m.mid);await ui.tap(`ag:n:${p.id}`,m.mid);assert.equal(ui.agent.pending(42),null);
+  assert.equal(f.bot.editField[42],undefined);
+  await ui.tap('e:split:Tia',m.mid);assert.equal(ui.agent.pending(42),null);assert.equal(f.writes.length,0);
+});
+
+test('receipt confirmation bindings survive restart and sync/partial failures remain visible',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'borton-buttons-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const f=fixture(),options={statePath:path.join(dir,'agent.json')},ui=receiptUI(f,options);const m=await ui.start();
+  const restored=receiptUI(f,options);assert.equal(restored.agent.pending(42).messageId,m.mid);
+  await restored.tap('e:split:Tia',m.mid);assert.ok(restored.agent.pending(42).operations[0].recipe.rec.split);assert.equal(f.writes.length,0);
+  const receipt=await f.apply(await f.stage({merchant:'Synthetic completed receipt'}));
+  const completed=[{preview:'Log receipt',result:{domain:'receipt',action:'create',receipt:receipt.receipt}}];
+  await f.bot.sendAgentResult(42,{text:'full result',completed,uncertain:null,syncFailed:true});
+  assert.match(restored.last().text,/cloud sync failed/);assert.doesNotMatch(restored.last().text,/Synced ✓/);
+  await f.bot.sendAgentResult(42,{text:'Stopped: step may have partially applied',completed,uncertain:1,syncFailed:false});
+  assert.match(restored.last().text,/partially applied/);assert.equal(restored.last().keyboard,undefined);
+});
+
+test('typed edit prompts persist across restart and still edit the original preview',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'borton-edit-prompt-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const f=fixture(),options={statePath:path.join(dir,'agent.json')},ui=receiptUI(f,options);const m=await ui.start();
+  Object.assign(f.bot,{fs,TXN_STORE:path.join(dir,'links.json')});
+  vm.runInContext(['persistTxns','loadTxns'].map(declaration).join('\n'),f.bot);
+  await ui.tap('e:set:note',m.mid);
+  const pendingId=ui.agent.pending(42).id;
+  const restored=receiptUI(f,options);f.bot.loadTxns();
+  assert.equal(f.bot.editField[42].planId,pendingId);
+  await f.bot.dispatch(42,{text:'Resumed after restart'});
+  assert.equal(restored.agent.pending(42).operations[0].recipe.rec.notes,'Resumed after restart');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.bot.TXN_STORE)).editField,{});assert.equal(f.writes.length,0);
+});
+
+test('receipt-button revisions preserve prerequisite operations and one confirmation',async()=>{
+  const f=fixture();let round=0;
+  const agent=createAgent({tools:f.tools,allowedChatId:42,generate:async()=>({role:'model',parts:round++ ? [{text:'Ready'}] : [
+    {functionCall:{name:'propose_account_change',args:{action:'create',ref:'newcard',fields:{name:'New Card',offbudget:false}}}},
+    {functionCall:{name:'propose_receipt_change',args:{action:'create',fields:{account:'$newcard',date:'2026-09-12',amount:1694,merchant:'Winners 339'}}}},
+  ]})});
+  const p=await agent.message(42,'Create New Card and log this receipt');
+  const revised=await agent.receiptChange(42,{planId:p.planId,fields:{splitPersons:['Tia'],notes:'Revised'}});
+  assert.equal(agent.pending(42).operations.length,2);assert.equal(f.writes.length,0);
+  const done=await agent.confirm(42,revised.planId);assert.equal(done.uncertain,null);
+  assert.equal(f.accounts.filter(a=>a.name==='New Card').length,1);
+  assert.equal(f.rows.find(r=>r.is_parent).notes,'Revised');
+  const writes=f.writes.length;await agent.confirm(42,revised.planId);assert.equal(f.writes.length,writes);
+});
 
 test('agent receipt shares use the legacy writer, exact cents, one confirmation and no note substitution',async()=>{
   const f=fixture();const plan=await f.stage({splitPersons:['Tia']});
