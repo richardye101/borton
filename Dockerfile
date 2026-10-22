@@ -10,7 +10,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY bot.mjs ./
+COPY receipt-utils.mjs ./
 COPY tools ./tools
+COPY webapp ./webapp
 
 ENV NODE_ENV=production
 CMD ["node", "bot.mjs"]

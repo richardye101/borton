@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  <title>Receipt review</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #111); }
+    body { margin: 0; padding: 20px 16px 32px; } h1 { font-size: 22px; margin: 0 0 18px; }
+    .card { background: var(--tg-theme-secondary-bg-color, #f4f4f5); border-radius: 14px; padding: 14px; margin: 12px 0; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+    .row:last-child { border: 0; } .label { opacity: .65; } input { font: inherit; color: inherit; background: transparent; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); border-radius: 8px; padding: 6px; }
+    .warning { color: var(--tg-theme-destructive-text-color, #b42318); } button { width: 100%; padding: 13px; border: 0; border-radius: 10px; font: inherit; font-weight: 650; margin-top: 10px; background: var(--tg-theme-button-color, #2481cc); color: var(--tg-theme-button-text-color, #fff); }
+    button.secondary { background: transparent; color: var(--tg-theme-hint-color, #777); } #status { min-height: 22px; color: var(--tg-theme-hint-color, #777); }
+  </style>
+</head>
+<body>
+  <h1>Review receipt</h1>
+  <div id="status">Loading…</div>
+  <main id="expense" hidden></main>
+  <button id="confirm" hidden>Log transaction</button>
+  <button id="cancel" class="secondary" hidden>Cancel</button>
+  <script>
+    const app = window.Telegram?.WebApp;
+    const token = new URLSearchParams(location.search).get('token');
+    const status = document.querySelector('#status'), expense = document.querySelector('#expense');
+    const confirm = document.querySelector('#confirm'), cancel = document.querySelector('#cancel');
+    let duplicate = false;
+    const escape = (value) => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    const call = async (path, body) => {
+      const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, initData: app?.initData, ...body }) });
+      return { response, body: await response.json() };
+    };
+    function render(view) {
+      duplicate = view.duplicates.length > 0;
+      const duplicates = duplicate ? `<div class="card warning"><strong>Possible duplicate</strong>${view.duplicates.map(d => `<div class="row"><span>${escape(d.merchant)}</span><span>$${escape(d.amount)} · ${escape(d.date)}</span></div>`).join('')}</div>` : '';
+      expense.innerHTML = `<div class="card">
+        <div class="row"><span class="label">Amount</span><strong>$${escape(view.amount)}</strong></div>
+        <div class="row"><span class="label">Merchant</span><span>${escape(view.merchant)}</span></div>
+        <div class="row"><span class="label">Date</span><input id="date" type="date" value="${escape(view.date)}"></div>
+        <div class="row"><span class="label">Category</span><span>${escape(view.category)}</span></div>
+        <div class="row"><span class="label">Card</span><span>${escape(view.card)}</span></div>
+        ${view.note ? `<div class="row"><span class="label">Note</span><span>${escape(view.note)}</span></div>` : ''}
+      </div>${duplicates}`;
+      expense.hidden = confirm.hidden = cancel.hidden = false;
+      confirm.textContent = duplicate ? 'Log transaction anyway' : 'Log transaction';
+    }
+    async function load() {
+      if (!app?.initData || !token) { status.textContent = 'Open this screen from the receipt bot.'; return; }
+      app.ready(); app.expand();
+      const result = await call('/miniapp/review', {});
+      if (!result.response.ok) { status.textContent = result.body.error; return; }
+      status.textContent = ''; render(result.body.expense);
+    }
+    confirm.onclick = async () => {
+      const date = document.querySelector('#date').value;
+      confirm.disabled = true; status.textContent = 'Saving…';
+      const result = await call('/miniapp/confirm', { action: 'confirm', date, allowDuplicate: duplicate });
+      if (result.response.ok) { status.textContent = 'Logged in Actual.'; confirm.hidden = cancel.hidden = true; return app.close(); }
+      if (result.body.expense) { render(result.body.expense); status.textContent = 'Review the possible duplicate, then tap Log transaction anyway.'; }
+      else status.textContent = result.body.error || 'Could not save the receipt.';
+      confirm.disabled = false;
+    };
+    cancel.onclick = async () => { await call('/miniapp/confirm', { action: 'cancel' }); app.close(); };
+    load().catch(() => { status.textContent = 'Could not connect to the receipt bot.'; });
+  </script>
+</body>
+</html>

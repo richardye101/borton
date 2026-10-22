@@ -1,7 +1,8 @@
 {
   "telegram": {
     "allowedChatId": 0,
-    "relayChannelId": 0
+    "relayChannelId": 0,
+    "miniAppUrl": ""
   },
   "gemini": {
     "model": "gemini-flash-latest",

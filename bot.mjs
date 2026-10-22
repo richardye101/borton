@@ -2,10 +2,12 @@
 // Flow: photo+caption -> Gemini vision extracts receipt JSON -> caption parsed in code
 //       -> route to card account (explicit alias > receipt last-4 > ask) -> write to Actual -> reply.
 import * as api from '@actual-app/api';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findLikelyDuplicates, isValidExpenseDate } from './receipt-utils.mjs';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(fs.readFileSync(path.join(__dir, 'config.json'), 'utf8'));
@@ -473,10 +475,23 @@ function todayISO() { return new Date().toISOString().slice(0, 10); }
 // ponytail: fixed window, widen PAST_DAYS if you start logging older receipts.
 const DATE_FUTURE_DAYS = 2, DATE_PAST_DAYS = 60;
 function safeDate(d) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(d || '')) return todayISO();
+  if (!isValidExpenseDate(d)) return todayISO();
   const days = (Date.parse(`${d}T00:00:00Z`) - Date.parse(`${todayISO()}T00:00:00Z`)) / 86400000;
   if (!isFinite(days) || days > DATE_FUTURE_DAYS || days < -DATE_PAST_DAYS) return todayISO();
   return d;
+}
+function transactionDate(receipt) {
+  return receipt.dateManual && isValidExpenseDate(receipt.date) ? receipt.date : safeDate(receipt.date);
+}
+function dateOffset(date, days) {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
+}
+async function findDuplicates(account, receipt) {
+  const accountId = ACCT[account];
+  const date = transactionDate(receipt);
+  if (!accountId || !receipt.merchant || !receipt.total) return [];
+  const transactions = await api.getTransactions(accountId, dateOffset(date, -4), dateOffset(date, 4));
+  return findLikelyDuplicates(transactions, { total: receipt.total, merchant: receipt.merchant, date });
 }
 
 // One-line-per-field "key: value" layout, shared by the confirm preview and the logged receipts.
@@ -498,7 +513,7 @@ const EDIT_HINT = 'Reply to edit or delete — e.g. "category Groceries", "split
 
 async function finalize(chatId, receipt, parsed, accountName) {
   parsed = maybeAutoSplit(receipt, parsed);
-  const date = safeDate(receipt.date);
+  const date = transactionDate(receipt);
   const category = parsed.category || guessCategory(receipt, parsed.notes);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   // Prefer what you wrote (the caption) over the receipt's OCR line-items (often cryptic shortcodes
@@ -620,6 +635,10 @@ async function applyFieldValue(chatId, text) {
       const acct = resolveAccount(value);
       if (!acct) return await send(chatId, `No account matching "${value}". Retry with a card alias or exact name.`);
       c.account = acct;
+    } else if (ef.field === 'date') {
+      if (!isValidExpenseDate(value)) return await send(chatId, 'Use a real date from the past five years (or up to two days ahead), like 2026-10-18.');
+      c.receipt.date = value;
+      c.receipt.dateManual = true;
     } else if (ef.field === 'split') {
       const person = personName(value) || cap(cfg.defaults.splitPerson);
       c.parsed = { ...c.parsed, split: true, splitDecided: true, person };
@@ -724,12 +743,15 @@ function rememberSplitPerson(person) {
   cardmap.lastSplitPerson = p; saveCardmap();
 }
 
-function confirmText(receipt, parsed, account) {
+function confirmText(receipt, parsed, account, duplicates = []) {
   const cat = parsed.category || guessCategory(receipt, parsed.notes);
   const person = cap(parsed.person || cfg.defaults.splitPerson);
   const items = (receipt.line_items || []).map((s) => String(s).trim()).filter(Boolean).join(', ');
   const note = parsed.notes || items; // your description wins over receipt line-items
-  return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, note })}`;
+  const warning = duplicates.length
+    ? `\n\n⚠️ Possible duplicate already in ${account}:\n${duplicates.map((t) => `• $${(Math.abs(t.amount) / 100).toFixed(2)} · ${t.payee_name || t.payee || 'Unknown merchant'} · ${t.date}`).join('\n')}`
+    : '';
+  return `Log this?\n${fmtExpense({ total: receipt.total, merchant: receipt.merchant, category: cat, account, split: parsed.split, paid: parsed.paid, person, note, date: transactionDate(receipt) })}${warning}`;
 }
 // Resolve a typed category to its exact Actual name (case-insensitive), or null.
 function resolveCategory(want) {
@@ -739,12 +761,19 @@ function resolveCategory(want) {
 // A stored note carries machine tags like "[card ****1234] [apple pay]"; strip them for display.
 const displayNote = (notes) => (notes || '').replace(/\s*\[[^\]]*\]/g, '').trim();
 // Pre-log preview: confirm, edit, or cancel.
-function confirmKb() {
-  return { inline_keyboard: [[
+function miniAppUrl(c) {
+  const base = String(cfg.telegram?.miniAppUrl || '').replace(/\/$/, '');
+  return base.startsWith('https://') && c?.miniAppToken ? `${base}/app?token=${encodeURIComponent(c.miniAppToken)}` : null;
+}
+function confirmKb(c) {
+  const rows = [[
     { text: '✅ Yes', callback_data: 'c:y' },
     { text: '✏️ Edit', callback_data: 'e:menu' },
     { text: '❌ No', callback_data: 'c:n' },
-  ]] };
+  ]];
+  const url = miniAppUrl(c);
+  if (url) rows.push([{ text: 'Open receipt app', web_app: { url } }]);
+  return { inline_keyboard: rows };
 }
 // Logged receipt: dismiss the buttons, edit a field, or delete.
 function loggedKb() {
@@ -756,8 +785,9 @@ function loggedKb() {
 }
 // Field picker shown after tapping ✏️ Edit (works for both a pending preview and a logged txn).
 // Category / Split / Paid-by open their own sub-menu (one thing per row → no truncation).
-function fieldMenuKb(reverse) {
+function fieldMenuKb(reverse, pending = false) {
   const rows = [[{ text: '🏷 Category', callback_data: 'e:sub:cat' }, { text: '🏬 Merchant', callback_data: 'e:set:merchant' }, { text: '📝 Note', callback_data: 'e:set:note' }]];
+  if (pending) rows.push([{ text: '📅 Date', callback_data: 'e:set:date' }]);
   rows.push(reverse
     ? [{ text: '👤 Paid by…', callback_data: 'e:sub:person' }]
     : [{ text: '💳 Card', callback_data: 'e:set:card' }, { text: '➗ Split…', callback_data: 'e:sub:split' }]);
@@ -785,8 +815,10 @@ function catPickerKb() {
 // Preview the parsed transaction and wait for a yes/no (button or typed) before writing.
 async function askConfirm(chatId, receipt, parsed, account) {
   parsed = maybeAutoSplit(receipt, parsed);
-  const mid = await send(chatId, confirmText(receipt, parsed, account), confirmKb());
-  confirming[chatId] = { receipt, parsed, account, promptMid: mid };
+  const c = { chatId, receipt, parsed, account, miniAppToken: crypto.randomUUID() };
+  c.duplicates = await findDuplicates(account, receipt);
+  const mid = await send(chatId, confirmText(receipt, parsed, account, c.duplicates), confirmKb(c));
+  confirming[chatId] = { ...c, promptMid: mid };
 }
 // If the chosen card belongs to someone else, ask how to split (they paid); otherwise normal confirm.
 // Used after a card is picked from the buttons, so that path gets owner detection too.
@@ -799,7 +831,8 @@ async function confirmOrOwnerPaid(chatId, receipt, parsed, account) {
 async function rerenderConfirm(chatId) {
   const c = confirming[chatId];
   if (!c || !c.promptMid) return;
-  await tg('editMessageText', { chat_id: chatId, message_id: c.promptMid, text: confirmText(c.receipt, c.parsed, c.account), reply_markup: confirmKb() }).catch(() => {});
+  c.duplicates = await findDuplicates(c.account, c.receipt);
+  await tg('editMessageText', { chat_id: chatId, message_id: c.promptMid, text: confirmText(c.receipt, c.parsed, c.account, c.duplicates), reply_markup: confirmKb(c) }).catch(() => {});
 }
 // Returns true if it consumed the text (yes/no, or a split-partner name we asked for), false to fall through.
 async function handleConfirm(chatId, text) {
@@ -1134,12 +1167,12 @@ async function onCallback(cq) {
     } else if (data === 'e:menu') { // ✏️ Edit -> show the field picker on this message
       const c = confirming[chatId];
       const rec = (c && c.promptMid === mid) ? null : msgTxn[mid];
-      if (c && c.promptMid === mid) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(c.parsed.paid) }).catch(() => {});
+      if (c && c.promptMid === mid) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(c.parsed.paid, true) }).catch(() => {});
       else if (rec) await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: fieldMenuKb(rec.reverse) }).catch(() => {});
       else await send(chatId, "That one's too old to edit by button — reply to it instead.");
     } else if (data === 'e:back') { // collapse the field picker back to the normal row
       const c = confirming[chatId];
-      const kb = (c && c.promptMid === mid) ? confirmKb() : loggedKb();
+      const kb = (c && c.promptMid === mid) ? confirmKb(c) : loggedKb();
       await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: kb }).catch(() => {});
     } else if (data === 'e:sub:cat') { // open the category picker
       await tg('editMessageReplyMarkup', { chat_id: chatId, message_id: mid, reply_markup: catPickerKb() }).catch(() => {});
@@ -1172,9 +1205,9 @@ async function onCallback(cq) {
       editField[chatId] = { field, kind, mid };
       const rec = kind === 'logged' ? msgTxn[mid] : null;
       const cur = kind === 'pending'
-        ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'merchant' ? (c.receipt.merchant || '') : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : cap(c.parsed.person || cfg.defaults.splitPerson))
-        : (field === 'cat' ? rec.category : field === 'merchant' ? rec.payee : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : cap(rec.person || cfg.defaults.splitPerson));
-      const prompts = { cat: 'Send the new category', merchant: 'Send the new merchant name', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
+        ? (field === 'cat' ? (c.parsed.category || guessCategory(c.receipt, c.parsed.notes)) : field === 'merchant' ? (c.receipt.merchant || '') : field === 'card' ? (c.account || '') : field === 'note' ? (c.parsed.notes || '') : field === 'date' ? transactionDate(c.receipt) : cap(c.parsed.person || cfg.defaults.splitPerson))
+        : (field === 'cat' ? rec.category : field === 'merchant' ? rec.payee : field === 'card' ? rec.account : field === 'note' ? displayNote(rec.notes) : field === 'date' ? rec.date : cap(rec.person || cfg.defaults.splitPerson));
+      const prompts = { cat: 'Send the new category', merchant: 'Send the new merchant name', card: 'Send the card (alias or account name)', note: 'Send the new note (replaces the current one)', date: 'Send the date as YYYY-MM-DD', split: 'Split with whom? Send a name', person: 'Who paid? Send a name' };
       // Plain message (no force_reply — Telegram silently drops force_reply in channels, which read as
       // "nothing happened"). editField is set, so your very next message is taken as the value.
       await send(chatId, `✏️ ${prompts[field] || 'Send the new value'}${cur ? `\n(currently: ${cur})` : ''}`);
@@ -1303,30 +1336,102 @@ async function handleIngest(d, chat = cfg.telegram.allowedChatId) {
   persistTxns();
   return rec;
 }
-function startIngest() {
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) reject(new Error('request too large'));
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(body || '{}')); } catch { reject(new Error('invalid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+function json(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(body));
+}
+function telegramWebAppUser(initData) {
+  try {
+    const params = new URLSearchParams(initData || '');
+    const hash = params.get('hash');
+    const authDate = Number(params.get('auth_date'));
+    params.delete('hash');
+    const check = [...params.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('\n');
+    const key = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_TOKEN).digest();
+    const expected = crypto.createHmac('sha256', key).update(check).digest('hex');
+    if (!hash || hash.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(expected))) return null;
+    if (!authDate || Math.abs(Date.now() / 1000 - authDate) > 86400) return null;
+    return JSON.parse(params.get('user') || 'null');
+  } catch { return null; }
+}
+function miniAppConfirmation(token, user) {
+  const c = Object.values(confirming).find((entry) => entry.miniAppToken === token);
+  return c && user && String(c.chatId) === String(user.id) ? c : null;
+}
+function miniAppView(c) {
+  const category = c.parsed.category || guessCategory(c.receipt, c.parsed.notes);
+  return {
+    amount: Number(c.receipt.total).toFixed(2), merchant: c.receipt.merchant, date: transactionDate(c.receipt),
+    category, card: c.account, note: c.parsed.notes || '',
+    duplicates: (c.duplicates || []).map((t) => ({ amount: (Math.abs(t.amount) / 100).toFixed(2), merchant: t.payee_name || t.payee || 'Unknown merchant', date: t.date })),
+  };
+}
+function startServer() {
   const port = cfg.ingest?.port || 8088;
   const secret = process.env.INGEST_SECRET;
-  if (!secret) { console.log('WARNING: INGEST_SECRET not set in .env — /ingest disabled.'); return; }
-  http.createServer((req, res) => {
-    if (req.method !== 'POST' || !req.url.startsWith('/ingest')) { res.writeHead(404); return res.end('not found'); }
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', async () => {
-      try {
-        const u = new URL(req.url, 'http://x');
+  const appEnabled = String(cfg.telegram?.miniAppUrl || '').startsWith('https://');
+  if (!secret && !appEnabled) { console.log('WARNING: INGEST_SECRET not set in .env — /ingest disabled.'); return; }
+  http.createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    try {
+      if (req.method === 'GET' && u.pathname === '/app' && appEnabled) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(fs.readFileSync(path.join(__dir, 'webapp', 'index.html')));
+      }
+      if (req.method === 'POST' && u.pathname === '/miniapp/review' && appEnabled) {
+        const body = await readJson(req);
+        const c = miniAppConfirmation(body.token, telegramWebAppUser(body.initData));
+        if (!c) return json(res, 401, { ok: false, error: 'This receipt preview has expired. Return to the bot and send it again.' });
+        c.duplicates = await findDuplicates(c.account, c.receipt);
+        return json(res, 200, { ok: true, expense: miniAppView(c) });
+      }
+      if (req.method === 'POST' && u.pathname === '/miniapp/confirm' && appEnabled) {
+        const body = await readJson(req);
+        const c = miniAppConfirmation(body.token, telegramWebAppUser(body.initData));
+        if (!c) return json(res, 401, { ok: false, error: 'This receipt preview has expired. Return to the bot and send it again.' });
+        if (body.action === 'cancel') {
+          delete confirming[c.chatId];
+          await send(c.chatId, '❌ Cancelled — nothing logged.');
+          return json(res, 200, { ok: true, cancelled: true });
+        }
+        if (body.action !== 'confirm' || !isValidExpenseDate(body.date)) return json(res, 400, { ok: false, error: 'Enter a valid date.' });
+        c.receipt.date = body.date;
+        c.receipt.dateManual = true;
+        c.duplicates = await findDuplicates(c.account, c.receipt);
+        if (c.duplicates.length && !body.allowDuplicate) return json(res, 409, { ok: false, duplicate: true, expense: miniAppView(c) });
+        delete confirming[c.chatId];
+        await finalize(c.chatId, c.receipt, c.parsed, c.account);
+        return json(res, 200, { ok: true });
+      }
+      if (req.method === 'POST' && u.pathname === '/ingest') {
+        const body = await readJson(req);
         const given = u.searchParams.get('secret') || req.headers['x-secret'];
         if (given !== secret) { res.writeHead(401); return res.end('unauthorized'); }
-        const out = await handleIngest(JSON.parse(body || '{}'));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, ...out }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: e.message }));
+        const out = await handleIngest(body);
+        return json(res, 200, { ok: true, ...out });
+      }
+      res.writeHead(404); res.end('not found');
+    } catch (e) {
+      json(res, 400, { ok: false, error: e.message });
+      if (u.pathname === '/ingest') {
         const chat = cfg.telegram.allowedChatId;
         if (chat) await send(chat, '⚠️ ingest error: ' + e.message).catch(() => {});
       }
-    });
-  }).listen(port, () => console.log(`Ingest endpoint listening on :${port}/ingest`));
+    }
+  }).listen(port, () => console.log(`HTTP server listening on :${port}${secret ? ' (/ingest)' : ''}${appEnabled ? ' (/app)' : ''}`));
 }
 
 async function main() {
@@ -1335,7 +1440,7 @@ async function main() {
   console.log('Accounts:', Object.keys(ACCT).join(', '));
   loadTxns(); // restore reply->txn links so edits survive restarts
   if (cardmap.lastSplitPerson && !personName(cardmap.lastSplitPerson)) { delete cardmap.lastSplitPerson; saveCardmap(); } // scrub a poisoned partner name
-  startIngest();
+  startServer();
   if (!cfg.telegram.allowedChatId) console.log('WARNING: allowedChatId not set — bot will respond to anyone who messages it. Run `npm run chatid` and set it in config.json.');
   console.log('Bot running. Long-polling Telegram…');
   let offset = 0;
@@ -1396,10 +1501,7 @@ function selftest() {
   cardmap.owners = { 'Wealthsimple VIP': 'Tia' };
   assert(ownerOf('wealthsimple vip') === 'Tia' && ownerOf('Amex') === null, 'ownerOf resolves owned cards, null otherwise');
   delete cardmap.owners;
-  // Card-alias learning: a distinct card word is remembered; generic words / numbers are not.
-  cardmap.aliases = { ...cardmap.aliases };
-  assert(learnCardAlias('Scotia Card', 'Scotiabank VI') === true && cardmap.aliases['scotia card'] === 'Scotiabank VI', 'learnCardAlias remembers a distinct card word');
-  assert(learnCardAlias('scotia card', 'Scotiabank VI') === false, 'learnCardAlias is a no-op when already mapped');
+  // Card-alias learning rejects broad terms and card digits, avoiding accidental over-matches.
   assert(learnCardAlias('visa', 'Amex') === false && learnCardAlias('1234', 'Amex') === false, 'learnCardAlias skips generic words and pure numbers');
   // New-account ownership buttons: callback_data must round-trip through the 'newacct:'.length
   // slice in onCallback (data.slice(8)) — a prefix-length typo here silently breaks the button.

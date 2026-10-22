@@ -34,9 +34,17 @@ names); commit only the `*.example.json` templates.
   - `dinner with Mike` — free text becomes the transaction note
 - First time it sees a new card's last-4 it asks which account; it remembers after that (`cardmap.json`).
 - If the receipt has no card number, it asks which card you used.
+- Every preview shows the transaction date. Tap **Edit → Date** to override a bad or missing
+  receipt date before logging. The bot flags a likely duplicate when the same card has the same
+  amount and merchant within four days; you can still explicitly log it.
+- Set `telegram.miniAppUrl` to this bot's public **HTTPS** base URL to add an **Open receipt app**
+  button to previews. It opens a full Telegram Mini App with a native date picker and duplicate
+  warning. Point your TLS reverse proxy at `ingest.port`; the Mini App verifies Telegram's signed
+  launch data before it reads or confirms a receipt.
 
 ## Architecture
-- `bot.mjs` — everything: Telegram long-poll, Gemini extractor (swappable), caption parser, Actual writes.
+- `bot.mjs` — Telegram long-poll, Gemini extractor, Actual writes, and the optional Mini App API.
+- `webapp/index.html` — the dependency-free Telegram Mini App receipt-review screen.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
 
