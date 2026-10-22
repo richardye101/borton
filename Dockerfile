@@ -9,10 +9,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY bot.mjs ./
-COPY receipt-utils.mjs ./
+COPY bot.mjs receipt-utils.mjs actual-tools.mjs agent.mjs retry-queue.mjs ./
 COPY tools ./tools
-COPY webapp ./webapp
 
 ENV NODE_ENV=production
 CMD ["node", "bot.mjs"]

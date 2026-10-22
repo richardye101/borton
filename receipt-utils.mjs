@@ -18,6 +18,13 @@ const merchantMatches = (left, right) => {
   return a === b || (a.length >= 5 && b.length >= 5 && (a.includes(b) || b.includes(a)));
 };
 
+export function withPayeeNames(transactions, payees) {
+  const names = new Map((payees || []).map((payee) => [payee.id, payee.name]));
+  return (transactions || []).map((transaction) => transaction.payee_name
+    ? transaction
+    : { ...transaction, payee_name: names.get(transaction.payee) || transaction.payee || '' });
+}
+
 export function findLikelyDuplicates(transactions, { total, merchant, date }) {
   const targetDate = asDate(date);
   const cents = Math.round(Math.abs(Number(total)) * 100);

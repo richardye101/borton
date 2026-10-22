@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { findLikelyDuplicates, isValidExpenseDate } from '../receipt-utils.mjs';
+import { findLikelyDuplicates, isValidExpenseDate, withPayeeNames } from '../receipt-utils.mjs';
 
 test('findLikelyDuplicates matches amount, merchant, and nearby posting date', () => {
   const matches = findLikelyDuplicates([
@@ -19,6 +19,11 @@ test('findLikelyDuplicates recognizes normalized merchant names', () => {
   ], { total: 45.99, merchant: 'Home Depot', date: '2026-10-20' });
 
   assert.equal(matches.length, 1);
+});
+
+test('withPayeeNames resolves Actual payee IDs before duplicate matching', () => {
+  const rows = withPayeeNames([{ id: 'txn', amount: -1299, payee: 'payee-1' }], [{ id: 'payee-1', name: 'Starbucks Coffee' }]);
+  assert.equal(rows[0].payee_name, 'Starbucks Coffee');
 });
 
 test('isValidExpenseDate rejects impossible and far-future dates', () => {

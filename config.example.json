@@ -1,8 +1,7 @@
 {
   "telegram": {
     "allowedChatId": 0,
-    "relayChannelId": 0,
-    "miniAppUrl": ""
+    "relayChannelId": 0
   },
   "gemini": {
     "model": "gemini-flash-latest",
@@ -14,6 +13,11 @@
   },
   "ingest": {
     "port": 28455
+  },
+  "agent": {
+    "enabled": true,
+    "relayEnabled": false,
+    "timezone": "America/Toronto"
   },
   "actual": {
     "serverURL": "https://YOUR_ACTUAL_SERVER:5006",

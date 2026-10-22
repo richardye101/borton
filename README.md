@@ -34,19 +34,104 @@ names); commit only the `*.example.json` templates.
   - `dinner with Mike` — free text becomes the transaction note
 - First time it sees a new card's last-4 it asks which account; it remembers after that (`cardmap.json`).
 - If the receipt has no card number, it asks which card you used.
-- Every preview shows the transaction date. Tap **Edit → Date** to override a bad or missing
+- Every preview shows the transaction date. Tap **Edit → Date** to correct a bad or missing
   receipt date before logging. The bot flags a likely duplicate when the same card has the same
   amount and merchant within four days; you can still explicitly log it.
-- Set `telegram.miniAppUrl` to this bot's public **HTTPS** base URL to add an **Open receipt app**
-  button to previews. It opens a full Telegram Mini App with a native date picker and duplicate
-  warning. Point your TLS reverse proxy at `ingest.port`; the Mini App verifies Telegram's signed
-  launch data before it reads or confirms a receipt.
 
 ## Architecture
-- `bot.mjs` — Telegram long-poll, Gemini extractor, Actual writes, and the optional Mini App API.
-- `webapp/index.html` — the dependency-free Telegram Mini App receipt-review screen.
+
+- `bot.mjs` — Telegram long-poll, receipts, voice transcription, expense workflows, and agent routing.
+- `agent.mjs` — Gemini tool loop, short conversation memory and confirmed plans.
+- `actual-tools.mjs` — validated Actual queries, reports and mutation proposals.
+- `retry-queue.mjs` — durable Telegram inbox, delayed retries and dead letters.
 - `cardmap.json` — `aliases` (caption words → account) + `byLast4` (self-built).
 - Extraction backend is one function (`extractReceipt`) — swap Gemini for Claude or local Gemma without touching the rest.
+
+## Conversational Actual assistant
+
+Ask naturally by text or voice: “How much did I spend on groceries last month?”,
+“Find the Costco charge from Friday”, “Change that to Household”, or
+“Increase this month's grocery budget by $200.” Receipt photos and explicit expense/edit
+commands keep their existing workflows. General questions go to the agent.
+
+The agent can work with transactions/transfers, accounts, categories and groups, payees,
+budget amounts/carryover, schedules, rules, tags, notes and bank sync. It reads immediately.
+For changes it shows the complete plan with before/after values and one **Confirm / Cancel**
+keyboard. Only Confirm executes it. Describe a revision to replace the plan and invalidate
+the old buttons. Plans expire after 24 hours. Direct receipt workflows retain their existing
+confirmations; the new plan requirement applies to agent operations.
+
+Receipt messages use a compact amount/merchant, card/date, share and note summary. Successful
+receipts restore **OK / Edit / Delete**; Edit includes category, merchant, note, card, split and
+payer/share choices. While the agent is enabled, these buttons stage validated changes without
+calling Gemini, then require one Confirm. They stay bound to that receipt (or pending preview),
+including across restarts. Sync failures and uncertain writes remain explicit.
+
+The agent requires `telegram.allowedChatId`, set to the owner's private Telegram chat/user ID.
+To enable it in the configured `telegram.relayChannelId`, explicitly set `agent.relayEnabled`
+to `true`. Channel subscribers can see its budget replies and plans; only the owner's Telegram
+account can use Confirm/Cancel or receipt-edit buttons. Typed channel “yes” cannot confirm.
+Private and channel conversation histories and receipt references stay separate.
+Ordinary text/voice replies (such as “This should be Sept 8th”) go to the agent, not into notes.
+Use an explicit `note: ...` command or the Note field for note edits. Channel text edits produce
+confirmed plans; trusted structured receipt uploads retain their existing workflow.
+Set `agent.enabled` to `false` to disable it, or `agent.timezone` to your IANA timezone (default
+`America/Toronto`). It uses the existing Gemini model/key and adds no runtime dependency.
+
+Actual computes aggregates locally. Gemini receives the requested totals or matching records,
+with transaction notes only when needed. It does not receive API credentials, configuration,
+or the raw budget database. Short history (12 messages), up to 50 entity references, a pending
+plan and the last 100 execution records persist in `actual-data/agent-state.json` (mode 0600).
+That file contains financial context; keep it private with the rest of the Actual cache.
+
+Confirmed plans are sequential, not atomic. A failure reports completed, uncertain and
+unattempted steps. Interrupted writes are never automatically replayed. Ask the bot to inspect
+Actual before requesting a new plan. It checks snapshots again before applying changes.
+Destructive account/category/payee changes are presented separately from edits to other object
+types. The agent's `propose_receipt_change` tool uses the same receipt writers as photos and
+deterministic text: equal multi-person splits, debt transfers, payer half/all-mine/all-theirs,
+and split/unsplit or card/payer edits. Its preview shows each share and any new owed accounts.
+Rebuilds preserve cleared status; reconciled/custom structures require explicit inspection.
+`get_receipt_context` exposes scoped card mappings, ownership and category/split defaults;
+`propose_card_memory_change` saves explicit alias/last-four/owner/partner changes only after
+confirmation. Receipt links are refreshed after agent writes instead of being erased.
+Receipt rebuilds can involve several Actual writes inside one confirmed step: a failure stops
+the plan as uncertain and is never blindly replayed. Regex fallback and queued retries remain.
+
+Offline checks: `node tools/test_agent.mjs`, `node --test tools/test_routing.mjs tools/test_split.mjs tools/test_retry.mjs tools/test_receipt_agent.mjs`,
+and `node bot.mjs selftest` (use synthetic
+config/cardmap files for selftest, which exercises card-map learning).
+Read-only deployment check: `node bot.mjs agent-smoke`. This downloads a separate temporary
+Actual cache, verifies budget/transaction read schemas, asks Gemini to count open accounts,
+and stages a sample plan with execution disabled. It never polls Telegram or executes financial
+mutations. The temporary cache is private financial data and is kept under
+the OS temporary directory for diagnosis.
+
+The API client is pinned to `26.8.1`, matching the deployed Actual server. A newer budget may
+reject an older client with `out-of-sync-migrations`; update the pin to the server's version
+and run the smoke check before restarting production.
+
+## Automatic retries
+
+Authorized Telegram text, voice and photo messages are saved before acknowledging delivery.
+Temporary Gemini/Telegram failures (429, 5xx, timeouts and interrupted connections) retry after
+1, 5 and 15 minutes, then hourly, honoring longer `Retry-After` delays. Model fallback remains,
+but there are no immediate repeated calls to the same model. Terse receipt parsing still works
+without Gemini; failed AI interpretation is queued rather than converted into a guessed expense.
+The bot shows one “Queued — I’ll retry automatically” status, updating it when processing finishes.
+Transcripts, receipt references and the original request date/context survive restarts. Messages
+stay ordered within each chat, and buttons wait while that chat has queued work. Other chats and
+Telegram polling continue. Agent changes still need the owner's existing Confirm button.
+
+The queue is `actual-data/message-queue.json` (under the configured `actual.dataDir`, mode 0600).
+It contains private message/financial context and Telegram attachment IDs, not downloaded media
+or API keys. Completed payloads are removed. After 24 hours, or on a permanent failure, the
+payload remains with `status: "dead"` for inspection, with one notification and no further retries.
+Any failure/restart after an Actual mutation started is also held there: its outcome may be
+uncertain, so it is never replayed automatically. Inspect Actual before attempting that work again;
+do not reset an uncertain job to pending. HTTP `/ingest` and confirmation execution retain their
+existing workflows and are not automatically replayed. Preserve the queue file if it is corrupt;
+the bot stops rather than silently discarding it. Run only one bot process per queue/token.
 
 ## Deploy
 On an always-on host with network access to the Actual server (e.g. a Proxmox LXC). The repo is
