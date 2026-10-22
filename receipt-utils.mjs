@@ -25,6 +25,14 @@ export function withPayeeNames(transactions, payees) {
     : { ...transaction, payee_name: names.get(transaction.payee) || transaction.payee || '' });
 }
 
+export function normalizeReceipts(result) {
+  const candidates = Array.isArray(result?.receipts) ? result.receipts : [result];
+  return candidates
+    .filter((receipt) => receipt && String(receipt.merchant || '').trim() && Number.isFinite(Number(receipt.total)) && Number(receipt.total) > 0)
+    .slice(0, 8)
+    .map((receipt) => ({ ...receipt, merchant: String(receipt.merchant).trim(), total: Number(receipt.total) }));
+}
+
 export function findLikelyDuplicates(transactions, { total, merchant, date }) {
   const targetDate = asDate(date);
   const cents = Math.round(Math.abs(Number(total)) * 100);

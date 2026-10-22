@@ -11,7 +11,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createActualTools, ToolError } from './actual-tools.mjs';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
 import { createRetryQueue, guardActualWrites, RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
-import { findLikelyDuplicates, isValidExpenseDate, withPayeeNames } from './receipt-utils.mjs';
+import { findLikelyDuplicates, isValidExpenseDate, normalizeReceipts, withPayeeNames } from './receipt-utils.mjs';
 
 const messageContext = new AsyncLocalStorage();
 const currentMessage = () => messageContext.getStore();
@@ -439,7 +439,7 @@ async function downloadTelegramFile(fileId, mime) {
 }
 
 // ---------- Gemini extractor (pluggable: swap this fn for Claude/local later) ----------
-const RECEIPT_SCHEMA = {
+const RECEIPT_ITEM_SCHEMA = {
   type: 'OBJECT',
   properties: {
     merchant: { type: 'STRING', description: 'Store / merchant name' },
@@ -451,6 +451,17 @@ const RECEIPT_SCHEMA = {
     line_items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Short list of items purchased' },
   },
   required: ['merchant', 'total'],
+};
+const RECEIPT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    receipts: {
+      type: 'ARRAY',
+      items: RECEIPT_ITEM_SCHEMA,
+      description: 'Every separate purchase receipt visible in the image, up to eight.',
+    },
+  },
+  required: ['receipts'],
 };
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 // Try the primary model, then fall back to other flash models on transient 429/5xx (e.g. 503 overload).
@@ -490,7 +501,7 @@ async function geminiGenerate(parts, schema) {
 }
 async function extractReceipt(buf, mime) {
   return geminiGenerate(
-    [{ text: 'Extract the receipt into the schema. Use the printed grand total for "total". List each purchased item in line_items using short names (condense long descriptions, drop prices/quantities). If the card last-4 is not printed, return an empty string for card_last4.' },
+    [{ text: 'Extract every separate purchase receipt visible in this image into the receipts array. A receipt is a distinct proof of purchase, not a duplicate copy, coupon, subtotal, or line item. Use the printed grand total for total. List each purchased item in line_items using short names (condense long descriptions, drop prices/quantities). If a card last-4 is not printed, return an empty string for card_last4. Return one array entry for an ordinary single receipt.' },
      { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
     RECEIPT_SCHEMA);
 }
@@ -838,6 +849,7 @@ async function logOwnerPaid({ cardAccount, owedAccount, total, myCents, payee, n
 // ---------- Main flow ----------
 const pending = {}; // chatId -> { receipt, parsed, last4, confirm }  (awaiting a card answer)
 const confirming = {}; // chatId -> { receipt, parsed, account }  (awaiting yes/no before logging)
+const batchConfirming = {}; // chatId -> { entries: [{ receipt, parsed, account, duplicates }], promptMid }
 const editField = {}; // chatId -> { field, kind: 'pending'|'logged', mid }  (awaiting a typed value after ✏️ Edit → field)
 const ownerPending = {}; // chatId -> { receipt, parsed, account, owner }  (a charge on someone else's card: awaiting split/all-mine/all-theirs)
 const lastTxn = {}; // chatId -> rec  (most recent logged txn, for follow-up edits within the hour)
@@ -1096,16 +1108,16 @@ async function applyFieldValue(chatId, text) {
 }
 
 async function handlePhoto(chatId, msg) {
-  delete pending[chatId]; delete confirming[chatId]; delete ownerPending[chatId]; // a fresh receipt supersedes any unanswered prompt
+  delete pending[chatId]; delete confirming[chatId]; delete batchConfirming[chatId]; delete ownerPending[chatId]; // a fresh receipt supersedes any unanswered prompt
   const fileId = msg.photo[msg.photo.length - 1].file_id; // largest
   const statusMid = await progressMessage(chatId, '📸 reading receipt…');
-  let receipt;
+  let extracted;
   try {
-    receipt = currentMessage()?.receipt;
-    if (!receipt) {
+    extracted = currentMessage()?.receipt;
+    if (!extracted) {
       const { buf, mime } = await downloadPhoto(fileId);
-      receipt = await extractReceipt(buf, mime);
-      checkpointMessage({ receipt });
+      extracted = await extractReceipt(buf, mime);
+      checkpointMessage({ receipt: extracted });
     }
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: '📸 Receipt read.' }).catch(() => {});
   } catch (e) {
@@ -1113,21 +1125,32 @@ async function handlePhoto(chatId, msg) {
     if (statusMid) await tg('editMessageText', { chat_id: chatId, message_id: statusMid, text: "⚠️ Couldn't read that receipt." }).catch(() => {});
     throw e;
   }
+  const receipts = normalizeReceipts(extracted);
+  if (!receipts.length) throw new Error('No purchase receipts found in that image.');
   const parsed = parseCaption(msg.caption);
-  let account = parsed.cardAccount || (receipt.card_last4 && cardmap.byLast4[receipt.card_last4]) || null;
-  if (!account) {
-    if (receipt.card_last4) {
-      pending[chatId] = { receipt, parsed, last4: receipt.card_last4 };
-      await send(chatId, `New card ****${receipt.card_last4} ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich account is it?`, cardKb());
-    } else {
-      pending[chatId] = { receipt, parsed, last4: null };
-      await send(chatId, `No card number on the receipt ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich card did you use?`, cardKb());
+  const entries = receipts.map((receipt) => ({ receipt, parsed: { ...parsed, persons: [...(parsed.persons || [])] },
+    account: parsed.cardAccount || (receipt.card_last4 && cardmap.byLast4[receipt.card_last4]) || null }));
+  if (entries.length === 1) {
+    const [{ receipt, account }] = entries;
+    if (!account) {
+      pending[chatId] = { receipt, parsed, last4: receipt.card_last4 || null };
+      return await send(chatId, receipt.card_last4
+        ? `New card ****${receipt.card_last4} ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich account is it?`
+        : `No card number on the receipt ($${Number(receipt.total).toFixed(2)} at ${receipt.merchant}).\nWhich card did you use?`, cardKb());
     }
-    return;
+    const owner = ownerOf(account);
+    if (owner && !parsed.paid) return await askOwnerPaid(chatId, receipt, parsed, account, owner);
+    return await askConfirm(chatId, receipt, parsed, account);
   }
-  const owner = ownerOf(account);
-  if (owner && !parsed.paid) return await askOwnerPaid(chatId, receipt, parsed, account, owner); // their card -> they paid; ask how to split
-  await finalize(chatId, receipt, parsed, account);
+  const missing = entries.filter((entry) => !entry.account);
+  if (missing.length) {
+    pending[chatId] = { batch: entries };
+    return await send(chatId, `I found ${entries.length} receipts. Which card was used for the ${missing.length} receipt${missing.length === 1 ? '' : 's'} without a recognized card?`, cardKb());
+  }
+  if (entries.some((entry) => ownerOf(entry.account) && !entry.parsed.paid)) {
+    return await send(chatId, 'I found receipts on someone else’s card. Send those receipts separately so I can ask how each one should be split.');
+  }
+  return askBatchConfirm(chatId, entries);
 }
 
 // Download a Telegram voice/audio note, run it through Gemini, and replace the progress message.
@@ -1208,6 +1231,12 @@ function confirmKb() {
     { text: '❌ No', callback_data: 'c:n' },
   ]] };
 }
+function batchConfirmKb() {
+  return { inline_keyboard: [[
+    { text: '✅ Log all', callback_data: 'b:y' },
+    { text: '❌ Cancel', callback_data: 'b:n' },
+  ]] };
+}
 function agentConfirmKb(planId, editable = true) {
   return {inline_keyboard:[[
     {text:'✅ Confirm',callback_data:`ag:y:${planId}`},
@@ -1265,6 +1294,27 @@ async function askConfirm(chatId, receipt, parsed, account) {
   c.duplicates = await findDuplicates(account, receipt);
   const mid = await send(chatId, confirmText(receipt, parsed, account, c.duplicates), confirmKb());
   confirming[chatId] = { ...c, promptMid: mid };
+}
+function batchConfirmText(entries) {
+  return `Log these ${entries.length} receipts?\n\n${entries.map((entry, index) => {
+    const duplicate = entry.duplicates.length
+      ? `\n⚠️ Possible duplicate: ${entry.duplicates.map((txn) => `${txn.payee_name || txn.payee || 'Unknown merchant'} · ${txn.date}`).join(', ')}`
+      : '';
+    return `${index + 1}. ${fmtExpense({ total: entry.receipt.total, merchant: entry.receipt.merchant,
+      category: entry.parsed.category || guessCategory(entry.receipt, entry.parsed.notes), account: entry.account,
+      split: entry.parsed.split, paid: entry.parsed.paid, person: cap(entry.parsed.person || cfg.defaults.splitPerson),
+      persons: entry.parsed.persons, note: entry.parsed.notes || (entry.receipt.line_items || []).join(', '),
+      date: transactionDate(entry.receipt) })}${duplicate}`;
+  }).join('\n\n')}\n\nAfter logging, each receipt gets its own Edit button.`;
+}
+async function askBatchConfirm(chatId, entries) {
+  const withDuplicates = [];
+  for (const entry of entries) withDuplicates.push({ ...entry, duplicates: await findDuplicates(entry.account, entry.receipt) });
+  const mid = await send(chatId, batchConfirmText(withDuplicates), batchConfirmKb());
+  batchConfirming[chatId] = { entries: withDuplicates, promptMid: mid };
+}
+async function finalizeBatch(chatId, batch) {
+  for (const entry of batch.entries) await finalize(chatId, entry.receipt, entry.parsed, entry.account);
 }
 // If the chosen card belongs to someone else, ask how to split (they paid); otherwise normal confirm.
 // Used after a card is picked from the buttons, so that path gets owner detection too.
@@ -1414,6 +1464,15 @@ async function handleCardAnswer(chatId, text, ownerVerified = false) {
       return runAgent(chatId, request, null, true);
     }
     const account = await createNamedAccount(raw);
+    if (p.batch) {
+      for (const entry of p.batch) if (!entry.account) {
+        entry.account = account;
+        if (entry.receipt.card_last4) cardmap.byLast4[entry.receipt.card_last4] = account;
+      }
+      saveCardmap();
+      delete pending[chatId];
+      return askBatchConfirm(chatId, p.batch);
+    }
     if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
     if (p.last4) { cardmap.byLast4[p.last4] = account; saveCardmap(); }
     if (p.cardToken) learnCardAlias(p.cardToken, account);
@@ -1423,6 +1482,18 @@ async function handleCardAnswer(chatId, text, ownerVerified = false) {
   }
   const account = resolveAccount(raw);
   if (account) {
+    if (p.batch) {
+      for (const entry of p.batch) if (!entry.account) {
+        entry.account = account;
+        if (entry.receipt.card_last4) cardmap.byLast4[entry.receipt.card_last4] = account;
+      }
+      saveCardmap();
+      delete pending[chatId];
+      if (p.batch.some((entry) => ownerOf(entry.account) && !entry.parsed.paid)) {
+        return await send(chatId, 'I found receipts on someone else’s card. Send those receipts separately so I can ask how each one should be split.');
+      }
+      return askBatchConfirm(chatId, p.batch);
+    }
     if (isRelay(chatId) && p.ingest && !ownerVerified) return send(chatId, 'Tap the matching card button so I can verify the owner before logging this charge.', cardKb());
     // A tap from the Shortcut (ingest): remember the card->account mapping, then log the charge.
     if (p.ingest) { rememberCard(p, account); delete pending[chatId]; return await handleIngest({ ...p.ingest, card: account }, chatId); }
@@ -1586,7 +1657,7 @@ async function onRelayPost(post) {
   const text = (post.text || '').trim();
   await react(id, post.message_id, REACT_SEEN);
   try {
-    if (text.startsWith('{') && !post.reply_to_message && !editField[id] && !confirming[id] && !pending[id]) {
+    if (text.startsWith('{') && !post.reply_to_message && !editField[id] && !confirming[id] && !batchConfirming[id] && !pending[id]) {
       // Keep the trusted structured receipt integration; human conversation shares DM routing.
       let json = null;
       try { json = JSON.parse(text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")); } catch { /* fall through */ }
@@ -1731,6 +1802,18 @@ async function onCallback(cq) {
       }
       if (!budgetAgent.pending(chatId)) await dropKb(chatId, mid);
       await sendAgentResult(chatId, result);
+    } else if (data === 'b:y') {
+      const batch = batchConfirming[chatId];
+      await dropKb(chatId, mid);
+      if (!batch || batch.promptMid !== mid) return;
+      delete batchConfirming[chatId];
+      await finalizeBatch(chatId, batch);
+    } else if (data === 'b:n') {
+      const batch = batchConfirming[chatId];
+      if (!batch || batch.promptMid !== mid) return;
+      delete batchConfirming[chatId];
+      await dropKb(chatId, mid);
+      await send(chatId, '❌ Cancelled — nothing logged.');
     } else if (data === 'c:y') {
       const c = confirming[chatId];
       await dropKb(chatId, mid);
@@ -1883,6 +1966,17 @@ async function dispatch(chatId, msg, voiceExpense) {
     return await editTxn(chatId, repliedTo, msg.text);
   }
   if (isReply) return runReplyAgent(chatId, msg);
+  if (batchConfirming[chatId] && /^(y|yes|ok|okay|confirm|👍|yep|yeah)$/i.test(msg.text.trim())) {
+    const batch = batchConfirming[chatId];
+    delete batchConfirming[chatId];
+    await finalizeBatch(chatId, batch);
+    return;
+  }
+  if (batchConfirming[chatId] && /^(n|no|nope|cancel|nvm)$/i.test(msg.text.trim())) {
+    delete batchConfirming[chatId];
+    await send(chatId, '❌ Cancelled — nothing logged.');
+    return;
+  }
   if (confirming[chatId] && await handleConfirm(chatId, msg.text)) return;
   if (pending[chatId]) return await handleCardAnswer(chatId, msg.text);
   const previous = currentMessage()?.context ? currentMessage().context.lastTxn : lastTxn[chatId];

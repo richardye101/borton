@@ -37,6 +37,9 @@ names); commit only the `*.example.json` templates.
 - Every preview shows the transaction date. Tap **Edit → Date** to correct a bad or missing
   receipt date before logging. The bot flags a likely duplicate when the same card has the same
   amount and merchant within four days; you can still explicitly log it.
+- A photo can contain multiple separate receipts. The bot lists each detected purchase, checks
+  each for duplicates, and waits for one **Log all** confirmation. Every logged receipt gets its
+  own **Edit** button.
 
 ## Architecture
 

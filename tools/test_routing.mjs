@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from '../agent.mjs';
 import { createActualTools } from '../actual-tools.mjs';
 import { createRetryQueue, RetryableError, guardActualWrites } from '../retry-queue.mjs';
+import { normalizeReceipts } from '../receipt-utils.mjs';
 
 const source = fs.readFileSync(new URL('../bot.mjs', import.meta.url), 'utf8');
 function declaration(name) {
@@ -33,7 +34,7 @@ function fixture() {
       confirm: async (chat, id) => { confirmations.push({ chat, id }); return { text: 'Applied' }; },
       cancel: async (chat, id) => { confirmations.push({ chat, id, cancel: true }); return { text: 'Cancelled' }; },
     },
-    pending: {}, confirming: {}, ownerPending: {}, editField: {},
+    pending: {}, confirming: {}, batchConfirming: {}, ownerPending: {}, editField: {},
     lastTxn: { 42: rec, '-42': rec }, msgTxn: { '42:91': rec, '-42:91': rec, 91: rec },
     REACT_SEEN: 'seen', REACT_DONE: 'done', EDIT_WINDOW_MS: 3600000,
     react: async () => {},
@@ -41,12 +42,13 @@ function fixture() {
     send: async (chat, text, keyboard) => { messages.push({ chat, text, keyboard }); return 100; },
     dropKb: async () => {}, persistTxns: () => {},
     api: { updateTransaction: async (id, fields) => writes.push({ id, fields: structuredClone(fields) }), sync: async () => {} },
-    parseExpense: async () => null, extractPaid: () => null, isAgentRequest, isReceiptEdit,
+    parseExpense: async () => null, extractPaid: () => null, isAgentRequest, isReceiptEdit, normalizeReceipts,
     transcribeVoiceNote: async () => ({ transcript: 'This should be Sept 8th', ft: null }),
     finalize: async () => writes.push({ receipt: true }),
     handleFreeText: async () => writes.push({ expense: true }),
     handleIngest: async () => { writes.push({ ingest: true }); return { id: 'ingested', ts: Date.now() }; },
     handlePhoto: async () => writes.push({ photo: true }),
+    askConfirm: async () => {}, askBatchConfirm: async () => {},
     applyFieldValue: async () => {}, handleCardAnswer: async () => {},
   });
   vm.runInContext(['isRelay', 'isAllowedChat', 'isOwner', 'agentFor', 'receiptFor',
@@ -122,6 +124,41 @@ test('photo extraction and voice transcription failures reach the durable worker
     assert.equal(f.messages.filter(m => /reading receipt|transcribing/.test(m.text)).length, 1);
     assert.ok(f.messages.every(m => !/503|Couldn't|try again/.test(m.text)));
   }
+});
+
+test('one photo can stage every detected receipt for one batch confirmation', async () => {
+  const f = fixture(), staged = [];
+  Object.assign(f.bot, {
+    cardmap: { byLast4: { '1234': 'Card' } }, parseCaption: () => ({}), ownerOf: () => null,
+    progressMessage: async () => null,
+    downloadPhoto: async () => ({ buf: Buffer.from('test'), mime: 'image/jpeg' }), RECEIPT_SCHEMA: {},
+    geminiGenerate: async () => ({ receipts: [
+      { merchant: 'Coffee', total: 4.5, card_last4: '1234', date: '2026-09-10' },
+      { merchant: 'Metro', total: 21.75, card_last4: '1234', date: '2026-09-10' },
+    ] }),
+    askBatchConfirm: async (chat, entries) => staged.push({ chat, entries }),
+  });
+  vm.runInContext(['handlePhoto', 'extractReceipt'].map(declaration).join('\n'), f.bot);
+  await f.bot.handlePhoto(42, { photo: [{ file_id: 'photo' }] });
+  assert.equal(staged.length, 1);
+  assert.equal(staged[0].chat, 42);
+  assert.deepEqual(staged[0].entries.map(e => [e.receipt.merchant, e.receipt.total, e.account]), [
+    ['Coffee', 4.5, 'Card'], ['Metro', 21.75, 'Card'],
+  ]);
+});
+
+test('batch receipt confirmation logs only from its matching owner button', async () => {
+  const f = fixture();
+  f.bot.batchConfirming[-42] = { promptMid: 100, entries: [{ receipt: { merchant: 'Coffee' } }] };
+  f.bot.finalizeBatch = async (chat, batch) => f.writes.push({ chat, batch });
+  await f.bot.onCallback({ id: 'tap', from: { id: 7 }, data: 'b:y', message: { chat: { id: -42 }, message_id: 100 } });
+  assert.deepEqual(f.writes, []);
+  await f.bot.onCallback({ id: 'tap', from: { id: 42 }, data: 'b:y', message: { chat: { id: -42 }, message_id: 99 } });
+  assert.deepEqual(f.writes, []);
+  await f.bot.onCallback({ id: 'tap', from: { id: 42 }, data: 'b:y', message: { chat: { id: -42 }, message_id: 100 } });
+  assert.equal(f.writes.length, 1);
+  assert.equal(f.writes[0].chat, -42);
+  assert.equal(f.bot.batchConfirming[-42], undefined);
 });
 
 test('delivery failure after logging cannot duplicate the receipt', async t => {
