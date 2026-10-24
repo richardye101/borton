@@ -7,3 +7,4 @@ cardmap.json
 *.log
 npm-debug.log*
 .DS_Store
+.worktrees/
