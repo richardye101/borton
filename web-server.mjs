@@ -29,7 +29,19 @@ const readMultipartImage = (req, maxBytes) => new Promise((resolve, reject) => {
   });
   req.on('error', reject);
 });
-const allowed = (remote, rule) => typeof rule === 'function' ? rule(remote) : (rule || []).includes(remote?.replace(/^::ffff:/, ''));
+const allowed = (remote, rule) => {
+  if (typeof rule === 'function') return rule(remote);
+  const address = remote?.replace(/^::ffff:/, '');
+  return (rule || []).some((entry) => {
+    if (entry === address) return true;
+    const [network, bits] = String(entry).split('/');
+    if (!bits || !/^\d+\.\d+\.\d+\.\d+$/.test(address || '') || !/^\d+\.\d+\.\d+\.\d+$/.test(network)) return false;
+    const mask = Number(bits); if (mask < 0 || mask > 32) return false;
+    const asNumber = (ip) => ip.split('.').reduce((value, part) => (value << 8) + Number(part), 0) >>> 0;
+    const keep = mask === 0 ? 0 : (0xffffffff << (32 - mask)) >>> 0;
+    return (asNumber(address) & keep) === (asNumber(network) & keep);
+  });
+};
 const safeStaticPath = (pathname) => pathname === '/' ? 'index.html' : pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
 
 export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [], maxUploadBytes = 10 * 1024 * 1024 } = {}) {

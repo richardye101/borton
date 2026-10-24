@@ -9,6 +9,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 install -m 755 "$SRC/borton-deploy.sh"      /usr/local/bin/borton-deploy.sh
 install -m 644 "$SRC/borton-deploy.service" /etc/systemd/system/borton-deploy.service
 install -m 644 "$SRC/borton-deploy.timer"   /etc/systemd/system/borton-deploy.timer
+install -m 644 "$SRC/../borton-web.service"  /etc/systemd/system/borton-web.service
 
 systemctl daemon-reload
 systemctl enable --now borton-deploy.timer

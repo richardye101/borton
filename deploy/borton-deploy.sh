@@ -20,11 +20,17 @@ npm ci --omit=dev 2>/dev/null || npm install # only re-resolves if deps changed;
 
 START=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl restart "$SERVICE"
+WEB_ENABLED=0
+if systemctl is-enabled --quiet borton-web 2>/dev/null; then
+  WEB_ENABLED=1
+  systemctl restart borton-web
+fi
 
 # Wait for the bot to report it actually came up (not just that systemd launched the process).
 healthy=0
 for _ in $(seq 1 "$((TIMEOUT / 2))"); do
   if systemctl is-active --quiet "$SERVICE" \
+     && { [ "$WEB_ENABLED" = 0 ] || systemctl is-active --quiet borton-web; } \
      && journalctl -u "$SERVICE" --since "$START" 2>/dev/null | grep -q "$READY_MARKER"; then
     healthy=1; break
   fi

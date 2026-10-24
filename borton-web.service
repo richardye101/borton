@@ -1,0 +1,13 @@
+[Unit]
+Description=Borton Web (private Actual expense review)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/borton
+ExecStart=/usr/bin/node web.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

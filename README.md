@@ -177,6 +177,29 @@ docker compose up -d --build      # code-only image; secrets/config bind-mounted
 docker compose logs -f
 ```
 
+## Borton Web
+
+`web.mjs` is a private mobile/desktop companion: recent transactions, duplicate lookup, multi-receipt
+review with row edits, and the Borton Assistant with web-based plan confirmation. It runs natively
+beside the Telegram bot. Set `web.host`, `web.port`, and `web.allowedRemote` in `config.json` for
+the WireGuard/LAN network, then set these root-only `.env` values:
+
+```
+BORTON_WEB_PASSWORD=choose-a-long-password
+BORTON_WEB_SESSION_SECRET=use-a-random-long-secret
+```
+
+Install the unit and start it on the LXC:
+
+```bash
+install -m 644 borton-web.service /etc/systemd/system/borton-web.service
+systemctl daemon-reload
+systemctl enable --now borton-web
+```
+
+Open `http://<private-LXC-IP>:28456` from a WireGuard-connected device. The service binds only to
+the configured private network and requires its own password; it does not need a public URL.
+
 ## Notes
 - Self-signed Actual cert → `NODE_TLS_REJECT_UNAUTHORIZED=0` is set in code.
 - Splits transfer half into an `Owed by {name}` account (format in config `defaults.owedAccountFormat`,
