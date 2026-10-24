@@ -1,0 +1,102 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { findLikelyDuplicates, isValidExpenseDate, withPayeeNames } from './receipt-utils.mjs';
+import { withActualLock } from './actual-lock.mjs';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const JOURNAL_TTL = DAY_MS;
+const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()];
+const normalize = (row, payees, accounts, categories) => ({
+  id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
+  accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId: row.category || null,
+  category: categories.get(row.category)?.name || '', note: row.notes || '', cleared: !!row.cleared,
+});
+const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+
+export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', now = () => Date.now() } = {}) {
+  if (!api || !dataDir) throw new Error('api and dataDir are required.');
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const journalPath = path.join(dataDir, 'web-request-journal.json');
+  let lastSync = 0;
+  let queue = Promise.resolve();
+  const readJournal = () => { try { return JSON.parse(fs.readFileSync(journalPath, 'utf8')); } catch { return {}; } };
+  const writeJournal = (journal) => { const tmp = `${journalPath}.tmp`; fs.writeFileSync(tmp, JSON.stringify(journal), { mode: 0o600 }); fs.renameSync(tmp, journalPath); };
+  const runExclusive = (work) => {
+    const guarded = () => withActualLock(lockPath, work);
+    const next = queue.then(guarded, guarded); queue = next.catch(() => {}); return next;
+  };
+  async function sync(force = false) {
+    if (force || now() - lastSync > 15_000) { await api.sync(); lastSync = now(); }
+  }
+  async function maps() {
+    const [allAccounts, visible, hidden, payeeRows] = await Promise.all([api.getAccounts(), api.getCategories(), api.getCategories({ hidden: true }), api.getPayees()]);
+    const accounts = new Map(allAccounts.map((row) => [row.id, row]));
+    const categories = new Map(unique([...visible, ...hidden]).map((row) => [row.id, row]));
+    const payees = new Map(payeeRows.map((row) => [row.id, row]));
+    return { accounts, categories, payees, payeeRows };
+  }
+  async function transactions({ start = new Date(now() - 90 * DAY_MS).toISOString().slice(0, 10), end = new Date(now()).toISOString().slice(0, 10), query = '', limit = 50 } = {}) {
+    await sync(); const { accounts, categories, payees } = await maps(); const rows = [];
+    for (const account of accounts.values()) {
+      if (account.closed) continue;
+      rows.push(...await api.getTransactions(account.id, start, end));
+    }
+    return unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
+      .map((row) => normalize(row, payees, accounts, categories))
+      .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
+      .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, Math.min(Number(limit) || 50, 50));
+  }
+  async function duplicateRows({ merchant, amountCents, date, accountId }) {
+    const rows = await transactions({ start: new Date(Date.parse(`${date}T12:00:00Z`) - 5 * DAY_MS).toISOString().slice(0, 10), end: new Date(Date.parse(`${date}T12:00:00Z`) + 5 * DAY_MS).toISOString().slice(0, 10), limit: 50 });
+    const raw = rows.filter((row) => !accountId || row.accountId === accountId).map((row) => ({ id: row.id, date: row.date, amount: -row.amountCents, payee_name: row.merchant }));
+    return findLikelyDuplicates(raw, { merchant, total: amountCents / 100, date }).map((match) => rows.find((row) => row.id === match.id));
+  }
+  async function validateRows(rows = []) {
+    if (!Array.isArray(rows) || rows.length > 50) throw error('Submit between 1 and 50 rows.');
+    const { accounts, categories } = await maps();
+    return Promise.all(rows.map(async (row) => {
+      const valid = row && typeof row.clientId === 'string' && String(row.merchant || '').trim() && Number.isSafeInteger(row.amountCents) && row.amountCents > 0 && isValidExpenseDate(row.date) && accounts.get(row.accountId) && !accounts.get(row.accountId).closed && categories.has(row.categoryId);
+      if (!valid) return { ...row, status: 'invalid', duplicates: [] };
+      const duplicates = await duplicateRows(row);
+      return { ...row, merchant: String(row.merchant).trim(), note: String(row.note || '').trim(), status: duplicates.length && !row.duplicateAcknowledged ? 'check_required' : 'ready', duplicates };
+    }));
+  }
+  return {
+    runExclusive,
+    async bootstrap() {
+      const [{ accounts, categories }, rows] = await Promise.all([maps(), transactions({})]);
+      return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed && !row.offbudget).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
+    },
+    findTransactions: transactions,
+    checkDuplicates: duplicateRows,
+    async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
+    submitBatch({ requestId, rows }) {
+      return runExclusive(async () => {
+        if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId || '')) throw error('Invalid request ID.');
+        const journal = readJournal();
+        for (const [key, value] of Object.entries(journal)) if (value.at < now() - JOURNAL_TTL) delete journal[key];
+        if (journal[requestId]?.result) return journal[requestId].result;
+        journal[requestId] = { at: now(), uncertain: true }; writeJournal(journal);
+        const checked = await validateRows(rows);
+        if (checked.some((row) => row.status === 'invalid')) return { status: 'invalid', rows: checked };
+        if (checked.some((row) => row.status === 'check_required')) return { status: 'review_required', rows: checked };
+        const { payeeRows } = await maps(); const byName = new Map(payeeRows.map((row) => [row.name.toLowerCase(), row]));
+        const outcome = [];
+        try {
+          for (const row of checked) {
+            const key = row.merchant.toLowerCase(); let payee = byName.get(key);
+            if (!payee) { const id = await api.createPayee({ name: row.merchant }); payee = { id, name: row.merchant }; byName.set(key, payee); }
+            const importedId = `borton-web-${requestId}-${row.clientId}`;
+            await api.addTransactions(row.accountId, [{ date: row.date, amount: -row.amountCents, payee: payee.id, notes: row.note, category: row.categoryId, imported_id: importedId }], { runTransfers: true });
+            outcome.push({ clientId: row.clientId, status: 'complete', importedId });
+          }
+          await api.sync(); lastSync = now();
+          const result = { status: 'complete', rows: outcome }; journal[requestId] = { at: now(), result }; writeJournal(journal); return result;
+        } catch (cause) {
+          const result = { status: outcome.length ? 'partial' : 'uncertain', rows: outcome, error: cause.message }; journal[requestId] = { at: now(), result }; writeJournal(journal); return result;
+        }
+      });
+    },
+    async close() { await api.shutdown?.(); },
+  };
+}

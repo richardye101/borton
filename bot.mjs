@@ -13,6 +13,7 @@ import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from
 import { createRetryQueue, guardActualWrites, RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
 import { findLikelyDuplicates, isValidExpenseDate, normalizeReceipts, withPayeeNames } from './receipt-utils.mjs';
 import { createReceiptExtractor, RECEIPT_SCHEMA } from './receipt-extractor.mjs';
+import { withActualLock } from './actual-lock.mjs';
 
 const messageContext = new AsyncLocalStorage();
 const currentMessage = () => messageContext.getStore();
@@ -60,12 +61,13 @@ const isOwner = userId => !!cfg.telegram.allowedChatId && String(userId) === Str
 const agentFor = chatId => isAllowedChat(chatId) && (!isRelay(chatId) || cfg.agent?.relayEnabled === true) ? budgetAgent : null;
 // The retry worker, callbacks and ingest share serialized Actual access.
 let actualQueue = Promise.resolve();
+const ACTUAL_LOCK_PATH = path.resolve(__dir, cfg.actual.dataDir, 'actual.lock');
 const serializeActual = fn => {
   const guarded = () => {
     if (agentTools?.hasPendingWrite()) throw new RetryableError('An earlier Actual write is still pending.');
     return fn();
   };
-  const next = actualQueue.then(guarded, guarded);
+  const next = actualQueue.then(() => withActualLock(ACTUAL_LOCK_PATH, guarded), () => withActualLock(ACTUAL_LOCK_PATH, guarded));
   actualQueue = next.catch(() => {});
   return next;
 };
