@@ -37,6 +37,7 @@
 
 - `receipt-extractor.mjs` — shared Gemini receipt schema, MIME validation, and `extractReceiptImage`.
 - `actual-web.mjs` — Actual initialization, bounded reads, normalized duplicate lookup, payee resolution, batch commit, file locking, and idempotency journal.
+- `web-agent.mjs` — authenticated web adapter around the existing Borton agent with isolated persisted state and locked confirmations.
 - `web-auth.mjs` — password/session/CSRF primitives with injectable clock/random source for tests.
 - `web-server.mjs` — static-file and JSON/multipart HTTP routing, access restrictions, security headers, request limits, and dependency injection.
 - `web.mjs` — production configuration loading and service composition/startup.
@@ -221,7 +222,52 @@
   git commit -m "feat: expose Borton web APIs"
   ```
 
-### Task 5: Responsive capture/review interface
+### Task 5: Web Assistant API
+
+**Files:**
+- Create: `web-agent.mjs`
+- Create: `test/web-agent.test.mjs`
+- Modify: `web-server.mjs`
+- Modify: `test/web-server.test.mjs`
+
+**Interfaces:**
+- Produces `createWebAgent({ api, config, statePath, lock, generate }): { message(text), pending(), confirm(planId), cancel(planId) }`.
+- `message` returns Borton's existing `{ text, planId? }` agent result. `confirm` and `cancel` preserve its single-use, stale-plan, and partial-failure semantics.
+
+- [ ] **Step 1: Write failing adapter tests for a read query, a staged multi-operation plan, revision, cancellation, and single-use confirmation**
+
+  Use the existing fake Actual/Gemini patterns from `tools/test_agent.mjs`. Assert a bulk command performs no writes until confirmation and state survives adapter recreation.
+
+- [ ] **Step 2: Run the adapter test to verify it fails**
+
+  Run: `node --test test/web-agent.test.mjs`
+
+  Expected: FAIL because `web-agent.mjs` does not exist.
+
+- [ ] **Step 3: Implement `createWebAgent` by composing `createAgent` and `createActualTools`**
+
+  Use fixed private web identity, `web-agent-state.json` under the web data directory, existing Gemini transport, and the cross-process Actual lock around all message/confirm/cancel calls. Do not add a browser-accessible generic tool interface.
+
+- [ ] **Step 4: Add failing HTTP route tests for Assistant auth/CSRF, text requests, and confirm/cancel**
+
+  Assert the routes pass only bounded text and plan IDs to the adapter and return the deterministic agent response.
+
+- [ ] **Step 5: Implement `/api/assistant/message`, `/api/assistant/confirm`, and `/api/assistant/cancel`**
+
+  Reuse Task 2 session/CSRF guards and normalize only agent text, plan ID, warnings, and completion status for the browser.
+
+- [ ] **Step 6: Run Task 5 tests and commit**
+
+  Run: `node --test test/web-agent.test.mjs test/web-server.test.mjs tools/test_agent.mjs`
+
+  Expected: PASS.
+
+  ```bash
+  git add web-agent.mjs web-server.mjs test/web-agent.test.mjs test/web-server.test.mjs
+  git commit -m "feat: add Borton web assistant"
+  ```
+
+### Task 6: Responsive capture/review interface
 
 **Files:**
 - Create: `web/index.html`
@@ -251,11 +297,15 @@
 
   Support camera/library/drop uploads, render editable rows/cards, account/category controls, multi-select field actions, duplicate badges, exclude/acknowledge handling, and Submit N expenses with per-row result state.
 
-- [ ] **Step 5: Apply responsive CSS and keyboard/touch behavior**
+- [ ] **Step 5: Build the Assistant tab**
+
+  Render short conversation history, request progress, staged plans, Confirm/Cancel, and clear write/partial-failure status. Reuse the responsive shell and preserve the current batch when switching tabs.
+
+- [ ] **Step 6: Apply responsive CSS and keyboard/touch behavior**
 
   Use a grid on wide displays and stacked cards with a sticky bottom action bar on phones. Ensure essential controls have labels and error messages are announced.
 
-- [ ] **Step 6: Run the full suite and commit**
+- [ ] **Step 7: Run the full suite and commit**
 
   Run: `node --test && node --check web/app.js && git diff --check`
 
@@ -266,7 +316,7 @@
   git commit -m "feat: add Borton web review interface"
   ```
 
-### Task 6: Native deployment and documentation
+### Task 7: Native deployment and documentation
 
 **Files:**
 - Create: `borton-web.service`
@@ -305,7 +355,7 @@
   git commit -m "feat: deploy Borton web service"
   ```
 
-### Task 7: Publish and verify on the LXC
+### Task 8: Publish and verify on the LXC
 
 **Files:**
 - No source changes expected.
@@ -326,7 +376,7 @@
 
 ## Self-review
 
-- **Spec coverage:** Tasks 1–5 cover extraction, batch editing APIs, duplicate warnings/rechecks, recent/search, image disposal, private authentication, and responsive UI. Task 6 covers configuration/native service/health checks; Task 7 covers LXC rollout. Split and owner-paid batch transactions remain an explicit non-goal.
+- **Spec coverage:** Tasks 1–6 cover extraction, batch editing APIs, duplicate warnings/rechecks, recent/search, image disposal, private authentication, the existing Agent through the Assistant tab, and responsive UI. Task 7 covers configuration/native service/health checks; Task 8 covers LXC rollout. Split and owner-paid batch transactions remain an explicit non-goal.
 - **Type consistency:** `WebExpense` is produced by browser rows and consumed by `actual-web` and submit routes. `createWebApplication` is the only API layer passed into `createWebServer`.
 - **Review focus:** Each of the five high-risk cases is assigned to Tasks 2–4 as stated above.
 - **Proportion:** The plan fixes module boundaries, endpoint names, exact limits, and test/commit steps without prescribing implementation bodies.

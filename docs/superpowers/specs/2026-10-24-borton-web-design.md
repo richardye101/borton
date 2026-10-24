@@ -20,6 +20,9 @@ extraction or batch-review workflow.
   connection, with no public URL and no Telegram requirement.
 - Make the newest Actual transactions immediately visible and searchable by merchant, amount,
   date, account, or category.
+- Provide an Assistant tab that reuses Borton's existing natural-language Actual agent for
+  read queries and reviewed multi-transaction plans, including confirmation and cancellation in
+  the web UI.
 - Accept an image containing one or more receipts, detect up to eight purchases per image using
   the current Gemini extractor, and never write them automatically.
 - Present extracted purchases in a compact editable table. Merchant, amount, date, card/account,
@@ -82,6 +85,10 @@ Small extracted modules own shared behavior:
 
 - `receipt-utils.mjs` continues to own date validation, receipt normalization, and duplicate
   matching. Its existing unit tests remain the source of truth.
+- A web-agent adapter creates the existing `agent.mjs` with a distinct `web-agent-state.json`
+  state file and a fixed owner identity. It reuses the validated Actual tool declarations and
+  existing Gemini function-calling loop; browser text never gains shell, raw API, or unrestricted
+  database access. Agent turns and confirmations use the same Actual lock as batch commits.
 - A new receipt-extraction module receives an image buffer and invokes the existing Gemini schema.
   Both Telegram and Web call it, preventing prompt/schema drift.
 - A new Actual session/transaction module initializes `@actual-app/api`, reads accounts, payees,
@@ -110,6 +117,16 @@ date, amount, and Actual transaction ID.
 The same lookup panel is reachable from **Check duplicate**. Entering or pasting merchant,
 amount, date, and optional account returns likely duplicates with the reason for the match and a
 link to the existing record. This supports a quick manual check even with no image upload.
+
+### Assistant
+
+The **Assistant** tab is a private web conversation with the existing Borton agent. It supports
+read questions and bulk commands such as “move the ten grocery transactions from last week to
+Household” or “find all Uber charges in September and clear them.” The reply renders as text;
+when the agent stages a mutation, the UI presents its full deterministic plan and **Confirm** /
+**Cancel** controls. Only Confirm executes the frozen plan. Revising the request replaces the
+pending plan exactly as it does in Telegram. The page keeps the same short local conversation
+state across restarts and makes no Telegram call.
 
 ### Capture and batch review
 
@@ -162,6 +179,10 @@ Authenticated API responses are JSON and contain only fields needed by the UI.
   request IDs and outcomes for 24 hours to make an accidental double-click or a service restart
   idempotent. A request interrupted after a write starts is recorded as uncertain and is never
   automatically replayed; its response directs the user to lookup completed rows before retrying.
+- `POST /api/assistant/message` submits one bounded text request and returns the existing agent
+  text plus an optional staged plan ID. `POST /api/assistant/confirm` and
+  `POST /api/assistant/cancel` act on that plan. All three require the regular authenticated
+  session and CSRF token.
 
 Endpoints reject unknown fields, dates outside Borton's existing validation window, non-positive
 amounts, non-open accounts, and unknown categories. Money crosses the wire as integer cents to
@@ -184,8 +205,9 @@ the secrets, enabling the service, and opening the private URL on the phone.
 Tests use Node's built-in test runner and fake Actual/Gemini adapters. They cover authentication,
 CSRF and unauthenticated data rejection; request schema limits; date/cents conversion; one and
 multi-receipt extraction mapping; bulk-field edits; duplicate status and final recheck; an
-intentionally accepted duplicate; idempotent submit; partial commit reporting; and no image
-persistence. Existing receipt, agent, routing, retry, and split tests continue to pass.
+intentionally accepted duplicate; idempotent submit; partial commit reporting; no image
+persistence; and Assistant message/revision/confirm/cancel behavior. Existing receipt, agent,
+routing, retry, and split tests continue to pass.
 
 Before deployment, run syntax checks, the full test suite, a local login/API smoke test with fake
 configuration, and the existing read-only Actual smoke test. On the LXC, verify both systemd
