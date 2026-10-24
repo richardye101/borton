@@ -1,0 +1,63 @@
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import path from 'node:path';
+
+const JSON_LIMIT = 256 * 1024;
+const contentTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const json = (res, status, body, headers = {}) => {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', ...headers });
+  res.end(JSON.stringify(body));
+};
+const readJson = (req) => new Promise((resolve, reject) => {
+  let size = 0; let body = '';
+  req.setEncoding('utf8');
+  req.on('data', (chunk) => { size += Buffer.byteLength(chunk); if (size > JSON_LIMIT) reject(new Error('Request is too large.')); else body += chunk; });
+  req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch { reject(new Error('Invalid JSON.')); } });
+  req.on('error', reject);
+});
+const allowed = (remote, rule) => typeof rule === 'function' ? rule(remote) : (rule || []).includes(remote?.replace(/^::ffff:/, ''));
+const safeStaticPath = (pathname) => pathname === '/' ? 'index.html' : pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
+
+export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [], maxUploadBytes = 10 * 1024 * 1024 } = {}) {
+  if (!auth || !staticDir) throw new Error('auth and staticDir are required.');
+  const dispatch = {
+    'GET /api/bootstrap': 'bootstrap',
+    'GET /api/transactions': 'transactions',
+    'POST /api/duplicates': 'duplicates',
+    'POST /api/batches/validate': 'validateBatch',
+    'POST /api/batches/submit': 'submitBatch',
+    'POST /api/assistant/message': 'assistantMessage',
+    'POST /api/assistant/confirm': 'assistantConfirm',
+    'POST /api/assistant/cancel': 'assistantCancel',
+  };
+  return http.createServer(async (req, res) => {
+    const remote = req.socket.remoteAddress || '';
+    if (!allowed(remote, allowedRemote)) return json(res, 403, { error: 'Private network access required.' });
+    const url = new URL(req.url, 'http://borton.local');
+    if (req.method === 'POST' && url.pathname === '/login') {
+      try {
+        const body = await readJson(req); const login = auth.login(body.password || '');
+        return login ? json(res, 200, { csrf: login.csrf }, { 'Set-Cookie': login.cookie }) : json(res, 401, { error: 'Invalid password.' });
+      } catch (error) { return json(res, 400, { error: error.message }); }
+    }
+    if (url.pathname.startsWith('/api/')) {
+      const session = auth.verifySession(req.headers.cookie);
+      if (!session) return json(res, 401, { error: 'Sign in required.' });
+      try {
+        const payload = req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
+        if (req.method === 'POST' && !auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
+        const handler = dispatch[`${req.method} ${url.pathname}`];
+        if (!handler || typeof app[handler] !== 'function') return json(res, 404, { error: 'Not found.' });
+        return json(res, 200, await app[handler](payload, session));
+      } catch (error) { return json(res, error.statusCode || 400, { error: error.message || 'Request failed.' }); }
+    }
+    if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed.' });
+    const relative = safeStaticPath(url.pathname);
+    if (!relative || !contentTypes[path.extname(relative)]) return json(res, 404, { error: 'Not found.' });
+    try {
+      const file = await fs.readFile(path.join(staticDir, relative));
+      res.writeHead(200, { 'Content-Type': contentTypes[path.extname(relative)], 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'" });
+      res.end(file);
+    } catch { json(res, 404, { error: 'Not found.' }); }
+  });
+}
