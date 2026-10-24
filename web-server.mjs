@@ -15,6 +15,20 @@ const readJson = (req) => new Promise((resolve, reject) => {
   req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch { reject(new Error('Invalid JSON.')); } });
   req.on('error', reject);
 });
+const readMultipartImage = (req, maxBytes) => new Promise((resolve, reject) => {
+  const type = req.headers['content-type'] || ''; const boundary = type.match(/boundary=([^;]+)/i)?.[1];
+  if (!boundary) return reject(new Error('Expected an image upload.'));
+  const chunks = []; let size = 0;
+  req.on('data', (chunk) => { size += chunk.length; if (size > maxBytes + 64 * 1024) reject(new Error('Receipt image exceeds the 10 MB limit.')); else chunks.push(chunk); });
+  req.on('end', () => {
+    const body = Buffer.concat(chunks); const marker = Buffer.from(`--${boundary}`); const start = body.indexOf(Buffer.from('\r\n\r\n')) + 4;
+    const end = body.indexOf(marker, start) - 2; const header = body.subarray(0, start).toString('utf8');
+    const mime = header.match(/Content-Type:\s*([^\r\n;]+)/i)?.[1]?.toLowerCase();
+    if (start < 4 || end <= start || !mime) return reject(new Error('Upload must include one image.'));
+    resolve({ buffer: body.subarray(start, end), mime });
+  });
+  req.on('error', reject);
+});
 const allowed = (remote, rule) => typeof rule === 'function' ? rule(remote) : (rule || []).includes(remote?.replace(/^::ffff:/, ''));
 const safeStaticPath = (pathname) => pathname === '/' ? 'index.html' : pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
 
@@ -24,6 +38,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'GET /api/bootstrap': 'bootstrap',
     'GET /api/transactions': 'transactions',
     'POST /api/duplicates': 'duplicates',
+    'POST /api/extract': 'extract',
     'POST /api/batches/validate': 'validateBatch',
     'POST /api/batches/submit': 'submitBatch',
     'POST /api/assistant/message': 'assistantMessage',
@@ -44,7 +59,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
       const session = auth.verifySession(req.headers.cookie);
       if (!session) return json(res, 401, { error: 'Sign in required.' });
       try {
-        const payload = req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
+        const payload = req.method === 'POST' && url.pathname === '/api/extract' ? await readMultipartImage(req, maxUploadBytes) : req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
         if (req.method === 'POST' && !auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
         const handler = dispatch[`${req.method} ${url.pathname}`];
         if (!handler || typeof app[handler] !== 'function') return json(res, 404, { error: 'Not found.' });
