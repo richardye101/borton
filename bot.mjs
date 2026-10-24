@@ -12,6 +12,7 @@ import { createActualTools, ToolError } from './actual-tools.mjs';
 import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
 import { createRetryQueue, guardActualWrites, RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
 import { findLikelyDuplicates, isValidExpenseDate, normalizeReceipts, withPayeeNames } from './receipt-utils.mjs';
+import { createReceiptExtractor, RECEIPT_SCHEMA } from './receipt-extractor.mjs';
 
 const messageContext = new AsyncLocalStorage();
 const currentMessage = () => messageContext.getStore();
@@ -439,30 +440,6 @@ async function downloadTelegramFile(fileId, mime) {
 }
 
 // ---------- Gemini extractor (pluggable: swap this fn for Claude/local later) ----------
-const RECEIPT_ITEM_SCHEMA = {
-  type: 'OBJECT',
-  properties: {
-    merchant: { type: 'STRING', description: 'Store / merchant name' },
-    date: { type: 'STRING', description: 'Purchase date as YYYY-MM-DD if visible, else empty string' },
-    total: { type: 'NUMBER', description: 'Grand total paid' },
-    currency: { type: 'STRING' },
-    tax: { type: 'NUMBER' },
-    card_last4: { type: 'STRING', description: 'Last 4 digits of the card if printed (e.g. from "VISA ****1234"), else empty string' },
-    line_items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Short list of items purchased' },
-  },
-  required: ['merchant', 'total'],
-};
-const RECEIPT_SCHEMA = {
-  type: 'OBJECT',
-  properties: {
-    receipts: {
-      type: 'ARRAY',
-      items: RECEIPT_ITEM_SCHEMA,
-      description: 'Every separate purchase receipt visible in the image, up to eight.',
-    },
-  },
-  required: ['receipts'],
-};
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 // Try the primary model, then fall back to other flash models on transient 429/5xx (e.g. 503 overload).
 // Fall back to lighter, less-contended models (lite variants rarely 503) rather than other popular flash models.
@@ -500,10 +477,7 @@ async function geminiGenerate(parts, schema) {
   throw failure;
 }
 async function extractReceipt(buf, mime) {
-  return geminiGenerate(
-    [{ text: 'Extract every separate purchase receipt visible in this image into the receipts array. A receipt is a distinct proof of purchase, not a duplicate copy, coupon, subtotal, or line item. Use the printed grand total for total. List each purchased item in line_items using short names (condense long descriptions, drop prices/quantities). If a card last-4 is not printed, return an empty string for card_last4. Return one array entry for an ordinary single receipt.' },
-     { inlineData: { mimeType: mime, data: buf.toString('base64') } }],
-    RECEIPT_SCHEMA);
+  return createReceiptExtractor({ generate: geminiGenerate }).extractImage(buf, mime);
 }
 
 // ---------- Split helpers (person -> "Owed by {name}" account) ----------
