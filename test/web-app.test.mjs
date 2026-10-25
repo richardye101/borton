@@ -25,3 +25,14 @@ test('passes the visible screen context to Borton', async () => {
   assert.deepEqual(await app.assistantMessage({ text: 'Classify these', context: { page: 'home', visibleTransactions: [{ id: 'txn-1' }] } }), { text: 'Ready' });
   assert.deepEqual(received, [{ text: 'Classify these', context: { page: 'home', visibleTransactions: [{ id: 'txn-1' }] } }]);
 });
+
+test('queues web assistant messages and exposes safe message history', async () => {
+  const received = [];
+  const app = createWebApplication({ actual: {}, extractor: {}, assistantQueue: {
+    enqueue(payload) { received.push(payload); return { id: 'job-1', text: payload.text, status: 'queued' }; },
+    list() { return [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]; },
+  } });
+  assert.deepEqual(await app.assistantMessage({ text: 'Classify these', context: { page: 'home' } }), { id: 'job-1', text: 'Classify these', status: 'queued' });
+  assert.deepEqual(await app.assistantMessages(), [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]);
+  assert.deepEqual(received, [{ text: 'Classify these', context: { page: 'home' } }]);
+});

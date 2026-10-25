@@ -57,6 +57,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'POST /api/batches/validate': 'validateBatch',
     'POST /api/batches/submit': 'submitBatch',
     'POST /api/assistant/message': 'assistantMessage',
+    'GET /api/assistant/messages': 'assistantMessages',
     'POST /api/assistant/confirm': 'assistantConfirm',
     'POST /api/assistant/cancel': 'assistantCancel',
   };

@@ -37,7 +37,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');
   fs.writeFileSync(path.join(staticDir, 'client-state.mjs'), 'export const Borton = true;');
   const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
-  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }) };
+  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }), assistantMessages: async () => [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }] };
   await withServer({ auth, app, staticDir, allowedRemote: ['127.0.0.1'] }, async (port) => {
     const page = await request(port);
     assert.equal(page.status, 200);
@@ -62,6 +62,8 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const bootstrap = await request(port, { path: '/api/bootstrap', headers: { cookie } });
     assert.equal(bootstrap.status, 200);
     assert.deepEqual(JSON.parse(bootstrap.body), { transactions: [] });
+    const assistantMessages = await request(port, { path: '/api/assistant/messages', headers: { cookie } });
+    assert.deepEqual(JSON.parse(assistantMessages.body), [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]);
     const summary = await request(port, { path: '/api/summary?days=30', headers: { cookie } });
     assert.equal(summary.status, 200);
     assert.deepEqual(JSON.parse(summary.body), { days: 30, totalCents: 1234 });

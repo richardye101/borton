@@ -28,7 +28,7 @@ export function createWebAgent({ agent, api, generate, statePath, currency = 'CA
     return value;
   };
   return {
-    message: (value) => lock(() => agent.message(OWNER, contextualize(value))),
+    message: (value) => lock(() => agent.message(OWNER, contextualize(value), { retryFailures: true })),
     confirm: (value) => lock(() => agent.confirm(OWNER, plan(value))),
     cancel: (value) => lock(() => agent.cancel(OWNER, plan(value))),
     pending: () => agent.pending(OWNER),

@@ -2,7 +2,7 @@ import { normalizeReceipts } from './receipt-utils.mjs';
 
 const clientId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant } = {}) {
+export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant, assistantQueue } = {}) {
   if (!actual || !extractor) throw new Error('actual and extractor are required.');
   return {
     bootstrap: () => actual.bootstrap(),
@@ -30,7 +30,8 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
       if (!transcriber) throw new Error('Audio transcription is unavailable.');
       return transcriber.transcribe(buffer, mime);
     },
-    assistantMessage: (payload) => assistant?.message({ text: payload.text, context: payload.context }),
+    assistantMessage: (payload) => assistantQueue ? assistantQueue.enqueue({ text: payload.text, context: payload.context }) : assistant?.message({ text: payload.text, context: payload.context }),
+    assistantMessages: () => assistantQueue?.list() || [],
     assistantConfirm: (payload) => assistant?.confirm(payload.planId),
     assistantCancel: (payload) => assistant?.cancel(payload.planId),
   };
