@@ -2213,10 +2213,13 @@ async function selftest() {
   delete cardmap.owners;
   // Card-alias learning: a distinct card word is remembered; generic words / numbers are not.
   cardmap.aliases = { ...cardmap.aliases };
+  const priorScotiaAlias = cardmap.aliases['scotia card'];
+  delete cardmap.aliases['scotia card'];
   assert(learnCardAlias('Scotia Card', 'Scotiabank VI') === true && cardmap.aliases['scotia card'] === 'Scotiabank VI', 'learnCardAlias remembers a distinct card word');
   assert(learnCardAlias('scotia card', 'Scotiabank VI') === false, 'learnCardAlias is a no-op when already mapped');
   assert(learnCardAlias('visa', 'Amex') === false && learnCardAlias('1234', 'Amex') === false, 'learnCardAlias skips generic words and pure numbers');
-  delete cardmap.aliases['scotia card']; saveCardmap();
+  if (priorScotiaAlias === undefined) delete cardmap.aliases['scotia card']; else cardmap.aliases['scotia card'] = priorScotiaAlias;
+  saveCardmap();
   // New-account ownership buttons: callback_data must round-trip through the 'newacct:'.length
   // slice in onCallback (data.slice(8)) — a prefix-length typo here silently breaks the button.
   const nak = newAccountOwnerKb('Tia');

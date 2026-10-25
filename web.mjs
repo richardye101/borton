@@ -49,4 +49,10 @@ const app = createWebApplication({ actual, extractor: createReceiptExtractor({ g
 const auth = createWebAuth({ password: process.env.BORTON_WEB_PASSWORD, sessionSecret: process.env.BORTON_WEB_SESSION_SECRET, secure: web.https === true });
 const server = createWebServer({ auth, app, staticDir: path.join(root, 'web'), allowedRemote: web.allowedRemote || ['127.0.0.1'], maxUploadBytes: web.maxUploadBytes || 10 * 1024 * 1024 });
 server.listen(web.port || 28456, web.host || '127.0.0.1', () => console.log(`Borton Web listening on http://${web.host || '127.0.0.1'}:${web.port || 28456}`));
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(() => actual.close().finally(() => process.exit(0))));
+let stopping = false;
+const shutdown = () => {
+  if (stopping) return;
+  stopping = true;
+  server.shutdown(() => actual.close().finally(() => process.exit(0)));
+};
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, shutdown);

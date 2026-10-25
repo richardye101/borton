@@ -32,6 +32,17 @@ test('returns newest non-transfer transactions and finds likely duplicates', asy
   assert.equal(invalid.rows[0].status, 'invalid');
 });
 
+test('summarizes expense spending by category, account, and month', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const web = createActualWeb({ api: fakeActual(), dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  assert.equal(typeof web.summary, 'function');
+  const summary = await web.summary({ days: 30 });
+  assert.equal(summary.totalCents, 1234);
+  assert.deepEqual(summary.byCategory, [{ name: 'Groceries', amountCents: 1234, count: 1 }]);
+  assert.deepEqual(summary.byAccount, [{ name: 'Visa', amountCents: 1234, count: 1 }]);
+  assert.deepEqual(summary.byMonth, [{ name: '2026-10', amountCents: 1234, count: 1 }]);
+});
+
 test('writes an acknowledged batch once and reuses one normalized payee', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual();

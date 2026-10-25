@@ -49,6 +49,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
   const dispatch = {
     'GET /api/bootstrap': 'bootstrap',
     'GET /api/transactions': 'transactions',
+    'GET /api/summary': 'summary',
     'POST /api/duplicates': 'duplicates',
     'POST /api/extract': 'extract',
     'POST /api/batches/validate': 'validateBatch',
@@ -57,7 +58,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'POST /api/assistant/confirm': 'assistantConfirm',
     'POST /api/assistant/cancel': 'assistantCancel',
   };
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     const remote = req.socket.remoteAddress || '';
     if (!allowed(remote, allowedRemote)) return json(res, 403, { error: 'Private network access required.' });
     const url = new URL(req.url, 'http://borton.local');
@@ -88,4 +89,14 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
       res.end(file);
     } catch { json(res, 404, { error: 'Not found.' }); }
   });
+  const sockets = new Set();
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  server.shutdown = (callback) => {
+    for (const socket of sockets) socket.destroy();
+    return server.close(callback);
+  };
+  return server;
 }

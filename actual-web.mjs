@@ -9,7 +9,7 @@ const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()]
 const normalize = (row, payees, accounts, categories) => ({
   id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
   accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId: row.category || null,
-  category: categories.get(row.category)?.name || '', note: row.notes || '', cleared: !!row.cleared,
+  category: categories.get(row.category)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
 });
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 
@@ -44,8 +44,12 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     return unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
       .map((row) => normalize(row, payees, accounts, categories))
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
-      .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, Math.min(Number(limit) || 50, 50));
+      .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, Math.min(Number(limit) || 50, 5000));
   }
+  const breakdown = (rows, field) => [...rows.reduce((groups, row) => {
+    const name = row[field] || 'Uncategorized'; const current = groups.get(name) || { name, amountCents: 0, count: 0 };
+    current.amountCents += row.amountCents; current.count += 1; groups.set(name, current); return groups;
+  }, new Map()).values()].sort((a, b) => b.amountCents - a.amountCents || a.name.localeCompare(b.name));
   async function duplicateRows({ merchant, amountCents, date, accountId }) {
     await sync(); const { accounts, categories, payees } = await maps();
     const start = new Date(Date.parse(`${date}T12:00:00Z`) - 5 * DAY_MS).toISOString().slice(0, 10);
@@ -73,6 +77,13 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed && !row.offbudget).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
+    async summary({ days = 90 } = {}) {
+      const range = Math.min(Math.max(Number(days) || 90, 1), 730);
+      const end = new Date(now()).toISOString().slice(0, 10);
+      const start = new Date(now() - (range - 1) * DAY_MS).toISOString().slice(0, 10);
+      const rows = (await transactions({ start, end, limit: 5000 })).filter((row) => row.isExpense);
+      return { start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category'), byAccount: breakdown(rows, 'account'), byMonth: breakdown(rows.map((row) => ({ ...row, month: row.date.slice(0, 7) })), 'month') };
+    },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
     submitBatch({ requestId, rows }) {

@@ -7,6 +7,7 @@ export function createWebApplication({ actual, extractor, cardmap = {}, fallback
   return {
     bootstrap: () => actual.bootstrap(),
     transactions: (query) => actual.findTransactions(query),
+    summary: (query) => actual.summary(query),
     duplicates: (row) => actual.checkDuplicates(row),
     validateBatch: (payload) => actual.validateBatch(payload),
     submitBatch: (payload) => actual.submitBatch(payload),
