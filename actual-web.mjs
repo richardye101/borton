@@ -12,8 +12,13 @@ const normalize = (row, payees, accounts, categories) => ({
   category: categories.get(row.category)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
 });
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
+const zonedDate = (time, timezone) => {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(time));
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value])); return `${value.year}-${value.month}-${value.day}`;
+};
+const monthEnd = (month) => `${month}-${new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate().toString().padStart(2, '0')}`;
 
-export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', now = () => Date.now() } = {}) {
+export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', timezone = 'America/Toronto', now = () => Date.now() } = {}) {
   if (!api || !dataDir) throw new Error('api and dataDir are required.');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const journalPath = path.join(dataDir, 'web-request-journal.json');
@@ -35,20 +40,25 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     const payees = new Map(payeeRows.map((row) => [row.id, row]));
     return { accounts, categories, payees, payeeRows };
   }
-  async function transactions({ start = new Date(now() - 90 * DAY_MS).toISOString().slice(0, 10), end = new Date(now()).toISOString().slice(0, 10), query = '', limit = 50 } = {}) {
-    await sync(); const { accounts, categories, payees } = await maps(); const rows = [];
+  async function transactions({ start = zonedDate(now() - 89 * DAY_MS, timezone), end = zonedDate(now(), timezone), query = '', limit = 50, offset = 0, categoryId, accountId, includeClosed = false, paged = false, force = false } = {}) {
+    await sync(force); const { accounts, categories, payees } = await maps(); const rows = [];
     for (const account of accounts.values()) {
-      if (account.closed) continue;
+      if (account.closed && !includeClosed) continue;
+      if (accountId && account.id !== accountId) continue;
       rows.push(...await api.getTransactions(account.id, start, end));
     }
-    return unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
+    const filtered = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
       .map((row) => normalize(row, payees, accounts, categories))
+      .filter((row) => !categoryId || row.categoryId === categoryId)
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
-      .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, Math.min(Number(limit) || 50, 5000));
+      .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+    const page = filtered.slice(Number(offset) || 0, (Number(offset) || 0) + Math.min(Number(limit) || 50, 5000));
+    return paged ? { rows: page, total: filtered.length } : page;
   }
-  const breakdown = (rows, field) => [...rows.reduce((groups, row) => {
-    const name = row[field] || 'Uncategorized'; const current = groups.get(name) || { name, amountCents: 0, count: 0 };
-    current.amountCents += row.amountCents; current.count += 1; groups.set(name, current); return groups;
+  const breakdown = (rows, field, filters) => [...rows.reduce((groups, row) => {
+    const id = field === 'category' ? row.categoryId || 'uncategorized' : field === 'account' ? row.accountId : row.date.slice(0, 7);
+    const name = field === 'month' ? id : row[field] || 'Uncategorized'; const current = groups.get(id) || { id, name, amountCents: 0, count: 0, filters: field === 'month' ? { start: `${id}-01`, end: monthEnd(id) } : { ...filters, [field === 'category' ? 'categoryId' : 'accountId']: row[`${field}Id`] || null } };
+    current.amountCents += row.amountCents; current.count += 1; groups.set(id, current); return groups;
   }, new Map()).values()].sort((a, b) => b.amountCents - a.amountCents || a.name.localeCompare(b.name));
   async function duplicateRows({ merchant, amountCents, date, accountId }) {
     await sync(); const { accounts, categories, payees } = await maps();
@@ -77,12 +87,12 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed && !row.offbudget).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
-    async summary({ days = 90 } = {}) {
-      const range = Math.min(Math.max(Number(days) || 90, 1), 730);
-      const end = new Date(now()).toISOString().slice(0, 10);
-      const start = new Date(now() - (range - 1) * DAY_MS).toISOString().slice(0, 10);
-      const rows = (await transactions({ start, end, limit: 5000 })).filter((row) => row.isExpense);
-      return { start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category'), byAccount: breakdown(rows, 'account'), byMonth: breakdown(rows.map((row) => ({ ...row, month: row.date.slice(0, 7) })), 'month') };
+    async summary({ period, days = 90, force = false } = {}) {
+      const range = period === 'all' ? null : Math.min(Math.max(Number(period || days) || 90, 1), 365);
+      const end = zonedDate(now(), timezone); const start = range ? zonedDate(now() - (range - 1) * DAY_MS, timezone) : '1900-01-01';
+      const rows = (await transactions({ start, end, limit: 5000, includeClosed: !range, force })).filter((row) => row.isExpense);
+      const filters = { start, end };
+      return { period: range ? String(range) : 'all', start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category', filters), byAccount: breakdown(rows, 'account', filters), byMonth: breakdown(rows, 'month', filters) };
     },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
