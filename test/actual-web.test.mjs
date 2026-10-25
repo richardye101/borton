@@ -20,6 +20,7 @@ function fakeActual(extraTransactions = []) {
     async createPayee({ name }) { const payee = { id: `p${payees.length + 1}`, name }; payees.push(payee); return payee.id; },
     async addTransactions(account, rows) { writes.push({ account, rows }); },
     async updateTransaction(id, fields) { writes.push({ id, fields }); return [{ id, ...fields }]; },
+    async deleteTransaction(id) { writes.push({ delete: id }); },
   };
 }
 
@@ -156,4 +157,19 @@ test('shows a person ledger and running balance from an owed account', async () 
       ],
     }],
   });
+});
+
+test('rebuilds an owner-paid transaction as a debt entry when splitting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'their-card', account: 'tia-card', date: '2026-10-21', amount: -1001, payee: 'p1', category: 'c1', notes: 'Dinner' }]);
+  api.getAccounts = async () => [{ id: 'tia-card', name: 'Tias Mastercard', closed: false }, { id: 'owed-tia', name: 'Owed by Tia', closed: false }];
+  api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
+  const web = createActualWeb({ api, dataDir: dir, cardmap: { owners: { 'Tias Mastercard': 'Tia' } }, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const result = await web.splitTransaction({ id: 'their-card', accountId: 'tia-card', date: '2026-10-21', person: 'Ignored' });
+  assert.deepEqual(result, { status: 'complete', person: 'Tia', account: 'Owed by Tia', direction: 'you_owe_them' });
+  assert.equal(api.writes[0].delete, 'their-card');
+  assert.deepEqual(api.writes.slice(1).map(({ account, rows }) => ({ account, rows: rows.map((row) => ({ amount: row.amount, payee: row.payee, category: row.category, notes: row.notes })) })), [
+    { account: 'tia-card', rows: [{ amount: -1001, payee: 'p1', category: undefined, notes: 'Dinner · Tia paid' }] },
+    { account: 'owed-tia', rows: [{ amount: -501, payee: 'p1', category: 'c1', notes: 'Dinner · your share — Tia paid' }] },
+  ]);
 });

@@ -35,7 +35,7 @@ const zonedDate = (time, timezone) => {
 };
 const monthEnd = (month) => `${month}-${new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate().toString().padStart(2, '0')}`;
 
-export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', timezone = 'America/Toronto', owedAccountFormat = 'Owed by {name}', now = () => Date.now() } = {}) {
+export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', timezone = 'America/Toronto', owedAccountFormat = 'Owed by {name}', cardmap = {}, now = () => Date.now() } = {}) {
   if (!api || !dataDir) throw new Error('api and dataDir are required.');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const journalPath = path.join(dataDir, 'web-request-journal.json');
@@ -52,6 +52,12 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     if (!owedAccountFormat.includes('{name}') || !name.startsWith(prefix) || !name.endsWith(suffix)) return '';
     return name.slice(prefix.length, suffix ? -suffix.length : undefined).trim();
   };
+  const owedAccountName = (person) => owedAccountFormat.replace('{name}', person);
+  const accountOwner = (name = '') => {
+    const owners = cardmap.owners || {};
+    const key = Object.keys(owners).find((candidate) => candidate.toLowerCase() === String(name).toLowerCase());
+    return key ? String(owners[key] || '').trim() : '';
+  };
   async function sync(force = false) {
     if (force || now() - lastSync > 15_000) { await api.sync(); lastSync = now(); }
   }
@@ -61,6 +67,19 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     const categories = new Map(unique([...visible, ...hidden]).map((row) => [row.id, row]));
     const payees = new Map(payeeRows.map((row) => [row.id, row]));
     return { accounts, categories, payees, payeeRows };
+  }
+  async function owedAccount(person) {
+    const name = owedAccountName(person);
+    let current = await maps();
+    let account = [...current.accounts.values()].find((row) => row.name.toLowerCase() === name.toLowerCase());
+    if (!account) {
+      await api.createAccount({ name, offbudget: false }, 0);
+      await api.sync(); lastSync = now();
+      current = await maps();
+      account = [...current.accounts.values()].find((row) => row.name.toLowerCase() === name.toLowerCase());
+    }
+    if (!account) throw error(`Could not create ${name}.`);
+    return { account, maps: current };
   }
   async function transactions({ start = zonedDate(now() - 89 * DAY_MS, timezone), end = zonedDate(now(), timezone), query = '', limit = 50, offset = 0, categoryId, accountId, includeClosed = false, paged = false, force = false } = {}) {
     await sync(force); const { accounts, categories, payees } = await maps(); const rows = [];
@@ -108,7 +127,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     runExclusive,
     async bootstrap() {
       const [{ accounts, categories }, rows] = await Promise.all([maps(), transactions({})]);
-      return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden && !row.is_income).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
+      return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed).map((row) => ({ id: row.id, name: row.name, owner: accountOwner(row.name) || null })), categories: [...categories.values()].filter((row) => !row.hidden && !row.is_income).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
     async shared() {
@@ -157,6 +176,39 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         for (const lineId of splitTransactionIds) await api.updateTransaction(lineId, { category: categoryId });
         await api.sync(); lastSync = now();
         return { status: 'complete', id };
+      });
+    },
+    splitTransaction({ id, accountId, date, person } = {}) {
+      return runExclusive(async () => {
+        const requestedPerson = String(person || '').trim();
+        if (typeof id !== 'string' || !id || typeof accountId !== 'string' || !accountId || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Choose a valid transaction to split.');
+        await sync();
+        const current = await maps();
+        const sourceAccount = current.accounts.get(accountId);
+        if (!sourceAccount || sourceAccount.closed || owedAccountPerson(sourceAccount.name)) throw error('Choose a regular expense account to split.');
+        const owner = accountOwner(sourceAccount.name);
+        const splitPerson = owner || requestedPerson;
+        if (!splitPerson) throw error('Enter the person who shared this expense.');
+        const raw = (await api.getTransactions(accountId, date, date)).find((row) => row.id === id);
+        if (!raw || raw.amount >= 0 || raw.parent_id || (raw.subtransactions || []).length) throw error('Only an ordinary expense can be converted to a split.');
+        const { account: debtAccount, maps: debtMaps } = await owedAccount(splitPerson);
+        const amountCents = Math.abs(raw.amount);
+        const myShareCents = amountCents - Math.round(amountCents / 2);
+        const transferPayee = owner ? null : debtMaps.payeeRows.find((row) => row.transfer_acct === debtAccount.id);
+        if (!owner && !transferPayee) throw error(`Could not find the transfer payee for ${debtAccount.name}.`);
+        await api.deleteTransaction(id);
+        if (owner) {
+          await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
+          await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -Math.round(amountCents / 2), payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: raw.category || null, cleared: false, reconciled: false }], { runTransfers: true });
+          await api.sync(); lastSync = now();
+          return { status: 'complete', person: owner, account: debtAccount.name, direction: 'you_owe_them' };
+        }
+        await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: raw.notes || '', cleared: !!raw.cleared, reconciled: false, subtransactions: [
+          { amount: -myShareCents, category: raw.category || null, notes: 'your share' },
+          { amount: -Math.round(amountCents / 2), payee: transferPayee.id, notes: `owed by ${splitPerson}` },
+        ] }], { runTransfers: true });
+        await api.sync(); lastSync = now();
+        return { status: 'complete', person: splitPerson, account: debtAccount.name, direction: 'they_owe_you' };
       });
     },
     submitBatch({ requestId, rows }) {
