@@ -8,13 +8,17 @@ const JOURNAL_TTL = DAY_MS;
 const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()];
 const normalize = (row, payees, accounts, categories) => {
   const splitTransactionIds = (row.subtransactions || []).map((line) => line.id).filter((id) => typeof id === 'string');
+  const splitLines = (row.subtransactions || []).map((line) => {
+    const categoryId = line.category || null;
+    return { id: line.id, amountCents: Math.abs(line.amount || 0), categoryId, category: categories.get(categoryId)?.name || '' };
+  });
   const splitCategoryIds = [...new Set((row.subtransactions || []).map((line) => line.category).filter(Boolean))];
   const categoryId = row.category || (splitCategoryIds.length === 1 ? splitCategoryIds[0] : null);
   return {
     id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
     accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId,
     category: categories.get(categoryId)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
-    ...(splitTransactionIds.length ? { splitTransactionIds } : {}),
+    ...(splitTransactionIds.length ? { splitTransactionIds, splitLines } : {}),
   };
 };
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });

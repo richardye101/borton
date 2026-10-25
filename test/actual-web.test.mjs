@@ -122,6 +122,10 @@ test('shows a shared split category and applies a row category edit to every spl
   const row = (await web.findTransactions({ start: '2026-10-01', end: '2026-10-31' })).find((transaction) => transaction.id === 'split');
   assert.equal(row.category, 'Groceries');
   assert.deepEqual(row.splitTransactionIds, ['split-one', 'split-two']);
+  assert.deepEqual(row.splitLines, [
+    { id: 'split-one', amountCents: 1721, categoryId: 'c1', category: 'Groceries' },
+    { id: 'split-two', amountCents: 1721, categoryId: null, category: '' },
+  ]);
   await web.editTransaction({ id: 'split', merchant: 'Corner Store', amountCents: 3442, date: '2026-10-21', accountId: 'a1', categoryId: 'c1', note: 'Groceries split', splitTransactionIds: row.splitTransactionIds });
   assert.deepEqual(api.writes.slice(-3), [
     { id: 'split', fields: { date: '2026-10-21', amount: -3442, payee: 'p1', notes: 'Groceries split', account: 'a1', category: 'c1' } },
