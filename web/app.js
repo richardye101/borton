@@ -19,7 +19,52 @@ async function api(path, { method = 'GET', body, form } = {}) {
 
 function picker({ id, type, label, selectedId = '', attrs = '' }) {
   const items = pickerItems(type); const current = selected(items, selectedId);
-  return `<label class="picker">${label}<input list="${id}-options" value="${esc(current?.name || '')}" placeholder="Search ${type === 'account' ? 'accounts' : 'categories'}" data-picker="${type}" ${attrs}><datalist id="${id}-options">${items.map((item) => `<option value="${esc(item.name)}"></option>`).join('')}</datalist></label>`;
+  return `<label class="picker">${label}<span class="picker-control"><input id="${id}" value="${esc(current?.name || '')}" placeholder="Search ${type === 'account' ? 'accounts' : 'categories'}" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-menu" data-picker="${type}" data-picker-menu="${id}-menu" ${attrs}><span class="picker-menu" id="${id}-menu" role="listbox" hidden></span></span></label>`;
+}
+
+function hidePicker(input) {
+  const menu = document.getElementById(input.dataset.pickerMenu);
+  if (!menu) return;
+  menu.hidden = true; input.setAttribute('aria-expanded', 'false');
+}
+
+function showPicker(input) {
+  const menu = document.getElementById(input.dataset.pickerMenu); if (!menu) return;
+  const query = input.value.trim().toLocaleLowerCase();
+  const matches = pickerItems(input.dataset.picker).filter((item) => item.name.toLocaleLowerCase().includes(query)).sort((a, b) => Number(b.name.toLocaleLowerCase().startsWith(query)) - Number(a.name.toLocaleLowerCase().startsWith(query)) || a.name.localeCompare(b.name)).slice(0, 10);
+  menu.innerHTML = matches.map((item) => `<button type="button" role="option" data-picker-value="${esc(item.name)}">${esc(item.name)}</button>`).join('') || '<span class="muted">No matches</span>';
+  menu.hidden = false; input.setAttribute('aria-expanded', 'true');
+  menu.querySelectorAll('[data-picker-value]').forEach((button) => {
+    button.onmousedown = (event) => event.preventDefault();
+    button.onclick = () => { input.value = button.dataset.pickerValue; input.dispatchEvent(new Event('change', { bubbles: true })); hidePicker(input); };
+  });
+}
+
+function bindPickers(root) {
+  root.querySelectorAll('[data-picker]').forEach((input) => {
+    input.onfocus = () => showPicker(input);
+    input.oninput = () => showPicker(input);
+    input.onkeydown = (event) => { if (event.key === 'Escape') hidePicker(input); };
+    input.onblur = () => setTimeout(() => hidePicker(input), 150);
+  });
+}
+
+function bindDictation(root) {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  root.querySelectorAll('[data-dictate]').forEach((button) => {
+    if (!Recognition) { button.disabled = true; button.title = 'Use your device keyboard dictation in this browser.'; return; }
+    let recognition;
+    button.onclick = () => {
+      if (recognition) { recognition.stop(); return; }
+      const target = document.getElementById(button.dataset.dictate); const initial = target.value.trim(); let transcript = '';
+      recognition = new Recognition(); recognition.lang = navigator.language || 'en-CA'; recognition.interimResults = true; recognition.continuous = true;
+      recognition.onstart = () => { button.textContent = 'Stop dictation'; button.setAttribute('aria-pressed', 'true'); };
+      recognition.onresult = (event) => { transcript = [...event.results].map((result) => result[0].transcript).join(''); target.value = [initial, transcript.trim()].filter(Boolean).join(initial && transcript ? ' ' : ''); target.dispatchEvent(new Event('change', { bubbles: true })); };
+      recognition.onend = () => { recognition = null; button.textContent = 'Dictate'; button.setAttribute('aria-pressed', 'false'); };
+      recognition.onerror = () => { recognition?.stop(); };
+      recognition.start();
+    };
+  });
 }
 
 function layout(html) {
@@ -37,8 +82,9 @@ function amountToggle(id) {
 }
 
 function home() {
-  layout(`<section class="card"><div class="toolbar page-toolbar"><h2>Recent expenses</h2><div class="toolbar-actions">${amountToggle('hide-amounts')}<button type="button" class="secondary" id="refresh">Refresh</button></div></div><section class="quick-add"><h3>Quick add</h3><form id="quick"><div class="quick-fields"><label>Merchant<input name="merchant" placeholder="Merchant" required></label><label>Amount<input name="amount" placeholder="Amount" inputmode="decimal" required></label><label>Date<input name="date" type="date" value="${today()}" required></label>${picker({ id: 'quick-account', type: 'account', label: 'Paid from', attrs: 'name="account" required' })}${picker({ id: 'quick-category', type: 'category', label: 'Category', attrs: 'name="category" required' })}</div><label class="quick-note">Notes<textarea name="note" rows="3" placeholder="What was this for?"></textarea></label><div class="quick-actions"><button>Add expense</button><output id="quick-out"></output></div></form></section><div class="toolbar search-bar"><input id="search" placeholder="Search merchant or notes"><button id="search-go">Search</button></div><table class="transactions"><thead><tr><th>Date</th><th>Merchant</th><th>Account</th><th>Category</th><th>Notes</th><th class="amount">Amount</th></tr></thead><tbody id="rows"></tbody></table></section>`);
+  layout(`<section class="card"><div class="toolbar page-toolbar"><h2>Recent expenses</h2><div class="toolbar-actions">${amountToggle('hide-amounts')}<button type="button" class="secondary" id="refresh">Refresh</button></div></div><section class="quick-add"><h3>Quick add</h3><form id="quick"><div class="quick-fields"><label>Merchant<input name="merchant" placeholder="Merchant" required></label><label>Amount<input name="amount" placeholder="Amount" inputmode="decimal" required></label><label>Date<input name="date" type="date" value="${today()}" required></label>${picker({ id: 'quick-account', type: 'account', label: 'Paid from', attrs: 'name="account" required' })}${picker({ id: 'quick-category', type: 'category', label: 'Category', attrs: 'name="category" required' })}</div><label class="quick-note">Notes<textarea id="quick-note" name="note" rows="3" placeholder="What was this for?"></textarea><button type="button" class="secondary dictate" data-dictate="quick-note" aria-pressed="false">Dictate</button></label><div class="quick-actions"><button>Add expense</button><output id="quick-out"></output></div></form></section><div class="toolbar search-bar"><input id="search" placeholder="Search merchant or notes"><button id="search-go">Search</button></div><table class="transactions"><thead><tr><th>Date</th><th>Merchant</th><th>Account</th><th>Category</th><th>Notes</th><th class="amount">Amount</th></tr></thead><tbody id="rows"></tbody></table></section>`);
   renderRows(state.boot.transactions);
+  bindPickers($('#quick')); bindDictation($('#quick'));
   $('#hide-amounts').onclick = () => { setAmountVisibility(!state.hide); home(); };
   $('#refresh').onclick = loadBoot;
   $('#search-go').onclick = async () => renderRows(await api(`/api/transactions?query=${encodeURIComponent($('#search').value)}`));
@@ -75,7 +121,7 @@ function add(message = '') {
 function renderBatch() {
   const host = $('#batch');
   if (!state.batch.length) { host.innerHTML = '<p class="muted">Use Check an expense to upload a receipt, or add one from Home.</p>'; return; }
-  host.innerHTML = state.batch.map((row, index) => `<article class="receipt"><label>Merchant<input data-i="${index}" data-k="merchant" value="${esc(row.merchant)}"></label><label>Amount<input data-i="${index}" data-k="amountCents" value="${(row.amountCents / 100).toFixed(2)}"></label><label>Date<input data-i="${index}" data-k="date" type="date" value="${esc(row.date)}"></label>${picker({ id: `batch-${index}-account`, type: 'account', label: 'Paid from', selectedId: row.accountId, attrs: `data-i="${index}" data-k="accountId"` })}${picker({ id: `batch-${index}-category`, type: 'category', label: 'Category', selectedId: row.categoryId, attrs: `data-i="${index}" data-k="categoryId"` })}<label class="receipt-note">Notes<textarea data-i="${index}" data-k="note" rows="2" placeholder="Notes">${esc(row.note)}</textarea></label>${row.duplicates?.length ? `<label class="duplicate-choice">Likely duplicate <input data-i="${index}" data-k="duplicateAcknowledged" type="checkbox"> intentionally new</label>` : ''}</article>`).join('') + '<button id="save-batch">Save expenses</button><output id="batch-out"></output>';
+  host.innerHTML = state.batch.map((row, index) => `<article class="receipt"><label>Merchant<input data-i="${index}" data-k="merchant" value="${esc(row.merchant)}"></label><label>Amount<input data-i="${index}" data-k="amountCents" value="${(row.amountCents / 100).toFixed(2)}"></label><label>Date<input data-i="${index}" data-k="date" type="date" value="${esc(row.date)}"></label>${picker({ id: `batch-${index}-account`, type: 'account', label: 'Paid from', selectedId: row.accountId, attrs: `data-i="${index}" data-k="accountId"` })}${picker({ id: `batch-${index}-category`, type: 'category', label: 'Category', selectedId: row.categoryId, attrs: `data-i="${index}" data-k="categoryId"` })}<label class="receipt-note">Notes<textarea id="batch-${index}-note" data-i="${index}" data-k="note" rows="2" placeholder="Notes">${esc(row.note)}</textarea><button type="button" class="secondary dictate" data-dictate="batch-${index}-note" aria-pressed="false">Dictate</button></label>${row.duplicates?.length ? `<label class="duplicate-choice">Likely duplicate <input data-i="${index}" data-k="duplicateAcknowledged" type="checkbox"> intentionally new</label>` : ''}</article>`).join('') + '<button id="save-batch">Save expenses</button><output id="batch-out"></output>';
   host.querySelectorAll('[data-k]').forEach((element) => {
     element.onchange = () => {
       const row = state.batch[element.dataset.i];
@@ -83,6 +129,7 @@ function renderBatch() {
       row[element.dataset.k] = value;
     };
   });
+  bindPickers(host); bindDictation(host);
   $('#save-batch').onclick = () => saveRows(state.batch, $('#batch-out'));
 }
 
