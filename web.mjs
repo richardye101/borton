@@ -25,6 +25,7 @@ const password = process.env.ACTUAL_PASSWORD || cfg.actual.password || (fs.exist
 if (!process.env.BORTON_WEB_PASSWORD || !process.env.BORTON_WEB_SESSION_SECRET || !process.env.GOOGLE_API_KEY || !password) throw new Error('Missing BORTON_WEB_PASSWORD, BORTON_WEB_SESSION_SECRET, GOOGLE_API_KEY, or Actual password.');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const dataDir = path.resolve(root, web.dataDir || './actual-web-data');
+fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 await actualApi.init({ dataDir, serverURL: cfg.actual.serverURL, password });
 await actualApi.downloadBudget(cfg.actual.syncId);
 const models = [cfg.gemini?.model, ...(cfg.gemini?.fallbackModels || [])].filter(Boolean);
