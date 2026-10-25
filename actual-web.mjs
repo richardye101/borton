@@ -49,7 +49,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     }
     const filtered = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
       .map((row) => normalize(row, payees, accounts, categories))
-      .filter((row) => !categoryId || row.categoryId === categoryId)
+      .filter((row) => !categoryId || (categoryId === '__uncategorized__' ? !row.categoryId : row.categoryId === categoryId))
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
       .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
     const startAt = Math.max(Number(offset) || 0, 0);
@@ -59,7 +59,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
   }
   const breakdown = (rows, field, filters) => [...rows.reduce((groups, row) => {
     const id = field === 'category' ? row.categoryId || 'uncategorized' : field === 'account' ? row.accountId : row.date.slice(0, 7);
-    const name = field === 'month' ? id : row[field] || 'Uncategorized'; const current = groups.get(id) || { id, name, amountCents: 0, count: 0, filters: field === 'month' ? { start: `${id}-01`, end: monthEnd(id) } : { ...filters, [field === 'category' ? 'categoryId' : 'accountId']: row[`${field}Id`] || null } };
+    const name = field === 'month' ? id : row[field] || 'Uncategorized'; const current = groups.get(id) || { id, name, amountCents: 0, count: 0, filters: field === 'month' ? { start: `${id}-01`, end: monthEnd(id) } : { ...filters, [field === 'category' ? 'categoryId' : 'accountId']: field === 'category' && !row.categoryId ? '__uncategorized__' : row[`${field}Id`] || null } };
     current.amountCents += row.amountCents; current.count += 1; groups.set(id, current); return groups;
   }, new Map()).values()].sort((a, b) => b.amountCents - a.amountCents || a.name.localeCompare(b.name));
   async function duplicateRows({ merchant, amountCents, date, accountId }) {

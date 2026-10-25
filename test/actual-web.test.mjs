@@ -5,8 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { createActualWeb } from '../actual-web.mjs';
 
-function fakeActual() {
-  const transactions = [{ id: 'old', account: 'a1', date: '2026-10-23', amount: -1234, payee: 'p1', category: 'c1', notes: '' }, { id: 'old-2', account: 'a1', date: '2026-10-22', amount: -200, payee: 'p1', category: 'c1', notes: '' }, { id: 'closed-expense', account: 'a2', date: '2024-01-02', amount: -500, payee: 'p1', category: 'c1', notes: '' }, { id: 'transfer', account: 'a1', date: '2026-10-24', amount: -500, payee: 'transfer', transfer_id: 'x' }];
+function fakeActual(extraTransactions = []) {
+  const transactions = [{ id: 'old', account: 'a1', date: '2026-10-23', amount: -1234, payee: 'p1', category: 'c1', notes: '' }, { id: 'old-2', account: 'a1', date: '2026-10-22', amount: -200, payee: 'p1', category: 'c1', notes: '' }, { id: 'closed-expense', account: 'a2', date: '2024-01-02', amount: -500, payee: 'p1', category: 'c1', notes: '' }, { id: 'transfer', account: 'a1', date: '2026-10-24', amount: -500, payee: 'transfer', transfer_id: 'x' }, ...extraTransactions];
   const payees = [{ id: 'p1', name: 'Corner Store' }, { id: 'transfer', name: 'Transfer', transfer_acct: 'a2' }];
   const writes = [];
   return {
@@ -64,6 +64,16 @@ test('returns a paged filtered transaction detail response', async () => {
   assert.deepEqual(detail.rows.map((row) => row.id), ['old-2']);
   const unbounded = await web.findTransactions({ start: '2026-10-01', end: '2026-10-31', categoryId: 'c1', limit: 0, paged: true });
   assert.deepEqual(unbounded.rows.map((row) => row.id), ['old', 'old-2']);
+});
+
+test('uses a dedicated filter for uncategorized transaction drill-downs', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'uncategorized', account: 'a1', date: '2026-10-21', amount: -300, payee: 'p1', category: null, notes: '' }]);
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const summary = await web.summary({ days: 30 });
+  assert.deepEqual(summary.byCategory.find((row) => row.name === 'Uncategorized').filters, { start: '2026-09-25', end: '2026-10-24', categoryId: '__uncategorized__' });
+  const detail = await web.findTransactions({ start: '2026-09-25', end: '2026-10-24', categoryId: '__uncategorized__' });
+  assert.deepEqual(detail.map((row) => row.id), ['uncategorized']);
 });
 
 test('writes an acknowledged batch once and reuses one normalized payee', async () => {
