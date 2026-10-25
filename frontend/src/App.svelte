@@ -151,7 +151,7 @@
   </main>
 {:else}
   <main class="shell">
-    <aside><h1>Borton</h1><small>Synced {new Date(boot.syncedAt).toLocaleTimeString()}</small><nav><span>View</span><button class:active={view === 'home'} on:click={() => show('home')}>Home</button><button class:active={view === 'summary'} on:click={() => show('summary')}>Summary</button><span>Actions</span><button class:nav-action class:active={view === 'add'} on:click={() => show('add')}><b aria-hidden="true">＋</b><span>Add expense</span></button><button class:nav-action class:active={view === 'check'} on:click={() => show('check')}><b aria-hidden="true">⌕</b><span>Check an expense</span></button></nav></aside>
+    <aside><h1>Borton</h1><small>Synced {new Date(boot.syncedAt).toLocaleTimeString()}</small><nav><span>View</span><button class:active={view === 'home'} on:click={() => show('home')}>Home</button><button class:active={view === 'summary'} on:click={() => show('summary')}>Summary</button><span>Actions</span><button class="nav-action" class:active={view === 'add'} on:click={() => show('add')}><b aria-hidden="true">＋</b><span>Add expense</span></button><button class="nav-action" class:active={view === 'check'} on:click={() => show('check')}><b aria-hidden="true">⌕</b><span>Check an expense</span></button></nav></aside>
     <section class="main"><header><div class="mobile-nav"><button on:click={() => show('home')}>Home</button><button on:click={() => show('summary')}>Summary</button></div><button class="chat-trigger" on:click={() => chatOpen = true} aria-label="Open chat" title="Chat"><span aria-hidden="true">◌</span></button></header>
 
       {#if view === 'home'}
