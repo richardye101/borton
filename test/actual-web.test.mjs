@@ -42,6 +42,7 @@ test('summarizes expense spending by category, account, and month', async () => 
   assert.deepEqual(summary.byCategory.map(({ name, amountCents, count }) => ({ name, amountCents, count })), [{ name: 'Groceries', amountCents: 1434, count: 2 }]);
   assert.deepEqual(summary.byAccount.map(({ name, amountCents, count }) => ({ name, amountCents, count })), [{ name: 'Visa', amountCents: 1434, count: 2 }]);
   assert.deepEqual(summary.byMonth.map(({ name, amountCents, count }) => ({ name, amountCents, count })), [{ name: '2026-10', amountCents: 1434, count: 2 }]);
+  assert.deepEqual(summary.monthCategories.map(({ name, categories }) => ({ name, categories: categories.map(({ name: category, amountCents }) => ({ name: category, amountCents })) })), [{ name: '2026-10', categories: [{ name: 'Groceries', amountCents: 1434 }] }]);
 });
 
 test('includes closed-account history in all-time summaries and returns stable drill-down filters', async () => {

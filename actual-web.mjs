@@ -94,7 +94,12 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       const end = zonedDate(now(), timezone); const start = range ? zonedDate(now() - (range - 1) * DAY_MS, timezone) : '1900-01-01';
       const rows = (await transactions({ start, end, limit: 0, includeClosed: !range, force })).filter((row) => row.isExpense);
       const filters = { start, end };
-      return { period: range ? String(range) : 'all', start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category', filters), byAccount: breakdown(rows, 'account', filters), byMonth: breakdown(rows, 'month', filters) };
+      const byMonth = breakdown(rows, 'month', filters);
+      const monthCategories = byMonth.map((month) => ({
+        ...month,
+        categories: breakdown(rows.filter((row) => row.date.startsWith(month.name)), 'category', month.filters),
+      }));
+      return { period: range ? String(range) : 'all', start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category', filters), byAccount: breakdown(rows, 'account', filters), byMonth, monthCategories };
     },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
