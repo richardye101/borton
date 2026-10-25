@@ -8,6 +8,7 @@
 
   let csrf = '';
   let boot = null;
+  let signedIn = false;
   let view = 'home';
   let loginPassword = '';
   let loginError = '';
@@ -35,10 +36,8 @@
     try {
       const session = await fetch('/api/session');
       if (session.ok) { csrf = (await session.json()).csrf; await loadBoot(); }
-    } catch {}
+    } catch (error) { loginError = `Could not restore your session: ${error.message || 'network error'}`; }
   });
-
-  $: signedIn = !!boot;
   $: accounts = boot?.accounts || [];
   $: categories = boot?.categories || [];
   $: money = (cents) => hideAmounts ? '••••' : new Intl.NumberFormat('en-CA', { style: 'currency', currency: boot?.currency || 'CAD' }).format((cents || 0) / 100);
@@ -50,8 +49,10 @@
   }
 
   async function loadBoot() {
-    boot = await request('/api/bootstrap', { csrf });
-    transactions = boot.transactions; recentUpdatedAt = new Date();
+    const data = await request('/api/bootstrap', { csrf });
+    boot = data;
+    transactions = data.transactions; recentUpdatedAt = new Date();
+    signedIn = true;
     show(view);
   }
 
