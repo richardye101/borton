@@ -12,7 +12,7 @@ function fakeActual(extraTransactions = []) {
   return {
     writes,
     async sync() {},
-    async getAccounts() { return [{ id: 'a1', name: 'Visa', closed: false }, { id: 'a2', name: 'Closed', closed: true }]; },
+    async getAccounts() { return [{ id: 'a1', name: 'Visa', closed: false }, { id: 'a2', name: 'Closed', closed: true }, { id: 'a3', name: 'Tias Mastercard', closed: false, offbudget: true }]; },
     async getCategories() { return [{ id: 'c1', name: 'Groceries', hidden: false }, { id: 'income', name: 'Salary', hidden: false, is_income: true }]; },
     async getPayees() { return payees; },
     async getTransactions(account) { return transactions.filter((row) => row.account === account); },
@@ -27,6 +27,7 @@ test('returns newest non-transfer transactions and finds likely duplicates', asy
   const web = createActualWeb({ api: fakeActual(), dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const boot = await web.bootstrap();
   assert.deepEqual(boot.transactions.map((row) => row.id), ['old', 'old-2']);
+  assert.deepEqual(boot.accounts.map((row) => row.name), ['Visa', 'Tias Mastercard']);
   assert.deepEqual(boot.categories.map((row) => row.name), ['Groceries']);
   const duplicates = await web.checkDuplicates({ merchant: 'Corner Store', amountCents: 1234, date: '2026-10-24' });
   assert.equal(duplicates.length, 1);
