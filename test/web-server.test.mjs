@@ -35,6 +35,7 @@ test('rejects untrusted remotes before login or financial data', async () => {
 test('serves static assets and guards API routes with login, session and CSRF', async () => {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-web-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');
+  fs.writeFileSync(path.join(staticDir, 'client-state.mjs'), 'export const Borton = true;');
   const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
   const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }) };
   await withServer({ auth, app, staticDir, allowedRemote: ['127.0.0.1'] }, async (port) => {
@@ -42,6 +43,13 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.equal(page.status, 200);
     assert.match(page.body, /Borton/);
     assert.equal(page.headers['cache-control'], 'no-store');
+    const module = await request(port, { path: '/client-state.mjs' });
+    assert.equal(module.status, 200);
+    assert.match(module.headers['content-type'], /^text\/javascript/);
+    assert.equal(module.headers['referrer-policy'], 'no-referrer');
+    const clearedPasswordQuery = await request(port, { path: '/?password=should-not-be-here' });
+    assert.equal(clearedPasswordQuery.status, 303);
+    assert.equal(clearedPasswordQuery.headers.location, '/');
     assert.equal((await request(port, { path: '/api/bootstrap' })).status, 401);
 
     const login = await request(port, { method: 'POST', path: '/login', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: 'password' }) });

@@ -3,7 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 
 const JSON_LIMIT = 256 * 1024;
-const contentTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+const contentTypes = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
 const json = (res, status, body, headers = {}) => {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', ...headers });
   res.end(JSON.stringify(body));
@@ -62,6 +62,10 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     const remote = req.socket.remoteAddress || '';
     if (!allowed(remote, allowedRemote)) return json(res, 403, { error: 'Private network access required.' });
     const url = new URL(req.url, 'http://borton.local');
+    if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('password')) {
+      res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+      return res.end();
+    }
     if (req.method === 'GET' && url.pathname === '/api/session') {
       const source = remote.replace(/^::ffff:/, '');
       const trusted = allowed(remote, trustedRemotes);
@@ -93,7 +97,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     if (!relative || !contentTypes[path.extname(relative)]) return json(res, 404, { error: 'Not found.' });
     try {
       const file = await fs.readFile(path.join(staticDir, relative));
-      res.writeHead(200, { 'Content-Type': contentTypes[path.extname(relative)], 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'" });
+      res.writeHead(200, { 'Content-Type': contentTypes[path.extname(relative)], 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'" });
       res.end(file);
     } catch { json(res, 404, { error: 'Not found.' }); }
   });
