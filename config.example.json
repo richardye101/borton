@@ -15,7 +15,7 @@
     "port": 28455
   },
   "web": {
-    "host": "0.0.0.0",
+    "host": "10.88.111.48",
     "port": 28456,
     "allowedRemote": ["10.88.111.0/24"],
     "dataDir": "./actual-web-data",

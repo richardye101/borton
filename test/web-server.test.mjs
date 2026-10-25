@@ -52,6 +52,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.equal(bootstrap.status, 200);
     assert.deepEqual(JSON.parse(bootstrap.body), { transactions: [] });
     assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+    assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf, origin: 'http://evil.example' }, body: '{}' })).status, 403);
     assert.equal(bootstrap.headers['cache-control'], 'no-store');
   });
 });

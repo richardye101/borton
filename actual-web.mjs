@@ -47,9 +47,14 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id)).slice(0, Math.min(Number(limit) || 50, 50));
   }
   async function duplicateRows({ merchant, amountCents, date, accountId }) {
-    const rows = await transactions({ start: new Date(Date.parse(`${date}T12:00:00Z`) - 5 * DAY_MS).toISOString().slice(0, 10), end: new Date(Date.parse(`${date}T12:00:00Z`) + 5 * DAY_MS).toISOString().slice(0, 10), limit: 50 });
-    const raw = rows.filter((row) => !accountId || row.accountId === accountId).map((row) => ({ id: row.id, date: row.date, amount: -row.amountCents, payee_name: row.merchant }));
-    return findLikelyDuplicates(raw, { merchant, total: amountCents / 100, date }).map((match) => rows.find((row) => row.id === match.id));
+    await sync(); const { accounts, categories, payees } = await maps();
+    const start = new Date(Date.parse(`${date}T12:00:00Z`) - 5 * DAY_MS).toISOString().slice(0, 10);
+    const end = new Date(Date.parse(`${date}T12:00:00Z`) + 5 * DAY_MS).toISOString().slice(0, 10);
+    const raw = [];
+    for (const account of accounts.values()) if (!account.closed && (!accountId || account.id === accountId)) raw.push(...await api.getTransactions(account.id, start, end));
+    const rows = unique(raw).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct).map((row) => normalize(row, payees, accounts, categories));
+    const candidates = rows.map((row) => ({ id: row.id, date: row.date, amount: -row.amountCents, payee_name: row.merchant }));
+    return findLikelyDuplicates(candidates, { merchant, total: amountCents / 100, date }).map((match) => rows.find((row) => row.id === match.id));
   }
   async function validateRows(rows = []) {
     if (!Array.isArray(rows) || rows.length > 50) throw error('Submit between 1 and 50 rows.');
@@ -76,8 +81,14 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         const journal = readJournal();
         for (const [key, value] of Object.entries(journal)) if (value.at < now() - JOURNAL_TTL) delete journal[key];
         if (journal[requestId]?.result) return journal[requestId].result;
+        if (journal[requestId]?.uncertain) return { status: 'uncertain', rows: [], error: 'This request may have started writing. Check Actual before submitting again.' };
         journal[requestId] = { at: now(), uncertain: true }; writeJournal(journal);
         const checked = await validateRows(rows);
+        for (let i = 0; i < checked.length; i += 1) {
+          const row = checked[i]; if (row.status !== 'ready') continue;
+          const earlier = checked.slice(0, i).filter((candidate) => candidate.status === 'ready').map((candidate, index) => ({ id: `batch-${index}`, date: candidate.date, amount: -candidate.amountCents, payee_name: candidate.merchant }));
+          if (findLikelyDuplicates(earlier, { merchant: row.merchant, total: row.amountCents / 100, date: row.date }).length && !row.duplicateAcknowledged) { row.status = 'check_required'; row.duplicates = [{ id: 'batch', merchant: row.merchant, amountCents: row.amountCents }]; }
+        }
         if (checked.some((row) => row.status === 'invalid')) return { status: 'invalid', rows: checked };
         if (checked.some((row) => row.status === 'check_required')) return { status: 'review_required', rows: checked };
         const { payeeRows } = await maps(); const byName = new Map(payeeRows.map((row) => [row.name.toLowerCase(), row]));
@@ -88,7 +99,8 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
             if (!payee) { const id = await api.createPayee({ name: row.merchant }); payee = { id, name: row.merchant }; byName.set(key, payee); }
             const importedId = `borton-web-${requestId}-${row.clientId}`;
             await api.addTransactions(row.accountId, [{ date: row.date, amount: -row.amountCents, payee: payee.id, notes: row.note, category: row.categoryId, imported_id: importedId }], { runTransfers: true });
-            outcome.push({ clientId: row.clientId, status: 'complete', importedId });
+            const created = (await api.getTransactions(row.accountId, row.date, row.date)).find((transaction) => transaction.imported_id === importedId);
+            outcome.push({ clientId: row.clientId, status: 'complete', transactionId: created?.id || null, importedId });
           }
           await api.sync(); lastSync = now();
           const result = { status: 'complete', rows: outcome }; journal[requestId] = { at: now(), result }; writeJournal(journal); return result;

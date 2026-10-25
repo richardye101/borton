@@ -46,3 +46,14 @@ test('writes an acknowledged batch once and reuses one normalized payee', async 
   assert.equal((await api.getPayees()).filter((payee) => payee.name.toLowerCase() === 'fresh shop').length, 1);
   assert.deepEqual(await web.submitBatch({ requestId: 'request-0001', rows }), first);
 });
+
+test('never replays an uncertain request and flags duplicate rows inside one batch', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual(); const now = () => Date.parse('2026-10-24T12:00:00Z');
+  fs.writeFileSync(path.join(dir, 'web-request-journal.json'), JSON.stringify({ 'uncertain-0001': { at: now(), uncertain: true } }));
+  const web = createActualWeb({ api, dataDir: dir, now });
+  const row = { clientId: 'one', merchant: 'New Store', amountCents: 200, date: '2026-10-24', accountId: 'a1', categoryId: 'c1', note: '', duplicateAcknowledged: false };
+  assert.equal((await web.submitBatch({ requestId: 'uncertain-0001', rows: [row] })).status, 'uncertain');
+  assert.equal(api.writes.length, 0);
+  assert.equal((await web.submitBatch({ requestId: 'request-0002', rows: [row, { ...row, clientId: 'two' }] })).status, 'review_required');
+});

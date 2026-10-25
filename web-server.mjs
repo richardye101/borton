@@ -72,6 +72,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
       if (!session) return json(res, 401, { error: 'Sign in required.' });
       try {
         const payload = req.method === 'POST' && url.pathname === '/api/extract' ? await readMultipartImage(req, maxUploadBytes) : req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
+        if (req.method === 'POST' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'Cross-origin request rejected.' });
         if (req.method === 'POST' && !auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
         const handler = dispatch[`${req.method} ${url.pathname}`];
         if (!handler || typeof app[handler] !== 'function') return json(res, 404, { error: 'Not found.' });
