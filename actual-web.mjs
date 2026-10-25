@@ -179,37 +179,67 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         return { status: 'complete', id };
       });
     },
-    splitTransaction({ id, accountId, date, person } = {}) {
+    splitTransaction({ id, accountId, date, person, mode = 'equal', shares } = {}) {
       return runExclusive(async () => {
-        const requestedPerson = String(person || '').trim();
         if (typeof id !== 'string' || !id || typeof accountId !== 'string' || !accountId || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Choose a valid transaction to split.');
+        if (!['equal', 'amount', 'percent'].includes(mode)) throw error('Choose Equal, Amount, or %.');
         await sync();
         const current = await maps();
         const sourceAccount = current.accounts.get(accountId);
         if (!sourceAccount || sourceAccount.closed || owedAccountPerson(sourceAccount.name)) throw error('Choose a regular expense account to split.');
         const owner = accountOwner(sourceAccount.name);
-        const splitPerson = owner || requestedPerson;
-        if (!splitPerson) throw error('Enter the person who shared this expense.');
         const raw = (await api.getTransactions(accountId, date, date)).find((row) => row.id === id);
         if (!raw || raw.amount >= 0 || raw.parent_id || (raw.subtransactions || []).length) throw error('Only an ordinary expense can be converted to a split.');
-        const { account: debtAccount, maps: debtMaps } = await owedAccount(splitPerson);
         const amountCents = Math.abs(raw.amount);
-        const myShareCents = amountCents - Math.round(amountCents / 2);
-        const transferPayee = owner ? null : debtMaps.payeeRows.find((row) => row.transfer_acct === debtAccount.id);
-        if (!owner && !transferPayee) throw error(`Could not find the transfer payee for ${debtAccount.name}.`);
-        await api.deleteTransaction(id);
+        const entries = Array.isArray(shares) && shares.length ? shares : person ? [{ person, value: null }] : [];
+        const asShare = (entry) => ({ person: String(entry?.person || '').trim(), value: entry?.value });
+        const namedShares = entries.map(asShare).filter((entry) => entry.person);
+        const shareCents = (value) => {
+          const number = Number(value);
+          if (!Number.isFinite(number) || number <= 0) throw error('Enter a positive share for each person.');
+          return mode === 'amount' ? Math.round(number * 100) : Math.round(amountCents * number / 100);
+        };
+        const resolveAmounts = (people, includeYou) => {
+          if (!people.length || people.length > 20 || new Set(people.map((entry) => entry.person.toLowerCase())).size !== people.length) throw error('Give each split a unique person.');
+          if (mode === 'equal') {
+            const each = Math.round(amountCents / (people.length + (includeYou ? 1 : 0)));
+            return people.map((entry) => ({ ...entry, amountCents: each }));
+          }
+          const result = people.map((entry) => {
+            if (mode === 'percent' && Number(entry.value) > 100) throw error('A percentage cannot exceed 100%.');
+            return { ...entry, amountCents: shareCents(entry.value) };
+          });
+          return result;
+        };
         if (owner) {
+          const selected = entries[0] || { value: null };
+          const myShareCents = mode === 'equal' ? Math.round(amountCents / 2) : shareCents(selected.value);
+          if (myShareCents > amountCents) throw error('Your share cannot exceed the transaction total.');
+          const { account: debtAccount } = await owedAccount(owner);
+          await api.deleteTransaction(id);
           await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
-          await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -Math.round(amountCents / 2), payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: raw.category || null, cleared: false, reconciled: false }], { runTransfers: true });
+          await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -myShareCents, payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: raw.category || null, cleared: false, reconciled: false }], { runTransfers: true });
           await api.sync(); lastSync = now();
-          return { status: 'complete', person: owner, account: debtAccount.name, direction: 'you_owe_them' };
+          return { status: 'complete', direction: 'you_owe_them', shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
         }
+        const parts = resolveAmounts(namedShares, true);
+        const totalSharedCents = parts.reduce((total, entry) => total + entry.amountCents, 0);
+        const myShareCents = amountCents - totalSharedCents;
+        if (myShareCents <= 0) throw error('Leave an amount for your share.');
+        const resolved = [];
+        for (const part of parts) {
+          const result = await owedAccount(part.person);
+          const transferPayee = result.maps.payeeRows.find((row) => row.transfer_acct === result.account.id);
+          if (!transferPayee) throw error(`Could not find the transfer payee for ${result.account.name}.`);
+          resolved.push({ ...part, account: result.account.name, transferPayee: transferPayee.id });
+        }
+        await api.deleteTransaction(id);
         await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: raw.notes || '', cleared: !!raw.cleared, reconciled: false, subtransactions: [
           { amount: -myShareCents, category: raw.category || null, notes: 'your share' },
-          { amount: -Math.round(amountCents / 2), payee: transferPayee.id, notes: `owed by ${splitPerson}` },
+          ...resolved.map((part) => ({ amount: -part.amountCents, payee: part.transferPayee, notes: `owed by ${part.person}` })),
         ] }], { runTransfers: true });
         await api.sync(); lastSync = now();
-        return { status: 'complete', person: splitPerson, account: debtAccount.name, direction: 'they_owe_you' };
+        return { status: 'complete', direction: 'they_owe_you', shares: resolved.map(({ person, account, amountCents: value }) => ({ person, account, amountCents: value })) };
       });
     },
     submitBatch({ requestId, rows }) {
