@@ -70,6 +70,11 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     }
     if (req.method === 'GET' && url.pathname === '/api/session') {
       const source = remote.replace(/^::ffff:/, '');
+      const existing = auth.verifySession(req.headers.cookie);
+      if (existing) {
+        console.log(`[Borton Web] session restored for ${source}`);
+        return json(res, 200, { csrf: auth.issueCsrf(existing) });
+      }
       const trusted = allowed(remote, trustedRemotes);
       console.log(`[Borton Web] trusted session ${trusted ? 'issued' : 'denied'} for ${source}`);
       if (!trusted) return json(res, 401, { error: 'Password required.' });
@@ -81,6 +86,13 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
         const body = await readJson(req); const login = auth.login(body.password || '');
         return login ? json(res, 200, { csrf: login.csrf }, { 'Set-Cookie': login.cookie }) : json(res, 401, { error: 'Invalid password.' });
       } catch (error) { return json(res, 400, { error: error.message }); }
+    }
+    if (req.method === 'POST' && url.pathname === '/logout') {
+      const session = auth.verifySession(req.headers.cookie);
+      if (!session) return json(res, 401, { error: 'Sign in required.' });
+      if (req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'Cross-origin request rejected.' });
+      if (!auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
+      return json(res, 200, { status: 'complete' }, { 'Set-Cookie': auth.clearSession() });
     }
     if (url.pathname.startsWith('/api/')) {
       const session = auth.verifySession(req.headers.cookie);

@@ -56,6 +56,9 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.equal(login.status, 200);
     const cookie = login.headers['set-cookie'][0].split(';')[0];
     const csrf = JSON.parse(login.body).csrf;
+    const restored = await request(port, { path: '/api/session', headers: { cookie } });
+    assert.equal(restored.status, 200);
+    assert.equal(JSON.parse(restored.body).csrf, csrf);
     const bootstrap = await request(port, { path: '/api/bootstrap', headers: { cookie } });
     assert.equal(bootstrap.status, 200);
     assert.deepEqual(JSON.parse(bootstrap.body), { transactions: [] });
@@ -64,6 +67,9 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.deepEqual(JSON.parse(summary.body), { days: 30, totalCents: 1234 });
     const edited = await request(port, { method: 'POST', path: '/api/transactions/edit', headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: JSON.stringify({ id: 'transaction-1' }) });
     assert.deepEqual(JSON.parse(edited.body), { status: 'complete', id: 'transaction-1' });
+    const logout = await request(port, { method: 'POST', path: '/logout', headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: '{}' });
+    assert.deepEqual(JSON.parse(logout.body), { status: 'complete' });
+    assert.match(logout.headers['set-cookie'][0], /borton_session=; Max-Age=0/);
     const boundary = 'borton-audio-boundary';
     const audioBody = `--${boundary}\r\nContent-Disposition: form-data; name="audio"; filename="note.webm"\r\nContent-Type: audio/webm\r\n\r\nspoken note\r\n--${boundary}--\r\n`;
     const transcript = await request(port, { method: 'POST', path: '/api/transcribe', headers: { cookie, 'x-csrf-token': csrf, 'content-type': `multipart/form-data; boundary=${boundary}` }, body: audioBody });
