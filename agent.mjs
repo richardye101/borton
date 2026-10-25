@@ -172,7 +172,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
     remember(chatId,text) {const c=chat(chatId);remember(c,'user',text);save();},
     async message(chatId,text,options={}) {return exclusive(chatId,async c=>{
       if(typeof text!=='string'||!text.trim()) return {text:'Send a question or tell me what to change in Actual.'};
-      if(text.length>8000) return {text:'Please shorten the request to 8,000 characters.'};
+      if(text.length>24_000) return {text:'Please shorten the request to 24,000 characters.'};
       const old=c.pending;
       c.pending=null; // Revisions invalidate every older callback even if reasoning later fails.
       const request = options.request || {};

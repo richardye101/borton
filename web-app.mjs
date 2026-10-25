@@ -30,7 +30,7 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
       if (!transcriber) throw new Error('Audio transcription is unavailable.');
       return transcriber.transcribe(buffer, mime);
     },
-    assistantMessage: (payload) => assistant?.message(payload.text),
+    assistantMessage: (payload) => assistant?.message({ text: payload.text, context: payload.context }),
     assistantConfirm: (payload) => assistant?.confirm(payload.planId),
     assistantCancel: (payload) => assistant?.cancel(payload.planId),
   };

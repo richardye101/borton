@@ -18,3 +18,10 @@ test('passes recorded audio to its configured transcriber', async () => {
   const app = createWebApplication({ actual: {}, extractor: {}, transcriber: { transcribe: async (buffer, mime) => ({ text: `${mime}:${buffer.toString()}` }) } });
   assert.deepEqual(await app.transcribe({ buffer: Buffer.from('note'), mime: 'audio/webm' }), { text: 'audio/webm:note' });
 });
+
+test('passes the visible screen context to Borton', async () => {
+  const received = [];
+  const app = createWebApplication({ actual: {}, extractor: {}, assistant: { async message(payload) { received.push(payload); return { text: 'Ready' }; } } });
+  assert.deepEqual(await app.assistantMessage({ text: 'Classify these', context: { page: 'home', visibleTransactions: [{ id: 'txn-1' }] } }), { text: 'Ready' });
+  assert.deepEqual(received, [{ text: 'Classify these', context: { page: 'home', visibleTransactions: [{ id: 'txn-1' }] } }]);
+});
