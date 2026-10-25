@@ -5,6 +5,7 @@
   export let value = '';
   export let placeholder = 'Search';
   export let required = false;
+  export let inputId = '';
   const dispatch = createEventDispatcher();
   let open = false;
 
@@ -21,7 +22,7 @@
 <label class="picker">
   {#if label}<span>{label}</span>{/if}
   <span class="picker-control">
-    <input bind:value {placeholder} {required} autocomplete="off" on:focus={() => open = true} on:input={() => open = true} on:keydown={(event) => event.key === 'Escape' && (open = false)} on:blur={() => setTimeout(() => open = false, 150)} />
+    <input id={inputId || undefined} bind:value {placeholder} {required} autocomplete="off" on:focus={() => open = true} on:input={() => open = true} on:keydown={(event) => event.key === 'Escape' && (open = false)} on:blur={() => setTimeout(() => open = false, 150)} />
     {#if open}
       <span class="picker-menu" role="listbox">
         {#each matches as item}
