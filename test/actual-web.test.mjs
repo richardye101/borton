@@ -59,6 +59,8 @@ test('returns a paged filtered transaction detail response', async () => {
   const detail = await web.findTransactions({ start: '2026-10-01', end: '2026-10-31', categoryId: 'c1', offset: 1, limit: 1, paged: true });
   assert.equal(detail.total, 2);
   assert.deepEqual(detail.rows.map((row) => row.id), ['old-2']);
+  const unbounded = await web.findTransactions({ start: '2026-10-01', end: '2026-10-31', categoryId: 'c1', limit: 0, paged: true });
+  assert.deepEqual(unbounded.rows.map((row) => row.id), ['old', 'old-2']);
 });
 
 test('writes an acknowledged batch once and reuses one normalized payee', async () => {

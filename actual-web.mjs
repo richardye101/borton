@@ -52,7 +52,9 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       .filter((row) => !categoryId || row.categoryId === categoryId)
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
       .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
-    const page = filtered.slice(Number(offset) || 0, (Number(offset) || 0) + Math.min(Number(limit) || 50, 5000));
+    const startAt = Math.max(Number(offset) || 0, 0);
+    const requestedLimit = Number(limit);
+    const page = requestedLimit === 0 ? filtered.slice(startAt) : filtered.slice(startAt, startAt + Math.min(requestedLimit || 50, 5000));
     return paged ? { rows: page, total: filtered.length } : page;
   }
   const breakdown = (rows, field, filters) => [...rows.reduce((groups, row) => {
@@ -90,7 +92,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     async summary({ period, days = 90, force = false } = {}) {
       const range = period === 'all' ? null : Math.min(Math.max(Number(period || days) || 90, 1), 365);
       const end = zonedDate(now(), timezone); const start = range ? zonedDate(now() - (range - 1) * DAY_MS, timezone) : '1900-01-01';
-      const rows = (await transactions({ start, end, limit: 5000, includeClosed: !range, force })).filter((row) => row.isExpense);
+      const rows = (await transactions({ start, end, limit: 0, includeClosed: !range, force })).filter((row) => row.isExpense);
       const filters = { start, end };
       return { period: range ? String(range) : 'all', start, end, totalCents: rows.reduce((total, row) => total + row.amountCents, 0), count: rows.length, byCategory: breakdown(rows, 'category', filters), byAccount: breakdown(rows, 'account', filters), byMonth: breakdown(rows, 'month', filters) };
     },

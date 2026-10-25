@@ -63,7 +63,10 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     if (!allowed(remote, allowedRemote)) return json(res, 403, { error: 'Private network access required.' });
     const url = new URL(req.url, 'http://borton.local');
     if (req.method === 'GET' && url.pathname === '/api/session') {
-      if (!allowed(remote, trustedRemotes)) return json(res, 401, { error: 'Password required.' });
+      const source = remote.replace(/^::ffff:/, '');
+      const trusted = allowed(remote, trustedRemotes);
+      console.log(`[Borton Web] trusted session ${trusted ? 'issued' : 'denied'} for ${source}`);
+      if (!trusted) return json(res, 401, { error: 'Password required.' });
       const login = auth.trustedLogin();
       return json(res, 200, { csrf: login.csrf }, { 'Set-Cookie': login.cookie });
     }
