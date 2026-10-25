@@ -16,6 +16,7 @@ function fakeActual(extraTransactions = []) {
     async getCategories() { return [{ id: 'c1', name: 'Groceries', hidden: false }, { id: 'income', name: 'Salary', hidden: false, is_income: true }]; },
     async getPayees() { return payees; },
     async getTransactions(account) { return transactions.filter((row) => row.account === account); },
+    async getAccountBalance(account) { return transactions.filter((row) => row.account === account).reduce((total, row) => total + row.amount, 0); },
     async createPayee({ name }) { const payee = { id: `p${payees.length + 1}`, name }; payees.push(payee); return payee.id; },
     async addTransactions(account, rows) { writes.push({ account, rows }); },
     async updateTransaction(id, fields) { writes.push({ id, fields }); return [{ id, ...fields }]; },
@@ -133,4 +134,23 @@ test('shows a shared split category and applies a row category edit to every spl
     { id: 'split-one', fields: { category: 'c1' } },
     { id: 'split-two', fields: { category: 'c1' } },
   ]);
+});
+
+test('shows a person ledger and running balance from an owed account', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([
+    { id: 'tia-split', account: 'owed-tia', date: '2026-10-20', amount: 2361, payee: 'p1', notes: 'No frills split' },
+    { id: 'tia-paid', account: 'owed-tia', date: '2026-10-22', amount: -500, payee: 'p1', notes: 'Tia paid back' },
+  ]);
+  api.getAccounts = async () => [{ id: 'a1', name: 'Visa', closed: false }, { id: 'owed-tia', name: 'Owed by Tia', closed: false }];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  assert.deepEqual(await web.shared(), {
+    people: [{
+      id: 'owed-tia', name: 'Tia', balanceCents: 1861, direction: 'they_owe_you',
+      entries: [
+        { id: 'tia-paid', date: '2026-10-22', merchant: 'Corner Store', note: 'Tia paid back', amountCents: 500, direction: 'you_owe_them', runningBalanceCents: 1861 },
+        { id: 'tia-split', date: '2026-10-20', merchant: 'Corner Store', note: 'No frills split', amountCents: 2361, direction: 'they_owe_you', runningBalanceCents: 2361 },
+      ],
+    }],
+  });
 });

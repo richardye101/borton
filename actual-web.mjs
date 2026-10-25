@@ -6,11 +6,13 @@ import { withActualLock } from './actual-lock.mjs';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const JOURNAL_TTL = DAY_MS;
 const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()];
-const normalize = (row, payees, accounts, categories) => {
+const normalize = (row, payees, accounts, categories, owedAccountPerson) => {
   const splitTransactionIds = (row.subtransactions || []).map((line) => line.id).filter((id) => typeof id === 'string');
   const splitLines = (row.subtransactions || []).map((line) => {
     const categoryId = line.category || null;
-    return { id: line.id, amountCents: Math.abs(line.amount || 0), categoryId, category: categories.get(categoryId)?.name || '' };
+    const transferAccount = payees.get(line.payee)?.transfer_acct;
+    const person = owedAccountPerson(accounts.get(transferAccount)?.name);
+    return { id: line.id, amountCents: Math.abs(line.amount || 0), categoryId, category: categories.get(categoryId)?.name || '', ...(person ? { person } : {}) };
   });
   const splitCategoryIds = [...new Set((row.subtransactions || []).map((line) => line.category).filter(Boolean))];
   const categoryId = row.category || (splitCategoryIds.length === 1 ? splitCategoryIds[0] : null);
@@ -18,7 +20,7 @@ const normalize = (row, payees, accounts, categories) => {
     id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
     accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId,
     category: categories.get(categoryId)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
-    ...(splitTransactionIds.length ? { splitTransactionIds, splitLines } : {}),
+    ...(splitTransactionIds.length ? { splitTransactionIds, splitLines, splitWith: [...new Set(splitLines.map((line) => line.person).filter(Boolean))] } : {}),
   };
 };
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
@@ -28,7 +30,7 @@ const zonedDate = (time, timezone) => {
 };
 const monthEnd = (month) => `${month}-${new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0)).getUTCDate().toString().padStart(2, '0')}`;
 
-export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', timezone = 'America/Toronto', now = () => Date.now() } = {}) {
+export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'actual.lock'), currency = 'CAD', timezone = 'America/Toronto', owedAccountFormat = 'Owed by {name}', now = () => Date.now() } = {}) {
   if (!api || !dataDir) throw new Error('api and dataDir are required.');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const journalPath = path.join(dataDir, 'web-request-journal.json');
@@ -39,6 +41,11 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
   const runExclusive = (work) => {
     const guarded = () => withActualLock(lockPath, work);
     const next = queue.then(guarded, guarded); queue = next.catch(() => {}); return next;
+  };
+  const owedAccountPerson = (name = '') => {
+    const [prefix, suffix = ''] = owedAccountFormat.split('{name}');
+    if (!owedAccountFormat.includes('{name}') || !name.startsWith(prefix) || !name.endsWith(suffix)) return '';
+    return name.slice(prefix.length, suffix ? -suffix.length : undefined).trim();
   };
   async function sync(force = false) {
     if (force || now() - lastSync > 15_000) { await api.sync(); lastSync = now(); }
@@ -58,7 +65,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       rows.push(...await api.getTransactions(account.id, start, end));
     }
     const filtered = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
-      .map((row) => normalize(row, payees, accounts, categories))
+      .map((row) => normalize(row, payees, accounts, categories, owedAccountPerson))
       .filter((row) => !categoryId || (categoryId === '__uncategorized__' ? !row.categoryId : row.categoryId === categoryId))
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
       .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
@@ -78,7 +85,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     const end = new Date(Date.parse(`${date}T12:00:00Z`) + 5 * DAY_MS).toISOString().slice(0, 10);
     const raw = [];
     for (const account of accounts.values()) if (!account.closed && (!accountId || account.id === accountId)) raw.push(...await api.getTransactions(account.id, start, end));
-    const rows = unique(raw).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct).map((row) => normalize(row, payees, accounts, categories));
+    const rows = unique(raw).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct).map((row) => normalize(row, payees, accounts, categories, owedAccountPerson));
     const candidates = rows.map((row) => ({ id: row.id, date: row.date, amount: -row.amountCents, payee_name: row.merchant }));
     return findLikelyDuplicates(candidates, { merchant, total: amountCents / 100, date }).map((match) => rows.find((row) => row.id === match.id));
   }
@@ -99,6 +106,23 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden && !row.is_income).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
+    async shared() {
+      await sync(); const { accounts, payees } = await maps();
+      const people = [];
+      for (const account of accounts.values()) {
+        const name = owedAccountPerson(account.name);
+        if (!name) continue;
+        const rows = (await api.getTransactions(account.id, '1900-01-01', '2099-12-31')).sort((left, right) => String(left.date).localeCompare(String(right.date)) || String(left.id).localeCompare(String(right.id)));
+        const balanceCents = await api.getAccountBalance(account.id);
+        let runningBalanceCents = balanceCents - rows.reduce((total, row) => total + row.amount, 0);
+        const entries = rows.map((row) => {
+          runningBalanceCents += row.amount;
+          return { id: row.id, date: String(row.date), merchant: payees.get(row.payee)?.name || row.payee_name || '', note: row.notes || '', amountCents: Math.abs(row.amount), direction: row.amount >= 0 ? 'they_owe_you' : 'you_owe_them', runningBalanceCents };
+        }).reverse();
+        people.push({ id: account.id, name, balanceCents, direction: balanceCents >= 0 ? 'they_owe_you' : 'you_owe_them', entries });
+      }
+      return { people: people.sort((left, right) => Math.abs(right.balanceCents) - Math.abs(left.balanceCents) || left.name.localeCompare(right.name)) };
+    },
     async summary({ period, days = 90, force = false } = {}) {
       const range = period === 'all' ? null : Math.min(Math.max(Number(period || days) || 90, 1), 365);
       const end = zonedDate(now(), timezone); const start = range ? zonedDate(now() - (range - 1) * DAY_MS, timezone) : '1900-01-01';
