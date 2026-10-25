@@ -44,7 +44,7 @@ const allowed = (remote, rule) => {
 };
 const safeStaticPath = (pathname) => pathname === '/' ? 'index.html' : pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
 
-export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [], maxUploadBytes = 10 * 1024 * 1024 } = {}) {
+export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [], trustedRemotes = [], maxUploadBytes = 10 * 1024 * 1024 } = {}) {
   if (!auth || !staticDir) throw new Error('auth and staticDir are required.');
   const dispatch = {
     'GET /api/bootstrap': 'bootstrap',
@@ -62,6 +62,11 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     const remote = req.socket.remoteAddress || '';
     if (!allowed(remote, allowedRemote)) return json(res, 403, { error: 'Private network access required.' });
     const url = new URL(req.url, 'http://borton.local');
+    if (req.method === 'GET' && url.pathname === '/api/session') {
+      if (!allowed(remote, trustedRemotes)) return json(res, 401, { error: 'Password required.' });
+      const login = auth.trustedLogin();
+      return json(res, 200, { csrf: login.csrf }, { 'Set-Cookie': login.cookie });
+    }
     if (req.method === 'POST' && url.pathname === '/login') {
       try {
         const body = await readJson(req); const login = auth.login(body.password || '');

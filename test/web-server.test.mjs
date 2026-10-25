@@ -60,6 +60,19 @@ test('serves static assets and guards API routes with login, session and CSRF', 
   });
 });
 
+test('issues an automatic session only to configured trusted WireGuard remotes', async () => {
+  const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
+  await withServer({ auth, app: {}, staticDir: os.tmpdir(), allowedRemote: ['127.0.0.1'], trustedRemotes: ['127.0.0.1'] }, async (port) => {
+    const trusted = await request(port, { path: '/api/session' });
+    assert.equal(trusted.status, 200);
+    assert.ok(trusted.headers['set-cookie']);
+    assert.ok(JSON.parse(trusted.body).csrf);
+  });
+  await withServer({ auth, app: {}, staticDir: os.tmpdir(), allowedRemote: ['127.0.0.1'], trustedRemotes: ['10.88.111.5'] }, async (port) => {
+    assert.equal((await request(port, { path: '/api/session' })).status, 401);
+  });
+});
+
 test('shuts down despite an in-flight authenticated request', async () => {
   const staticDir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-web-'));
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');

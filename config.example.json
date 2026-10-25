@@ -18,6 +18,7 @@
     "host": "10.88.111.48",
     "port": 28456,
     "allowedRemote": ["10.88.111.0/24"],
+    "trustedAutoLoginRemote": ["10.88.111.5", "10.88.111.7", "10.0.0.3", "10.0.0.4"],
     "dataDir": "./actual-web-data",
     "maxUploadBytes": 10485760,
     "https": false

@@ -9,7 +9,7 @@ const equal = (left, right) => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 
-export function createWebAuth({ password, sessionSecret, now = () => Date.now(), randomBytes = systemRandomBytes, secure = false, ttlMs = DAY_MS } = {}) {
+export function createWebAuth({ password, sessionSecret, now = () => Date.now(), randomBytes = systemRandomBytes, secure = false, ttlMs = 30 * DAY_MS } = {}) {
   if (!password || !sessionSecret) throw new Error('Web password and session secret are required.');
   const sign = (value) => createHmac('sha256', sessionSecret).update(value).digest('base64url');
   const sessionCookie = (token) => `borton_session=${token}; Max-Age=${Math.floor(ttlMs / 1000)}; HttpOnly; SameSite=Strict; Path=/${secure ? '; Secure' : ''}`;
@@ -23,14 +23,18 @@ export function createWebAuth({ password, sessionSecret, now = () => Date.now(),
       return session.exp > now() && typeof session.id === 'string' ? session : null;
     } catch { return null; }
   };
-  return {
-    login(candidate) {
-      if (!equal(candidate, password)) return null;
+  const issueSession = () => {
       const session = { id: randomBytes(16).toString('base64url'), exp: now() + ttlMs };
       const payload = encode(JSON.stringify(session));
       const token = `${payload}.${sign(payload)}`;
       return { cookie: sessionCookie(token), csrf: sign(`csrf:${session.id}`), session };
+  };
+  return {
+    login(candidate) {
+      if (!equal(candidate, password)) return null;
+      return issueSession();
     },
+    trustedLogin() { return issueSession(); },
     verifySession,
     issueCsrf(session) { return session?.id ? sign(`csrf:${session.id}`) : null; },
     verifyCsrf(expected, given) { return !!expected && !!given && equal(expected, given); },
