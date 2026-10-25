@@ -56,7 +56,8 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
   const accountOwner = (name = '') => {
     const owners = cardmap.owners || {};
     const key = Object.keys(owners).find((candidate) => candidate.toLowerCase() === String(name).toLowerCase());
-    return key ? String(owners[key] || '').trim() : '';
+    if (key) return String(owners[key] || '').trim();
+    return String(name).match(/^(.+?)(?:'s|s)\s+\S/i)?.[1].trim() || '';
   };
   async function sync(force = false) {
     if (force || now() - lastSync > 15_000) { await api.sync(); lastSync = now(); }

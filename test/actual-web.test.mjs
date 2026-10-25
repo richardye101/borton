@@ -164,7 +164,7 @@ test('rebuilds an owner-paid transaction as a debt entry when splitting', async 
   const api = fakeActual([{ id: 'their-card', account: 'tia-card', date: '2026-10-21', amount: -1001, payee: 'p1', category: 'c1', notes: 'Dinner' }]);
   api.getAccounts = async () => [{ id: 'tia-card', name: 'Tias Mastercard', closed: false }, { id: 'owed-tia', name: 'Owed by Tia', closed: false }];
   api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
-  const web = createActualWeb({ api, dataDir: dir, cardmap: { owners: { 'Tias Mastercard': 'Tia' } }, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const result = await web.splitTransaction({ id: 'their-card', accountId: 'tia-card', date: '2026-10-21', person: 'Ignored' });
   assert.deepEqual(result, { status: 'complete', person: 'Tia', account: 'Owed by Tia', direction: 'you_owe_them' });
   assert.equal(api.writes[0].delete, 'their-card');
