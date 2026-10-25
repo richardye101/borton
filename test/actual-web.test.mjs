@@ -117,17 +117,20 @@ test('never replays an uncertain request and flags duplicate rows inside one bat
 test('shows a shared split category and applies a row category edit to every split line', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual([{ id: 'split', account: 'a1', date: '2026-10-21', amount: -3442, payee: 'p1', category: null, notes: 'Groceries split', subtransactions: [
-    { id: 'split-one', category: 'c1', amount: -1721 },
-    { id: 'split-two', category: null, amount: -1721 },
+    { id: 'split-one', category: 'c1', amount: -1721, payee: 'p1' },
+    { id: 'split-two', category: null, amount: -1721, payee: 'owed-tia' },
   ] }]);
+  api.getAccounts = async () => [{ id: 'a1', name: 'Visa', closed: false }, { id: 'owed-tia', name: 'Owed by Tia', closed: false }];
+  api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const row = (await web.findTransactions({ start: '2026-10-01', end: '2026-10-31' })).find((transaction) => transaction.id === 'split');
   assert.equal(row.category, 'Groceries');
   assert.deepEqual(row.splitTransactionIds, ['split-one', 'split-two']);
   assert.deepEqual(row.splitLines, [
     { id: 'split-one', amountCents: 1721, categoryId: 'c1', category: 'Groceries' },
-    { id: 'split-two', amountCents: 1721, categoryId: null, category: '' },
+    { id: 'split-two', amountCents: 1721, categoryId: null, category: '', person: 'Tia', account: 'Owed by Tia' },
   ]);
+  assert.deepEqual(row.splitDetails, [{ person: 'Tia', account: 'Owed by Tia', amountCents: 1721, direction: 'they_owe_you' }]);
   await web.editTransaction({ id: 'split', merchant: 'Corner Store', amountCents: 3442, date: '2026-10-21', accountId: 'a1', categoryId: 'c1', note: 'Groceries split', splitTransactionIds: row.splitTransactionIds });
   assert.deepEqual(api.writes.slice(-3), [
     { id: 'split', fields: { date: '2026-10-21', amount: -3442, payee: 'p1', notes: 'Groceries split', account: 'a1', category: 'c1' } },

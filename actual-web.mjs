@@ -11,16 +11,21 @@ const normalize = (row, payees, accounts, categories, owedAccountPerson) => {
   const splitLines = (row.subtransactions || []).map((line) => {
     const categoryId = line.category || null;
     const transferAccount = payees.get(line.payee)?.transfer_acct;
-    const person = owedAccountPerson(accounts.get(transferAccount)?.name);
-    return { id: line.id, amountCents: Math.abs(line.amount || 0), categoryId, category: categories.get(categoryId)?.name || '', ...(person ? { person } : {}) };
+    const account = accounts.get(transferAccount)?.name || '';
+    const person = owedAccountPerson(account);
+    return { id: line.id, amountCents: Math.abs(line.amount || 0), categoryId, category: categories.get(categoryId)?.name || '', ...(person ? { person, account } : {}) };
   });
   const splitCategoryIds = [...new Set((row.subtransactions || []).map((line) => line.category).filter(Boolean))];
   const categoryId = row.category || (splitCategoryIds.length === 1 ? splitCategoryIds[0] : null);
+  const splitDetails = splitLines.filter((line) => line.person).map(({ person, account, amountCents }) => ({ person, account, amountCents, direction: 'they_owe_you' }));
+  const debtAccount = accounts.get(row.account)?.name || '';
+  const debtPerson = owedAccountPerson(debtAccount);
   return {
     id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
     accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId,
     category: categories.get(categoryId)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
-    ...(splitTransactionIds.length ? { splitTransactionIds, splitLines, splitWith: [...new Set(splitLines.map((line) => line.person).filter(Boolean))] } : {}),
+    ...(splitTransactionIds.length ? { splitTransactionIds, splitLines, splitWith: [...new Set(splitLines.map((line) => line.person).filter(Boolean))], ...(splitDetails.length ? { splitDetails } : {}) } : {}),
+    ...(debtPerson ? { debt: { person: debtPerson, account: debtAccount, amountCents: Math.abs(row.amount), direction: row.amount >= 0 ? 'they_owe_you' : 'you_owe_them' } } : {}),
   };
 };
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
