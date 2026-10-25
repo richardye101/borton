@@ -7,9 +7,15 @@
   "scripts": {
     "start": "node bot.mjs",
     "chatid": "node tools/get-chat-id.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "build": "vite build"
   },
   "dependencies": {
     "@actual-app/api": "26.8.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "5.1.1",
+    "svelte": "5.57.2",
+    "vite": "6.4.5"
   }
 }

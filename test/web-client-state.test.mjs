@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createSummaryCache } from '../web/client-state.mjs';
+import { createSummaryCache } from '../frontend/src/lib/client-state.js';
 
 test('reuses cached summaries until refresh or an expense write clears them', () => {
   const cache = createSummaryCache();

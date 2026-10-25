@@ -192,10 +192,16 @@ BORTON_WEB_SESSION_SECRET=use-a-random-long-secret
 Install the unit and start it on the LXC:
 
 ```bash
+npm ci
 install -m 644 borton-web.service /etc/systemd/system/borton-web.service
 systemctl daemon-reload
 systemctl enable --now borton-web
 ```
+
+The web interface is a Svelte app compiled locally into `web/`. The unit runs
+`npm run build` before starting Node, so after an update install dependencies with `npm ci`,
+copy the service file again if it changed, run `systemctl daemon-reload`, then restart
+`borton-web`.
 
 Open `http://<private-LXC-IP>:28456` from a WireGuard-connected device. The service binds only to
 the configured private network and requires its own password; it does not need a public URL.

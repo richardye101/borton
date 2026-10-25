@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=/root/borton
+ExecStartPre=/usr/bin/npm run build
 ExecStart=/usr/bin/node web.mjs
 Restart=always
 RestartSec=5

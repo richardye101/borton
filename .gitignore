@@ -8,3 +8,4 @@ cardmap.json
 npm-debug.log*
 .DS_Store
 .worktrees/
+web/
