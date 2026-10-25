@@ -16,7 +16,8 @@ REMOTE=$(git rev-parse origin/main)
 
 echo "Deploying $LOCAL -> $REMOTE"
 git reset --hard origin/main
-npm ci --omit=dev 2>/dev/null || npm install # only re-resolves if deps changed; cheap otherwise
+npm ci
+npm run build
 
 START=$(date '+%Y-%m-%d %H:%M:%S')
 systemctl restart "$SERVICE"
@@ -43,7 +44,9 @@ if [ "$healthy" = 1 ]; then
 else
   echo "FAILED health check ($TIMEOUT s) — rolling back to $LOCAL"
   git reset --hard "$LOCAL"
-  npm ci --omit=dev 2>/dev/null || npm install
+  npm ci
+  npm run build
   systemctl restart "$SERVICE"
+  if [ "$WEB_ENABLED" = 1 ]; then systemctl restart borton-web; fi
   exit 1                                       # marks borton-deploy.service failed in the journal
 fi

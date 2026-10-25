@@ -1,7 +1,7 @@
 # Auto-deploy (poll + self-heal)
 
-Keeps the LXC's `receipt-bot` in sync with `origin/main`: polls every 60s, and on a new
-commit pulls, restarts, **waits for the bot to report it's up**, and **rolls back** to the
+Keeps the LXC's `receipt-bot` and enabled Borton Web service in sync with `origin/main`: polls every 60s, and on a new
+commit pulls, installs dependencies, builds the Svelte web app, restarts, **waits for the bot to report it's up**, and **rolls back** to the
 previous commit if it doesn't come up healthy within 30s.
 
 ## Install (run on the LXC, once)
