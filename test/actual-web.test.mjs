@@ -18,6 +18,7 @@ function fakeActual() {
     async getTransactions(account) { return transactions.filter((row) => row.account === account); },
     async createPayee({ name }) { const payee = { id: `p${payees.length + 1}`, name }; payees.push(payee); return payee.id; },
     async addTransactions(account, rows) { writes.push({ account, rows }); },
+    async updateTransaction(id, fields) { writes.push({ id, fields }); return [{ id, ...fields }]; },
   };
 }
 
@@ -78,6 +79,16 @@ test('writes an acknowledged batch once and reuses one normalized payee', async 
   assert.equal(api.writes.length, 2);
   assert.equal((await api.getPayees()).filter((payee) => payee.name.toLowerCase() === 'fresh shop').length, 1);
   assert.deepEqual(await web.submitBatch({ requestId: 'request-0001', rows }), first);
+});
+
+test('edits an expense with validated fields and a normalized payee', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual();
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const result = await web.editTransaction({ id: 'old', merchant: 'Fresh Shop', amountCents: 1500, date: '2026-10-24', accountId: 'a1', categoryId: 'c1', note: 'Weekly groceries' });
+  assert.deepEqual(result, { status: 'complete', id: 'old' });
+  assert.deepEqual(api.writes.at(-1), { id: 'old', fields: { date: '2026-10-24', amount: -1500, payee: 'p3', notes: 'Weekly groceries', account: 'a1', category: 'c1' } });
+  await assert.rejects(web.editTransaction({ id: 'old', merchant: '', amountCents: 0, date: 'invalid', accountId: 'missing', categoryId: 'missing' }), /valid expense/);
 });
 
 test('never replays an uncertain request and flags duplicate rows inside one batch', async () => {

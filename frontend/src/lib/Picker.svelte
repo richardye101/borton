@@ -19,7 +19,7 @@
 </script>
 
 <label class="picker">
-  <span>{label}</span>
+  {#if label}<span>{label}</span>{/if}
   <span class="picker-control">
     <input bind:value {placeholder} {required} autocomplete="off" on:focus={() => open = true} on:input={() => open = true} on:keydown={(event) => event.key === 'Escape' && (open = false)} on:blur={() => setTimeout(() => open = false, 150)} />
     {#if open}

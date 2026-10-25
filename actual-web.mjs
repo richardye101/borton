@@ -103,6 +103,21 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
+    editTransaction({ id, merchant, amountCents, date, accountId, categoryId, note = '' } = {}) {
+      return runExclusive(async () => {
+        if (typeof id !== 'string' || !id || !String(merchant || '').trim() || !Number.isSafeInteger(amountCents) || amountCents <= 0 || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Enter valid expense details.');
+        await sync();
+        const { accounts, categories, payeeRows } = await maps();
+        if (!accounts.get(accountId) || accounts.get(accountId).closed || !categories.has(categoryId)) throw error('Choose a valid account and category.');
+        const name = String(merchant).trim();
+        let payee = payeeRows.find((row) => row.name.toLowerCase() === name.toLowerCase());
+        if (!payee) payee = { id: await api.createPayee({ name }), name };
+        const updated = await api.updateTransaction(id, { date, amount: -amountCents, payee: payee.id, notes: String(note || '').trim(), account: accountId, category: categoryId });
+        if (Array.isArray(updated) && !updated.length) throw error('Actual could not update this transaction.');
+        await api.sync(); lastSync = now();
+        return { status: 'complete', id };
+      });
+    },
     submitBatch({ requestId, rows }) {
       return runExclusive(async () => {
         if (!/^[A-Za-z0-9_-]{8,128}$/.test(requestId || '')) throw error('Invalid request ID.');

@@ -7,6 +7,7 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
   return {
     bootstrap: () => actual.bootstrap(),
     transactions: (query) => actual.findTransactions(query),
+    editTransaction: (payload) => actual.editTransaction(payload),
     summary: (query) => actual.summary(query),
     duplicates: (row) => actual.checkDuplicates(row),
     validateBatch: (payload) => actual.validateBatch(payload),

@@ -49,6 +49,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
   const dispatch = {
     'GET /api/bootstrap': 'bootstrap',
     'GET /api/transactions': 'transactions',
+    'POST /api/transactions/edit': 'editTransaction',
     'GET /api/summary': 'summary',
     'POST /api/duplicates': 'duplicates',
     'POST /api/extract': 'extract',
