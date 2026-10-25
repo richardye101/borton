@@ -131,7 +131,7 @@
     editingId = row.id;
     editSource = source;
     editError = '';
-    edit = { id: row.id, date: row.date, merchant: row.merchant, amount: (row.amountCents / 100).toFixed(2), account: itemName(accounts, row.accountId), category: itemName(categories, row.categoryId), note: row.note || '' };
+    edit = { id: row.id, date: row.date, merchant: row.merchant, amount: (row.amountCents / 100).toFixed(2), account: itemName(accounts, row.accountId), category: itemName(categories, row.categoryId), note: row.note || '', splitTransactionIds: row.splitTransactionIds || [] };
     await tick();
     document.getElementById(`edit-${row.id}-${field}`)?.focus();
   }
@@ -167,7 +167,7 @@
     savingEdit = true;
     try {
       const savedMerchant = edit.merchant.trim();
-      await request('/api/transactions/edit', { csrf, method: 'POST', body: { id: edit.id, merchant: savedMerchant, amountCents, date: edit.date, accountId, categoryId, note: edit.note } });
+      await request('/api/transactions/edit', { csrf, method: 'POST', body: { id: edit.id, merchant: savedMerchant, amountCents, date: edit.date, accountId, categoryId, note: edit.note, splitTransactionIds: edit.splitTransactionIds } });
       const source = editSource;
       summaryCache.clear();
       cancelEdit();

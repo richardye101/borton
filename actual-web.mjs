@@ -6,11 +6,17 @@ import { withActualLock } from './actual-lock.mjs';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const JOURNAL_TTL = DAY_MS;
 const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()];
-const normalize = (row, payees, accounts, categories) => ({
-  id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
-  accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId: row.category || null,
-  category: categories.get(row.category)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
-});
+const normalize = (row, payees, accounts, categories) => {
+  const splitTransactionIds = (row.subtransactions || []).map((line) => line.id).filter((id) => typeof id === 'string');
+  const splitCategoryIds = [...new Set((row.subtransactions || []).map((line) => line.category).filter(Boolean))];
+  const categoryId = row.category || (splitCategoryIds.length === 1 ? splitCategoryIds[0] : null);
+  return {
+    id: row.id, date: String(row.date), amountCents: Math.abs(row.amount), merchant: payees.get(row.payee)?.name || row.payee_name || '',
+    accountId: row.account, account: accounts.get(row.account)?.name || '', categoryId,
+    category: categories.get(categoryId)?.name || '', note: row.notes || '', cleared: !!row.cleared, isExpense: row.amount < 0,
+    ...(splitTransactionIds.length ? { splitTransactionIds } : {}),
+  };
+};
 const error = (message, statusCode = 400) => Object.assign(new Error(message), { statusCode });
 const zonedDate = (time, timezone) => {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date(time));
@@ -103,9 +109,10 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
-    editTransaction({ id, merchant, amountCents, date, accountId, categoryId, note = '' } = {}) {
+    editTransaction({ id, merchant, amountCents, date, accountId, categoryId, note = '', splitTransactionIds = [] } = {}) {
       return runExclusive(async () => {
         if (typeof id !== 'string' || !id || !String(merchant || '').trim() || !Number.isSafeInteger(amountCents) || amountCents <= 0 || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Enter valid expense details.');
+        if (!Array.isArray(splitTransactionIds) || splitTransactionIds.length > 100 || splitTransactionIds.some((lineId) => typeof lineId !== 'string' || !lineId || lineId === id)) throw error('Invalid split transaction details.');
         await sync();
         const { accounts, categories, payeeRows } = await maps();
         if (!accounts.get(accountId) || accounts.get(accountId).closed || !categories.has(categoryId)) throw error('Choose a valid account and category.');
@@ -114,6 +121,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         if (!payee) payee = { id: await api.createPayee({ name }), name };
         const updated = await api.updateTransaction(id, { date, amount: -amountCents, payee: payee.id, notes: String(note || '').trim(), account: accountId, category: categoryId });
         if (Array.isArray(updated) && !updated.length) throw error('Actual could not update this transaction.');
+        for (const lineId of splitTransactionIds) await api.updateTransaction(lineId, { category: categoryId });
         await api.sync(); lastSync = now();
         return { status: 'complete', id };
       });
