@@ -86,7 +86,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     runExclusive,
     async bootstrap() {
       const [{ accounts, categories }, rows] = await Promise.all([maps(), transactions({})]);
-      return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed && !row.offbudget).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
+      return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed && !row.offbudget).map((row) => ({ id: row.id, name: row.name })), categories: [...categories.values()].filter((row) => !row.hidden && !row.is_income).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
     async summary({ period, days = 90, force = false } = {}) {
