@@ -23,6 +23,11 @@
   let summaryPeriod = '90';
   let summaryData = null;
   let summaryDetail = null;
+  let summaryDetailFilters = null;
+  let summaryUpdatedAt = null;
+  let recentUpdatedAt = null;
+  let detailAccount = '';
+  let detailCategory = '';
   const summaryCache = createSummaryCache();
 
   onMount(async () => {
@@ -46,7 +51,7 @@
 
   async function loadBoot() {
     boot = await request('/api/bootstrap', { csrf });
-    transactions = boot.transactions;
+    transactions = boot.transactions; recentUpdatedAt = new Date();
     show(view);
   }
 
@@ -113,13 +118,22 @@
 
   async function loadSummary(force = false) {
     summaryDetail = null;
+    summaryDetailFilters = null;
     let data = summaryCache.get(summaryPeriod);
     if (!data || force) { data = await request(`/api/summary?period=${summaryPeriod}${force ? '&force=true' : ''}`, { csrf }); summaryCache.set(summaryPeriod, data); }
-    summaryData = data;
+    summaryData = data; summaryUpdatedAt = new Date();
   }
 
   async function openDetail(filters) {
-    const data = await request(`/api/transactions?paged=true&limit=100&${new URLSearchParams(filters)}`, { csrf });
+    summaryDetailFilters = { ...filters };
+    detailAccount = itemName(accounts, filters.accountId); detailCategory = itemName(categories, filters.categoryId);
+    const data = await request(`/api/transactions?paged=true&limit=100&${new URLSearchParams(summaryDetailFilters)}`, { csrf });
+    summaryDetail = data.rows;
+  }
+
+  async function updateSummaryDetail() {
+    if (!summaryDetailFilters) return;
+    const data = await request(`/api/transactions?paged=true&limit=100&${new URLSearchParams(summaryDetailFilters)}`, { csrf });
     summaryDetail = data.rows;
   }
 
@@ -136,21 +150,21 @@
   </main>
 {:else}
   <main class="shell">
-    <aside><h1>Borton</h1><small>Synced {new Date(boot.syncedAt).toLocaleTimeString()}</small><nav><span>View</span><button class:active={view === 'home'} on:click={() => show('home')}>Home</button><button class:active={view === 'summary'} on:click={() => show('summary')}>Summary</button><span>Actions</span><button class:active={view === 'add'} on:click={() => show('add')}>＋ Add expense</button><button class:active={view === 'check'} on:click={() => show('check')}>Check an expense</button></nav></aside>
-    <section class="main"><header><div class="mobile-nav"><button on:click={() => show('home')}>Home</button><button on:click={() => show('summary')}>Summary</button></div><button on:click={() => chatOpen = true}>◌ Chat</button></header>
+    <aside><h1>Borton</h1><small>Synced {new Date(boot.syncedAt).toLocaleTimeString()}</small><nav><span>View</span><button class:active={view === 'home'} on:click={() => show('home')}>Home</button><button class:active={view === 'summary'} on:click={() => show('summary')}>Summary</button><span>Actions</span><button class:nav-action class:active={view === 'add'} on:click={() => show('add')}><b aria-hidden="true">＋</b><span>Add expense</span></button><button class:nav-action class:active={view === 'check'} on:click={() => show('check')}><b aria-hidden="true">⌕</b><span>Check an expense</span></button></nav></aside>
+    <section class="main"><header><div class="mobile-nav"><button on:click={() => show('home')}>Home</button><button on:click={() => show('summary')}>Summary</button></div><button class="chat-trigger" on:click={() => chatOpen = true} aria-label="Open chat" title="Chat"><span aria-hidden="true">◌</span></button></header>
 
       {#if view === 'home'}
-        <section class="card"><div class="toolbar page-toolbar"><h2>Recent expenses</h2><div class="toolbar-actions"><button class="secondary" class:pressed={hideAmounts} on:click={toggleAmounts}>{hideAmounts ? 'Show amounts' : 'Hide amounts'}</button><button class="secondary" on:click={loadBoot}>Refresh</button></div></div>
-          <section class="quick-add"><h3>Quick add</h3><form on:submit|preventDefault={addQuickExpense}><div class="quick-fields"><label>Merchant<input bind:value={quick.merchant} placeholder="Merchant" required></label><label>Amount<input bind:value={quick.amount} placeholder="Amount" inputmode="decimal" required></label><label>Date<input bind:value={quick.date} type="date" required></label><Picker label="Paid from" items={accounts} bind:value={quick.account} placeholder="Search accounts" required /><Picker label="Category" items={categories} bind:value={quick.category} placeholder="Search categories" required /></div><label class="quick-note">Notes<textarea bind:value={quick.note} rows="3" placeholder="What was this for?"></textarea><DictationButton bind:value={quick.note} /></label><div class="quick-actions"><button>Add expense</button>{#if quickError}<output class="error">{quickError}</output>{/if}</div></form></section>
+        <section class="card"><div class="toolbar page-toolbar"><h2>Recent expenses</h2><div class="toolbar-actions"><button class="icon-button" class:pressed={hideAmounts} on:click={toggleAmounts} aria-label={hideAmounts ? 'Show amounts' : 'Hide amounts'} title={hideAmounts ? 'Show amounts' : 'Hide amounts'}>{hideAmounts ? '◉' : '◌'}</button><button class="icon-button" on:click={loadBoot} aria-label="Refresh recent expenses" title={`Updated ${new Date(boot.syncedAt).toLocaleString()}`}>↻</button>{#if recentUpdatedAt}<small class="updated">Updated {recentUpdatedAt.toLocaleString()}</small>{/if}</div></div>
+          <section class="quick-add"><h3>Quick add</h3><form on:submit|preventDefault={addQuickExpense}><div class="quick-fields"><label>Merchant<input bind:value={quick.merchant} placeholder="Merchant" required></label><label>Amount<input bind:value={quick.amount} placeholder="Amount" inputmode="decimal" required></label><label>Date<input bind:value={quick.date} type="date" required></label><Picker label="Paid from" items={accounts} bind:value={quick.account} placeholder="Search accounts" required /><Picker label="Category" items={categories} bind:value={quick.category} placeholder="Search categories" required /></div><label class="quick-note">Notes<textarea bind:value={quick.note} rows="3" placeholder="What was this for?"></textarea><DictationButton bind:value={quick.note} {csrf} /></label><div class="quick-actions"><button>Add expense</button>{#if quickError}<output class="error">{quickError}</output>{/if}</div></form></section>
           <div class="toolbar search-bar"><input bind:value={search} placeholder="Search merchant or notes"><button on:click={searchTransactions}>Search</button></div>
           <table class="transactions"><thead><tr><th>Date</th><th>Merchant</th><th>Account</th><th>Category</th><th>Notes</th><th class="amount">Amount</th></tr></thead><tbody>{#each transactions as row}<tr><td>{row.date}</td><td>{row.merchant}</td><td>{row.account}</td><td>{row.category}</td><td>{row.note || '—'}</td><td class="amount">{money(row.amountCents)}</td></tr>{:else}<tr><td colspan="6" class="muted">No transactions found.</td></tr>{/each}</tbody></table>
         </section>
       {:else if view === 'summary'}
-        <section class="card"><div class="toolbar page-toolbar"><h2>Summary</h2><div class="toolbar-actions"><select bind:value={summaryPeriod} on:change={() => loadSummary()}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last 12 months</option><option value="all">All time</option></select><button class="secondary" class:pressed={hideAmounts} on:click={toggleAmounts}>{hideAmounts ? 'Show amounts' : 'Hide amounts'}</button><button class="secondary" on:click={() => loadSummary(true)}>Refresh</button></div></div>
-          {#if summaryDetail}<button class="secondary" on:click={() => summaryDetail = null}>← Summary</button><table class="transactions"><tbody>{#each summaryDetail as row}<tr><td>{row.date}</td><td>{row.merchant}</td><td>{row.note}</td><td class="amount">{money(row.amountCents)}</td></tr>{/each}</tbody></table>{:else if summaryData}<div class="summary-total"><span>{summaryData.start} to {summaryData.end}</span><strong>{money(summaryData.totalCents)}</strong><small>{summaryData.count} expenses</small></div><div class="breakdown-grid">{#each [['Category', summaryData.byCategory], ['Account', summaryData.byAccount], ['Month', summaryData.byMonth]] as [title, rows]}<article><h3>{title}</h3><ol>{#each rows as row}<li><button on:click={() => openDetail(row.filters)}><span>{row.name} <small>({row.count})</small></span><strong>{money(row.amountCents)}</strong></button></li>{/each}</ol></article>{/each}</div>{:else}<p class="muted">Loading…</p>{/if}
+        <section class="card"><div class="toolbar page-toolbar"><h2>Summary</h2><div class="toolbar-actions"><button class="icon-button" class:pressed={hideAmounts} on:click={toggleAmounts} aria-label={hideAmounts ? 'Show amounts' : 'Hide amounts'} title={hideAmounts ? 'Show amounts' : 'Hide amounts'}>{hideAmounts ? '◉' : '◌'}</button><button class="icon-button" on:click={() => loadSummary(true)} aria-label="Refresh summary" title={summaryUpdatedAt ? `Updated ${summaryUpdatedAt.toLocaleString()}` : 'Refresh summary'}>↻</button>{#if summaryUpdatedAt}<small class="updated">Updated {summaryUpdatedAt.toLocaleString()}</small>{/if}</div></div>
+          {#if summaryDetail}<div class="summary-detail-heading"><button class="back-title" on:click={() => { summaryDetail = null; summaryDetailFilters = null; }} aria-label="Back to summary">← <span>Summary</span></button><label>From<input bind:value={summaryDetailFilters.start} type="date" on:change={updateSummaryDetail}></label><label>To<input bind:value={summaryDetailFilters.end} type="date" on:change={updateSummaryDetail}></label><Picker label="Account" items={accounts} bind:value={detailAccount} placeholder="All accounts" on:change={() => { summaryDetailFilters.accountId = matchItem(accounts, detailAccount)?.id || ''; updateSummaryDetail(); }} /><Picker label="Category" items={categories} bind:value={detailCategory} placeholder="All categories" on:change={() => { summaryDetailFilters.categoryId = matchItem(categories, detailCategory)?.id || ''; updateSummaryDetail(); }} /><button class="secondary" on:click={updateSummaryDetail}>Apply</button></div><table class="transactions"><tbody>{#each summaryDetail as row}<tr><td>{row.date}</td><td>{row.merchant}</td><td>{row.note}</td><td class="amount">{money(row.amountCents)}</td></tr>{/each}</tbody></table>{:else if summaryData}<div class="summary-period"><label>Period<select bind:value={summaryPeriod} on:change={() => loadSummary()}><option value="30">Last 30 days</option><option value="90">Last 90 days</option><option value="365">Last 12 months</option><option value="all">All time</option></select></label></div><div class="summary-total"><span>{summaryData.start} to {summaryData.end}</span><strong>{money(summaryData.totalCents)}</strong><small>{summaryData.count} expenses</small></div><div class="breakdown-grid">{#each [['Category', summaryData.byCategory], ['Account', summaryData.byAccount], ['Month', summaryData.byMonth]] as [title, rows]}<article><h3>{title}</h3><ol>{#each rows as row}<li><button on:click={() => openDetail(row.filters)}><span>{row.name} <small>({row.count})</small></span><strong>{money(row.amountCents)}</strong></button></li>{/each}</ol></article>{/each}</div>{:else}<p class="muted">Loading…</p>{/if}
         </section>
       {:else if view === 'add'}
-        <section class="card"><h2>Review expenses</h2>{#if batch.length}<section class="batch">{#each batch as row, index (row.clientId)}<article class="receipt"><label>Merchant<input bind:value={row.merchant}></label><label>Amount<input bind:value={row.amount} inputmode="decimal"></label><label>Date<input bind:value={row.date} type="date"></label><Picker label="Paid from" items={accounts} bind:value={row.account} placeholder="Search accounts" /><Picker label="Category" items={categories} bind:value={row.category} placeholder="Search categories" /><label class="receipt-note">Notes<textarea bind:value={row.note} rows="2"></textarea><DictationButton bind:value={row.note} /></label>{#if row.duplicates?.length}<label class="duplicate-choice">Likely duplicate <input bind:checked={row.duplicateAcknowledged} type="checkbox"> intentionally new</label>{/if}</article>{/each}</section><button on:click={saveBatch}>Save expenses</button>{#if quickError}<output class="error">{quickError}</output>{/if}{:else}<p class="muted">Use Check an expense to upload a receipt, or add one from Home.</p>{/if}</section>
+        <section class="card"><h2>Review expenses</h2>{#if batch.length}<section class="batch">{#each batch as row, index (row.clientId)}<article class="receipt"><label>Merchant<input bind:value={row.merchant}></label><label>Amount<input bind:value={row.amount} inputmode="decimal"></label><label>Date<input bind:value={row.date} type="date"></label><Picker label="Paid from" items={accounts} bind:value={row.account} placeholder="Search accounts" /><Picker label="Category" items={categories} bind:value={row.category} placeholder="Search categories" /><label class="receipt-note">Notes<textarea bind:value={row.note} rows="2"></textarea><DictationButton bind:value={row.note} {csrf} /></label>{#if row.duplicates?.length}<label class="duplicate-choice">Likely duplicate <input bind:checked={row.duplicateAcknowledged} type="checkbox"> intentionally new</label>{/if}</article>{/each}</section><button on:click={saveBatch}>Save expenses</button>{#if quickError}<output class="error">{quickError}</output>{/if}{:else}<p class="muted">Use Check an expense to upload a receipt, or add one from Home.</p>{/if}</section>
       {:else if view === 'check'}
         <section class="card"><h2>Check an expense</h2><p>Upload a receipt or ask Chat when you only remember part of it.</p><form on:submit|preventDefault={extractReceipt}><input name="image" type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" required><button>Read receipt</button>{#if quickError}<output class="error">{quickError}</output>{/if}</form><details><summary>Enter known details</summary><button on:click={() => chatOpen = true}>Ask in Chat</button></details></section>
       {/if}

@@ -13,3 +13,8 @@ test('turns extracted receipts into editable rows with duplicate candidates', as
   assert.equal(result.rows.length, 1);
   assert.deepEqual(result.rows[0], { clientId: result.rows[0].clientId, merchant: 'Coffee', amountCents: 500, date: '2026-10-24', accountId: 'a1', categoryId: 'c1', note: 'Coffee', duplicateAcknowledged: false, duplicates: [{ id: 'existing', merchant: 'Coffee', amountCents: 500 }], status: 'check_required' });
 });
+
+test('passes recorded audio to its configured transcriber', async () => {
+  const app = createWebApplication({ actual: {}, extractor: {}, transcriber: { transcribe: async (buffer, mime) => ({ text: `${mime}:${buffer.toString()}` }) } });
+  assert.deepEqual(await app.transcribe({ buffer: Buffer.from('note'), mime: 'audio/webm' }), { text: 'audio/webm:note' });
+});
