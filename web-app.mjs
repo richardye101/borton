@@ -2,7 +2,7 @@ import { normalizeReceipts } from './receipt-utils.mjs';
 
 const clientId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-export function createWebApplication({ actual, extractor, cardmap = {}, fallbackCategory = 'General', assistant } = {}) {
+export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant } = {}) {
   if (!actual || !extractor) throw new Error('actual and extractor are required.');
   return {
     bootstrap: () => actual.bootstrap(),
@@ -24,6 +24,10 @@ export function createWebApplication({ actual, extractor, cardmap = {}, fallback
         return { ...row, duplicates, status: !row.accountId || !row.categoryId || !row.date ? 'invalid' : duplicates.length ? 'check_required' : 'ready' };
       }));
       return { rows };
+    },
+    transcribe: ({ buffer, mime }) => {
+      if (!transcriber) throw new Error('Audio transcription is unavailable.');
+      return transcriber.transcribe(buffer, mime);
     },
     assistantMessage: (payload) => assistant?.message(payload.text),
     assistantConfirm: (payload) => assistant?.confirm(payload.planId),

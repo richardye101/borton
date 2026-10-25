@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createActualWeb } from './actual-web.mjs';
 import { createReceiptExtractor } from './receipt-extractor.mjs';
+import { createAudioTranscriber } from './audio-transcriber.mjs';
 import { createWebApplication } from './web-app.mjs';
 import { createWebAgent } from './web-agent.mjs';
 import { createGeminiGenerate } from './agent.mjs';
@@ -45,7 +46,7 @@ const generate = async (parts, responseSchema) => {
 const cardmap = fs.existsSync(path.join(root, 'cardmap.json')) ? JSON.parse(fs.readFileSync(path.join(root, 'cardmap.json'), 'utf8')) : {};
 const actual = createActualWeb({ api: actualApi, dataDir, lockPath: path.resolve(root, cfg.actual.dataDir, 'actual.lock'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto' });
 const assistant = createWebAgent({ api: actualApi, generate: createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY, models }), statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
-const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant });
+const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber: createAudioTranscriber({ generate, maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 }), cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant });
 const auth = createWebAuth({ password: process.env.BORTON_WEB_PASSWORD, sessionSecret: process.env.BORTON_WEB_SESSION_SECRET, secure: web.https === true });
 const server = createWebServer({ auth, app, staticDir: path.join(root, 'web'), allowedRemote: web.allowedRemote || ['127.0.0.1'], trustedRemotes: web.trustedAutoLoginRemote || [], maxUploadBytes: web.maxUploadBytes || 10 * 1024 * 1024 });
 server.listen(web.port || 28456, web.host || '127.0.0.1', () => console.log(`Borton Web listening on http://${web.host || '127.0.0.1'}:${web.port || 28456}`));

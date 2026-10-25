@@ -37,7 +37,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');
   fs.writeFileSync(path.join(staticDir, 'client-state.mjs'), 'export const Borton = true;');
   const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
-  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }) };
+  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }) };
   await withServer({ auth, app, staticDir, allowedRemote: ['127.0.0.1'] }, async (port) => {
     const page = await request(port);
     assert.equal(page.status, 200);
@@ -62,6 +62,11 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const summary = await request(port, { path: '/api/summary?days=30', headers: { cookie } });
     assert.equal(summary.status, 200);
     assert.deepEqual(JSON.parse(summary.body), { days: 30, totalCents: 1234 });
+    const boundary = 'borton-audio-boundary';
+    const audioBody = `--${boundary}\r\nContent-Disposition: form-data; name="audio"; filename="note.webm"\r\nContent-Type: audio/webm\r\n\r\nspoken note\r\n--${boundary}--\r\n`;
+    const transcript = await request(port, { method: 'POST', path: '/api/transcribe', headers: { cookie, 'x-csrf-token': csrf, 'content-type': `multipart/form-data; boundary=${boundary}` }, body: audioBody });
+    assert.equal(transcript.status, 200);
+    assert.deepEqual(JSON.parse(transcript.body), { text: 'audio/webm:spoken note' });
     assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
     assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf, origin: 'http://evil.example' }, body: '{}' })).status, 403);
     assert.equal(bootstrap.headers['cache-control'], 'no-store');

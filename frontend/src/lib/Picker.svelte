@@ -1,9 +1,11 @@
 <script>
+  import { createEventDispatcher } from 'svelte';
   export let label;
   export let items = [];
   export let value = '';
   export let placeholder = 'Search';
   export let required = false;
+  const dispatch = createEventDispatcher();
   let open = false;
 
   $: query = value.trim().toLocaleLowerCase();
@@ -12,6 +14,7 @@
   function choose(item) {
     value = item.name;
     open = false;
+    dispatch('change', { value });
   }
 </script>
 
