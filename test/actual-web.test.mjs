@@ -166,6 +166,19 @@ test('shows a person ledger and running balance from an owed account', async () 
   });
 });
 
+test('attaches an owner-paid shared debt to its expense row', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([
+    { id: 'tia-paid', account: 'tia-card', date: '2026-10-21', amount: -1000, payee: 'p1', category: 'c1', notes: 'Dinner · Tia paid' },
+    { id: 'owed-tia', account: 'owed-tia', date: '2026-10-21', amount: -500, payee: 'p1', category: 'c1', notes: 'Dinner · your share — Tia paid' },
+  ]);
+  api.getAccounts = async () => [{ id: 'tia-card', name: 'Tias Wealthsimple VIP', closed: false }, { id: 'owed-tia', name: 'Owed by Tia', closed: false }];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const rows = await web.findTransactions({ start: '2026-10-21', end: '2026-10-21' });
+  assert.deepEqual(rows.map((row) => row.id), ['tia-paid']);
+  assert.deepEqual(rows[0].sharedDebt, { person: 'Tia', account: 'Owed by Tia', amountCents: 500, direction: 'you_owe_them' });
+});
+
 test('rebuilds an owner-paid transaction as a debt entry when splitting', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual([{ id: 'their-card', account: 'tia-card', date: '2026-10-21', amount: -1001, payee: 'p1', category: 'c1', notes: 'Dinner' }]);
@@ -176,7 +189,7 @@ test('rebuilds an owner-paid transaction as a debt entry when splitting', async 
   assert.deepEqual(result, { status: 'complete', direction: 'you_owe_them', person: 'Tia', shares: [{ person: 'Tia', account: 'Owed by Tia', amountCents: 501 }] });
   assert.equal(api.writes[0].delete, 'their-card');
   assert.deepEqual(api.writes.slice(1).map(({ account, rows }) => ({ account, rows: rows.map((row) => ({ amount: row.amount, payee: row.payee, category: row.category, notes: row.notes })) })), [
-    { account: 'tia-card', rows: [{ amount: -1001, payee: 'p1', category: undefined, notes: 'Dinner · Tia paid' }] },
+    { account: 'tia-card', rows: [{ amount: -1001, payee: 'p1', category: 'c1', notes: 'Dinner · Tia paid' }] },
     { account: 'owed-tia', rows: [{ amount: -501, payee: 'p1', category: 'c1', notes: 'Dinner · your share — Tia paid' }] },
   ]);
 });
@@ -195,6 +208,18 @@ test('converts named exact shares into debt transfers and keeps the remainder as
     { amount: -2500, category: undefined, payee: 'owed-alex' },
     { amount: -1500, category: undefined, payee: 'owed-tia' },
   ]);
+});
+
+test('converts a one-category Actual split into a shared expense', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'category-split', account: 'a1', date: '2026-10-21', amount: -1000, payee: 'p1', category: null, notes: 'Dinner', subtransactions: [
+    { id: 'part-one', amount: 0, category: 'c1' }, { id: 'part-two', amount: 0, category: 'c1' },
+  ] }]);
+  api.getAccounts = async () => [{ id: 'a1', name: 'Visa', closed: false }, { id: 'owed-alex', name: 'Owed by Alex', closed: false }];
+  api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-alex', name: 'Owed by Alex', transfer_acct: 'owed-alex' }];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  assert.equal((await web.splitTransaction({ id: 'category-split', accountId: 'a1', date: '2026-10-21', mode: 'equal', shares: [{ person: 'Alex' }] })).direction, 'they_owe_you');
+  assert.equal(api.writes[0].delete, 'category-split');
 });
 
 test('uses a percentage as your share when the named account owner paid', async () => {

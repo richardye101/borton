@@ -91,8 +91,15 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       if (accountId && account.id !== accountId) continue;
       rows.push(...await api.getTransactions(account.id, rangeStart, rangeEnd));
     }
-    const filtered = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
-      .map((row) => normalize(row, payees, accounts, categories, owedAccountPerson))
+    const normalized = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
+      .map((row) => normalize(row, payees, accounts, categories, owedAccountPerson));
+    const linkedDebtIds = new Set();
+    for (const debtRow of normalized.filter((row) => row.debt)) {
+      const { person } = debtRow.debt;
+      const source = normalized.find((row) => row.id !== debtRow.id && accountOwner(row.account) === person && row.date === debtRow.date && row.merchant === debtRow.merchant && row.note.includes(`${person} paid`) && debtRow.note.includes(`your share — ${person} paid`));
+      if (source) { source.sharedDebt = debtRow.debt; linkedDebtIds.add(debtRow.id); }
+    }
+    const filtered = normalized.filter((row) => !linkedDebtIds.has(row.id))
       .filter((row) => !transactionId || row.id === transactionId)
       .filter((row) => !categoryId || (categoryId === '__uncategorized__' ? !row.categoryId : row.categoryId === categoryId))
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
@@ -192,7 +199,10 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         if (!sourceAccount || sourceAccount.closed || owedAccountPerson(sourceAccount.name)) throw error('Choose a regular expense account to split.');
         const owner = accountOwner(sourceAccount.name);
         const raw = (await api.getTransactions(accountId, date, date)).find((row) => row.id === id);
-        if (!raw || raw.amount >= 0 || raw.parent_id || (raw.subtransactions || []).length) throw error('Only an ordinary expense can be converted to a split.');
+        if (!raw || raw.amount >= 0 || raw.parent_id) throw error('Choose an expense to split.');
+        const childCategories = [...new Set((raw.subtransactions || []).map((line) => line.category).filter(Boolean))];
+        if ((raw.subtransactions || []).length && childCategories.length !== 1) throw error('This transaction has multiple category allocations and cannot be converted to one shared expense.');
+        const sourceCategoryId = raw.category || childCategories[0] || null;
         const amountCents = Math.abs(raw.amount);
         const entries = Array.isArray(shares) && shares.length ? shares : person ? [{ person, value: null }] : [];
         const asShare = (entry) => ({ person: String(entry?.person || '').trim(), value: entry?.value });
@@ -220,8 +230,8 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           if (myShareCents > amountCents) throw error('Your share cannot exceed the transaction total.');
           const { account: debtAccount } = await owedAccount(owner);
           await api.deleteTransaction(id);
-          await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
-          await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -myShareCents, payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: raw.category || null, cleared: false, reconciled: false }], { runTransfers: true });
+          await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), category: sourceCategoryId, cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
+          await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -myShareCents, payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: sourceCategoryId, cleared: false, reconciled: false }], { runTransfers: true });
           await api.sync(); lastSync = now();
           return { status: 'complete', direction: 'you_owe_them', person: owner, shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
         }
@@ -238,7 +248,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         }
         await api.deleteTransaction(id);
         await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: raw.notes || '', cleared: !!raw.cleared, reconciled: false, subtransactions: [
-          { amount: -myShareCents, category: raw.category || null, notes: 'your share' },
+          { amount: -myShareCents, category: sourceCategoryId, notes: 'your share' },
           ...resolved.map((part) => ({ amount: -part.amountCents, payee: part.transferPayee, notes: `owed by ${part.person}` })),
         ] }], { runTransfers: true });
         await api.sync(); lastSync = now();
