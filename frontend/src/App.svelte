@@ -285,15 +285,15 @@
   }
 
   function handleEditShortcut(event) {
-    if (!editingId || !edit || savingEdit || event.isComposing || event.target?.closest?.('button')) return;
-    if (!event.target?.closest?.('tr.editing')) return;
+    if (!editingId || !edit || savingEdit) return;
     if (event.key === 'Escape') {
       event.preventDefault();
       cancelEdit();
-    } else if (event.key === 'Enter') {
-      event.preventDefault();
-      void saveEdit();
+      return;
     }
+    if (event.key !== 'Enter' || event.isComposing || event.target?.closest?.('button')) return;
+    event.preventDefault();
+    void saveEdit();
   }
 
   async function refreshTransactionsAfterEdit(source) {
