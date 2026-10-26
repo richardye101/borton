@@ -69,6 +69,13 @@ test('returns a paged filtered transaction detail response', async () => {
   assert.deepEqual(unbounded.rows.map((row) => row.id), ['old', 'old-2']);
 });
 
+test('finds one transaction by id for a direct transaction link', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const web = createActualWeb({ api: fakeActual(), dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const detail = await web.findTransactions({ transactionId: 'old-2' });
+  assert.deepEqual(detail.map((row) => row.id), ['old-2']);
+});
+
 test('uses a dedicated filter for uncategorized transaction drill-downs', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual([{ id: 'uncategorized', account: 'a1', date: '2026-10-21', amount: -300, payee: 'p1', category: null, notes: '' }]);
@@ -166,7 +173,7 @@ test('rebuilds an owner-paid transaction as a debt entry when splitting', async 
   api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const result = await web.splitTransaction({ id: 'their-card', accountId: 'tia-card', date: '2026-10-21', person: 'Ignored' });
-  assert.deepEqual(result, { status: 'complete', direction: 'you_owe_them', shares: [{ person: 'Tia', account: 'Owed by Tia', amountCents: 501 }] });
+  assert.deepEqual(result, { status: 'complete', direction: 'you_owe_them', person: 'Tia', shares: [{ person: 'Tia', account: 'Owed by Tia', amountCents: 501 }] });
   assert.equal(api.writes[0].delete, 'their-card');
   assert.deepEqual(api.writes.slice(1).map(({ account, rows }) => ({ account, rows: rows.map((row) => ({ amount: row.amount, payee: row.payee, category: row.category, notes: row.notes })) })), [
     { account: 'tia-card', rows: [{ amount: -1001, payee: 'p1', category: undefined, notes: 'Dinner · Tia paid' }] },
@@ -181,7 +188,7 @@ test('converts named exact shares into debt transfers and keeps the remainder as
   api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-alex', name: 'Owed by Alex', transfer_acct: 'owed-alex' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const result = await web.splitTransaction({ id: 'manual-split', accountId: 'a1', date: '2026-10-21', mode: 'amount', shares: [{ person: 'Alex', value: 25 }, { person: 'Tia', value: 15 }] });
-  assert.deepEqual(result, { status: 'complete', direction: 'they_owe_you', shares: [{ person: 'Alex', account: 'Owed by Alex', amountCents: 2500 }, { person: 'Tia', account: 'Owed by Tia', amountCents: 1500 }] });
+  assert.deepEqual(result, { status: 'complete', direction: 'they_owe_you', person: 'Alex', shares: [{ person: 'Alex', account: 'Owed by Alex', amountCents: 2500 }, { person: 'Tia', account: 'Owed by Tia', amountCents: 1500 }] });
   assert.equal(api.writes[0].delete, 'manual-split');
   assert.deepEqual(api.writes[1].rows[0].subtransactions.map((row) => ({ amount: row.amount, category: row.category, payee: row.payee })), [
     { amount: -6000, category: 'c1', payee: undefined },
@@ -197,6 +204,6 @@ test('uses a percentage as your share when the named account owner paid', async 
   api.getPayees = async () => [{ id: 'p1', name: 'Corner Store' }, { id: 'owed-tia', name: 'Owed by Tia', transfer_acct: 'owed-tia' }];
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
   const result = await web.splitTransaction({ id: 'owner-percent', accountId: 'tia-card', date: '2026-10-21', mode: 'percent', shares: [{ person: 'ignored', value: 30 }] });
-  assert.deepEqual(result, { status: 'complete', direction: 'you_owe_them', shares: [{ person: 'Tia', account: 'Owed by Tia', amountCents: 300 }] });
+  assert.deepEqual(result, { status: 'complete', direction: 'you_owe_them', person: 'Tia', shares: [{ person: 'Tia', account: 'Owed by Tia', amountCents: 300 }] });
   assert.equal(api.writes[2].rows[0].amount, -300);
 });

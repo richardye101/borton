@@ -82,15 +82,18 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     if (!account) throw error(`Could not create ${name}.`);
     return { account, maps: current };
   }
-  async function transactions({ start = zonedDate(now() - 89 * DAY_MS, timezone), end = zonedDate(now(), timezone), query = '', limit = 50, offset = 0, categoryId, accountId, includeClosed = false, paged = false, force = false } = {}) {
+  async function transactions({ start, end, transactionId, query = '', limit = 50, offset = 0, categoryId, accountId, includeClosed = false, paged = false, force = false } = {}) {
+    const rangeStart = start || (transactionId ? '1900-01-01' : zonedDate(now() - 89 * DAY_MS, timezone));
+    const rangeEnd = end || zonedDate(now(), timezone);
     await sync(force); const { accounts, categories, payees } = await maps(); const rows = [];
     for (const account of accounts.values()) {
       if (account.closed && !includeClosed) continue;
       if (accountId && account.id !== accountId) continue;
-      rows.push(...await api.getTransactions(account.id, start, end));
+      rows.push(...await api.getTransactions(account.id, rangeStart, rangeEnd));
     }
     const filtered = unique(rows).filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
       .map((row) => normalize(row, payees, accounts, categories, owedAccountPerson))
+      .filter((row) => !transactionId || row.id === transactionId)
       .filter((row) => !categoryId || (categoryId === '__uncategorized__' ? !row.categoryId : row.categoryId === categoryId))
       .filter((row) => !query || `${row.merchant} ${row.note}`.toLowerCase().includes(String(query).toLowerCase()))
       .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
@@ -220,7 +223,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
           await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -myShareCents, payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: raw.category || null, cleared: false, reconciled: false }], { runTransfers: true });
           await api.sync(); lastSync = now();
-          return { status: 'complete', direction: 'you_owe_them', shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
+          return { status: 'complete', direction: 'you_owe_them', person: owner, shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
         }
         const parts = resolveAmounts(namedShares, true);
         const totalSharedCents = parts.reduce((total, entry) => total + entry.amountCents, 0);
@@ -239,7 +242,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           ...resolved.map((part) => ({ amount: -part.amountCents, payee: part.transferPayee, notes: `owed by ${part.person}` })),
         ] }], { runTransfers: true });
         await api.sync(); lastSync = now();
-        return { status: 'complete', direction: 'they_owe_you', shares: resolved.map(({ person, account, amountCents: value }) => ({ person, account, amountCents: value })) };
+        return { status: 'complete', direction: 'they_owe_you', person: resolved[0]?.person || '', shares: resolved.map(({ person, account, amountCents: value }) => ({ person, account, amountCents: value })) };
       });
     },
     submitBatch({ requestId, rows }) {

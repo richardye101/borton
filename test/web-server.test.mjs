@@ -42,6 +42,9 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const page = await request(port);
     assert.equal(page.status, 200);
     assert.match(page.body, /Borton/);
+    const summaryPage = await request(port, { path: '/summary' });
+    assert.equal(summaryPage.status, 200);
+    assert.match(summaryPage.body, /Borton/);
     assert.equal(page.headers['cache-control'], 'no-store');
     const module = await request(port, { path: '/client-state.mjs' });
     assert.equal(module.status, 200);

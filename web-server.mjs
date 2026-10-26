@@ -42,7 +42,10 @@ const allowed = (remote, rule) => {
     return (asNumber(address) & keep) === (asNumber(network) & keep);
   });
 };
-const safeStaticPath = (pathname) => pathname === '/' ? 'index.html' : pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
+const safeStaticPath = (pathname) => {
+  if (pathname === '/' || /^\/(?:home|summary|shared|add|check)$/.test(pathname) || /^\/home\/transactions\/[^/]+$/.test(pathname)) return 'index.html';
+  return pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
+};
 
 export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [], trustedRemotes = [], maxUploadBytes = 10 * 1024 * 1024 } = {}) {
   if (!auth || !staticDir) throw new Error('auth and staticDir are required.');
