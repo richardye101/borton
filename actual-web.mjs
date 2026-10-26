@@ -229,11 +229,13 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           const myShareCents = mode === 'equal' ? Math.round(amountCents / 2) : shareCents(selected.value);
           if (myShareCents > amountCents) throw error('Your share cannot exceed the transaction total.');
           const { account: debtAccount } = await owedAccount(owner);
+          const importedId = `borton-split-${now()}-${Math.random().toString(36).slice(2)}`;
           await api.deleteTransaction(id);
-          await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), category: sourceCategoryId, cleared: !!raw.cleared, reconciled: false }], { runTransfers: true });
+          await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: [raw.notes, `${owner} paid`].filter(Boolean).join(' · '), category: sourceCategoryId, cleared: !!raw.cleared, reconciled: false, imported_id: importedId }], { runTransfers: true });
           await api.addTransactions(debtAccount.id, [{ account: debtAccount.id, date: String(raw.date), amount: -myShareCents, payee: raw.payee, notes: [raw.notes, `your share — ${owner} paid`].filter(Boolean).join(' · '), category: sourceCategoryId, cleared: false, reconciled: false }], { runTransfers: true });
           await api.sync(); lastSync = now();
-          return { status: 'complete', direction: 'you_owe_them', person: owner, shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
+          const transactionId = (await api.getTransactions(accountId, String(raw.date), String(raw.date))).find((row) => row.imported_id === importedId)?.id || null;
+          return { status: 'complete', transactionId, direction: 'you_owe_them', person: owner, shares: [{ person: owner, account: debtAccount.name, amountCents: myShareCents }] };
         }
         const parts = resolveAmounts(namedShares, true);
         const totalSharedCents = parts.reduce((total, entry) => total + entry.amountCents, 0);
@@ -246,13 +248,15 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           if (!transferPayee) throw error(`Could not find the transfer payee for ${result.account.name}.`);
           resolved.push({ ...part, account: result.account.name, transferPayee: transferPayee.id });
         }
+        const importedId = `borton-split-${now()}-${Math.random().toString(36).slice(2)}`;
         await api.deleteTransaction(id);
-        await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: raw.notes || '', cleared: !!raw.cleared, reconciled: false, subtransactions: [
+        await api.addTransactions(accountId, [{ account: accountId, date: String(raw.date), amount: -amountCents, payee: raw.payee, notes: raw.notes || '', cleared: !!raw.cleared, reconciled: false, imported_id: importedId, subtransactions: [
           { amount: -myShareCents, category: sourceCategoryId, notes: 'your share' },
           ...resolved.map((part) => ({ amount: -part.amountCents, payee: part.transferPayee, notes: `owed by ${part.person}` })),
         ] }], { runTransfers: true });
         await api.sync(); lastSync = now();
-        return { status: 'complete', direction: 'they_owe_you', person: resolved[0]?.person || '', shares: resolved.map(({ person, account, amountCents: value }) => ({ person, account, amountCents: value })) };
+        const transactionId = (await api.getTransactions(accountId, String(raw.date), String(raw.date))).find((row) => row.imported_id === importedId)?.id || null;
+        return { status: 'complete', transactionId, direction: 'they_owe_you', person: resolved[0]?.person || '', shares: resolved.map(({ person, account, amountCents: value }) => ({ person, account, amountCents: value })) };
       });
     },
     submitBatch({ requestId, rows }) {
