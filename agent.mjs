@@ -104,6 +104,7 @@ const groqSchema = (value) => {
   if (!value || typeof value !== 'object') return value;
   const schema = Object.fromEntries(Object.entries(value).map(([key, child]) => [key, groqSchema(child)]));
   if (typeof schema.type === 'string') schema.type = schema.type.toLowerCase();
+  if (Array.isArray(schema.type)) schema.type = schema.type.map(type => typeof type === 'string' ? type.toLowerCase() : type);
   if (schema.nullable) {
     schema.type = Array.isArray(schema.type) ? [...new Set([...schema.type, 'null'])] : [schema.type, 'null'];
     delete schema.nullable;
