@@ -71,3 +71,7 @@
   body.chat-open{overflow:hidden;overscroll-behavior:none}
   .chat{inset:var(--borton-viewport-top,0px) 0 auto auto;height:var(--borton-viewport-height,100dvh);max-height:var(--borton-viewport-height,100dvh)}
 }
+@media(max-width:760px){
+  /* Safari draws its bottom controls over the layout viewport while typing. */
+  .chat-scrim{display:block;background:#fff}
+}
