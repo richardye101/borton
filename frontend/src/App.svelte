@@ -445,7 +445,6 @@
 
   async function addExpenseInChat() {
     await openChat('chat');
-    if (!chatText.trim()) chatText = 'Add an expense: ';
     await tick();
     document.getElementById('chat-message')?.focus();
   }
