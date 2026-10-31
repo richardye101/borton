@@ -3,10 +3,10 @@ import { createAgent } from './agent.mjs';
 
 const OWNER = 'web-owner';
 
-export function createWebAgent({ agent, api, generate, statePath, currency = 'CAD', timezone = 'America/Toronto', lock = async (work) => work() } = {}) {
+export function createWebAgent({ agent, api, generate, statePath, currency = 'CAD', timezone = 'America/Toronto', timeoutMs = 120_000, lock = async (work) => work() } = {}) {
   if (!agent) {
     if (!api || !generate || !statePath) throw new Error('api, generate, and statePath are required.');
-    agent = createAgent({ tools: createActualTools(api, { currency }), generate, statePath, allowedChatId: OWNER, currency, timezone });
+    agent = createAgent({ tools: createActualTools(api, { currency }), generate, statePath, allowedChatId: OWNER, currency, timezone, timeoutMs });
   }
   const text = (value) => {
     if (typeof value !== 'string' || !value.trim()) throw new Error('A message is required.');
