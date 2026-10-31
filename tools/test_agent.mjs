@@ -213,9 +213,10 @@ await test('Groq adapter turns a local tool call into the agent tool-call format
     assert.equal(body.tools[0].function.parameters.type,'object');
     assert.equal(body.tools[0].function.parameters.properties.start.type,'string');
     assert.deepEqual(body.tools[0].function.parameters.properties.end.type,['string','null']);
+    assert.deepEqual(body.tools[0].function.parameters.properties.category.anyOf,[{type:'string'},{type:'null'}]);
     return {ok:true,json:async()=>({choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'call-1',type:'function',function:{name:'find_transactions',arguments:'{"start":"2026-10-01","end":"2026-10-31"}'}}]}}]})};
   }});
-  const result=await groq({system:'Use tools.',contents:[{role:'user',parts:[{text:'Show October expenses'}]}],declarations:[{name:'find_transactions',description:'Find expenses',parameters:{type:'OBJECT',properties:{start:{type:'STRING'},end:{type:['STRING','NULL']}}}}],signal:AbortSignal.timeout(1000)});
+  const result=await groq({system:'Use tools.',contents:[{role:'user',parts:[{text:'Show October expenses'}]}],declarations:[{name:'find_transactions',description:'Find expenses',parameters:{type:'OBJECT',properties:{start:{type:'STRING'},end:{type:['STRING','NULL']},category:{anyOf:[{type:'STRING'}],nullable:true}}}}],signal:AbortSignal.timeout(1000)});
   assert.deepEqual(result,{role:'model',parts:[{functionCall:{id:'call-1',name:'find_transactions',args:{start:'2026-10-01',end:'2026-10-31'}}}]});
 });
 await test('opted-in channel date correction is isolated, staged, and applied once',async()=>{

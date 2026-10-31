@@ -106,7 +106,8 @@ const groqSchema = (value) => {
   if (typeof schema.type === 'string') schema.type = schema.type.toLowerCase();
   if (Array.isArray(schema.type)) schema.type = schema.type.map(type => typeof type === 'string' ? type.toLowerCase() : type);
   if (schema.nullable) {
-    schema.type = Array.isArray(schema.type) ? [...new Set([...schema.type, 'null'])] : [schema.type, 'null'];
+    if (schema.type !== undefined) schema.type = Array.isArray(schema.type) ? [...new Set([...schema.type, 'null'])] : [schema.type, 'null'];
+    else if (Array.isArray(schema.anyOf)) schema.anyOf.push({ type: 'null' });
     delete schema.nullable;
   }
   return schema;
