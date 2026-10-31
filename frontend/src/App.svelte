@@ -429,10 +429,12 @@
 
   function chatContext() {
     const rows = view === 'home' ? transactions : view === 'summary' && summaryDetail ? summaryDetail : [];
+    const dates = rows.map((row) => row.date).filter(Boolean).sort();
     return {
       page: view === 'summary' && summaryDetail ? 'Summary transaction detail' : view === 'home' ? 'Home recent expenses' : view,
       filters: view === 'summary' && summaryDetail ? summaryDetailFilters : view === 'home' && search ? { search } : {},
-      visibleTransactions: rows.map((row) => ({ id: row.id, date: row.date, merchant: row.merchant, accountId: row.accountId, account: row.account, categoryId: row.categoryId || null, category: row.category || null, amountCents: row.amountCents, note: String(row.note || '').slice(0, 80) })),
+      visibleTransactionIds: rows.map((row) => row.id),
+      ...(dates.length ? { transactionRange: { start: dates[0], end: dates.at(-1) } } : {}),
     };
   }
 
