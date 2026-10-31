@@ -173,6 +173,13 @@ await test('read-only smoke mode excludes proposals',async()=>{
   const f=fakeActual();const agent=createAgent({tools:createActualTools(f.api),allowedChatId:42,readOnly:true,generate:script(req=>{assert.ok(req.declarations.every(d=>!d.name.startsWith('propose_')));return answer('Read only');})});
   assert.equal((await agent.message(42,'hello')).text,'Read only');assert.equal(f.writes.length,0);
 });
+await test('transaction classification receives only its focused tool catalog',async()=>{
+  const f=fakeActual();const agent=createAgent({tools:createActualTools(f.api),allowedChatId:42,generate:script(req=>{
+    assert.deepEqual(req.declarations.map(d=>d.name),['list_accounts','list_categories','list_payees','find_transactions','run_report','propose_transaction_changes']);
+    return answer('Ready to categorize the visible transactions.');
+  })});
+  assert.equal((await agent.message(42,'Categorize the transactions on this page as Groceries.')).text,'Ready to categorize the visible transactions.');
+});
 await test('plan-only smoke mode cannot execute even a valid confirmation',async()=>{
   const f=fakeActual();const a=createAgent({tools:createActualTools(f.api),allowedChatId:42,planOnly:true,generate:script(content('propose_budget_change',{month:'2026-09',category:'food',amount:100}),answer('Ready'))});
   const p=await a.message(42,'plan');assert.ok(p.planId);await a.confirm(42,p.planId);assert.equal(f.writes.length,0);
@@ -203,9 +210,11 @@ await test('Groq adapter turns a local tool call into the agent tool-call format
     assert.equal(body.messages[0].role,'system');
     assert.equal(body.messages[1].role,'user');
     assert.equal(body.tools[0].function.name,'find_transactions');
+    assert.equal(body.tools[0].function.parameters.type,'object');
+    assert.equal(body.tools[0].function.parameters.properties.start.type,'string');
     return {ok:true,json:async()=>({choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'call-1',type:'function',function:{name:'find_transactions',arguments:'{"start":"2026-10-01","end":"2026-10-31"}'}}]}}]})};
   }});
-  const result=await groq({system:'Use tools.',contents:[{role:'user',parts:[{text:'Show October expenses'}]}],declarations:[{name:'find_transactions',description:'Find expenses',parameters:{type:'object',properties:{start:{type:'string'},end:{type:'string'}}}}],signal:AbortSignal.timeout(1000)});
+  const result=await groq({system:'Use tools.',contents:[{role:'user',parts:[{text:'Show October expenses'}]}],declarations:[{name:'find_transactions',description:'Find expenses',parameters:{type:'OBJECT',properties:{start:{type:'STRING'},end:{type:'STRING'}}}}],signal:AbortSignal.timeout(1000)});
   assert.deepEqual(result,{role:'model',parts:[{functionCall:{id:'call-1',name:'find_transactions',args:{start:'2026-10-01',end:'2026-10-31'}}}]});
 });
 await test('opted-in channel date correction is isolated, staged, and applied once',async()=>{

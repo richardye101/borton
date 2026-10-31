@@ -99,6 +99,18 @@ const groqMessages = (contents, system) => {
   return messages;
 };
 
+const groqSchema = (value) => {
+  if (Array.isArray(value)) return value.map(groqSchema);
+  if (!value || typeof value !== 'object') return value;
+  const schema = Object.fromEntries(Object.entries(value).map(([key, child]) => [key, groqSchema(child)]));
+  if (typeof schema.type === 'string') schema.type = schema.type.toLowerCase();
+  if (schema.nullable) {
+    schema.type = Array.isArray(schema.type) ? [...new Set([...schema.type, 'null'])] : [schema.type, 'null'];
+    delete schema.nullable;
+  }
+  return schema;
+};
+
 export function createGroqGenerate({ apiKey, model = 'openai/gpt-oss-20b', fetchImpl = globalThis.fetch }) {
   return async ({ contents, declarations, system, signal }) => {
     if (signal.aborted) throw new RetryableError('Groq request timed out.');
@@ -111,7 +123,7 @@ export function createGroqGenerate({ apiKey, model = 'openai/gpt-oss-20b', fetch
         body: JSON.stringify({
           model,
           messages: groqMessages(contents, system),
-          tools: declarations.map(declaration => ({ type: 'function', function: declaration })),
+          tools: declarations.map(declaration => ({ type: 'function', function: { ...declaration, parameters: groqSchema(declaration.parameters) } })),
           tool_choice: declarations.length ? 'auto' : 'none',
         }),
       });
@@ -152,6 +164,27 @@ function until(promise,signal) {
 }
 const freshChat = () => ({history:[],references:[],pending:null,results:[]});
 const clone = x => structuredClone(x);
+const toolsForRequest = (declarations, text, receiptOnly) => {
+  const request = text.toLowerCase();
+  let names;
+  if (receiptOnly || /\b(receipt|split|charge|card)\b/.test(request)) {
+    names = ['list_accounts','list_categories','list_payees','find_transactions','run_report','propose_transaction_changes','get_receipt','get_receipt_context','propose_receipt_change','propose_card_memory_change'];
+  } else if (/\b(budget|budgeted|envelope|carryover|allocate|fund|increase|decrease)\b/.test(request)) {
+    names = ['list_categories','get_budget','run_report','propose_budget_change'];
+  } else if (/\b(account|category|payee)\b/.test(request) && /\b(create|rename|delete|close|reopen|merge|edit|change|update)\b/.test(request)) {
+    names = ['list_accounts','list_categories','list_payees','propose_account_change','propose_category_change','propose_payee_change'];
+  } else if (/\b(schedule|rule|tag|note)\b/.test(request)) {
+    names = ['list_schedules','list_rules','list_tags','get_note','propose_schedule_change','propose_rule_change','propose_tag_change','propose_note_change'];
+  } else if (/\b(sync|bank)\b/.test(request)) {
+    names = ['list_accounts','propose_bank_sync','propose_sync'];
+  } else if (/\b(transaction|expense|spend|categorize|categorise|category|merchant|payee|amount|date)\b/.test(request)) {
+    names = ['list_accounts','list_categories','list_payees','find_transactions','run_report','propose_transaction_changes'];
+  } else {
+    names = ['list_accounts','list_categories','list_payees','find_transactions','get_budget','run_report','propose_transaction_changes','propose_budget_change'];
+  }
+  const available = new Set(names);
+  return declarations.filter(declaration => available.has(declaration.name));
+};
 
 export function createAgent({ tools, generate, statePath, allowedChatId, allowedChatIds=[], now=Date.now, timeoutMs=60_000, readOnly=false, planOnly=false, currency='CAD', timezone='America/Toronto' }) {
   let state={version:1,chats:{}};
@@ -247,6 +280,8 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
       if (options.requireReceipt) request.requireReceipt = true;
       if (options.receiptScope || options.requireReceipt || old?.operations.some(op=>op.domain === 'receipt')) request.receiptScope = true;
       const receiptOnly = request.receiptScope && tools.declarations.some(d=>d.name === 'propose_receipt_change');
+      const declarations = toolsForRequest(tools.declarations, text, receiptOnly).filter(d=>(!readOnly||!d.name.startsWith('propose_')) && (!receiptOnly || d.name !== 'propose_transaction_changes'));
+      const declaredTools = new Set(declarations.map(d=>d.name));
       if (!request.contents) remember(c,'user',text);
       save();
       const signal=AbortSignal.timeout(timeoutMs);
@@ -261,7 +296,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
       const draft=[];let invalid=false;
       try {
         for(let round=0;round<8;round++) {
-          const content=await until(generate({contents,declarations:tools.declarations.filter(d=>(!readOnly||!d.name.startsWith('propose_')) && (!receiptOnly || d.name !== 'propose_transaction_changes')),system,signal}),signal);
+          const content=await until(generate({contents,declarations,system,signal}),signal);
           if(JSON.stringify(content).length>64_000) throw new Error('The model response was too large. Please narrow the request.');
           const calls=(content.parts||[]).filter(p=>p.functionCall).map(p=>p.functionCall);
           if(!calls.length) {
@@ -284,6 +319,7 @@ export function createAgent({ tools, generate, statePath, allowedChatId, allowed
           for(const call of calls) {
             signal.throwIfAborted();let output;
             try {
+              if (!declaredTools.has(call.name)) throw new ToolError('That action is not available for this request. Please make the request more specific.');
               if(call.name.startsWith('propose_')) {
                 if(readOnly) throw new ToolError('This session only permits read tools');
                 if(receiptOnly && call.name === 'propose_transaction_changes') throw new ToolError('Use propose_receipt_change for this receipt so its split, ownership and links are preserved.');
