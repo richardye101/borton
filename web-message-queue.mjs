@@ -20,10 +20,10 @@ export function createWebMessageQueue({ assistant, filePath, now = Date.now } = 
     try { state = JSON.parse(fs.readFileSync(filePath, 'utf8')); }
     catch { throw new Error('Unreadable web message queue; preserve the file before recovery.'); }
   }
-  if (state.version !== 1 || !Array.isArray(state.jobs) || state.jobs.some((job) => !job?.id || !job.payload?.text || !Number.isFinite(job.createdAt) || !Number.isFinite(job.nextAt) || !Number.isSafeInteger(job.attempts) || !['queued', 'processing', 'retry', 'complete', 'failed'].includes(job.status))) {
+  if (state.version !== 1 || !Array.isArray(state.jobs) || state.jobs.some((job) => !job?.id || !job.payload?.text || !Number.isFinite(job.createdAt) || !Number.isSafeInteger(job.attempts) || !['queued', 'processing', 'retry', 'complete', 'failed'].includes(job.status) || (['queued', 'retry'].includes(job.status) && !Number.isFinite(job.nextAt)))) {
     throw new Error('Invalid web message queue; preserve the file before recovery.');
   }
-  for (const job of state.jobs) if (job.status === 'processing') { job.status = 'retry'; job.nextAt = Math.max(job.nextAt, now()); }
+  for (const job of state.jobs) if (job.status === 'processing') { job.status = 'retry'; job.nextAt = Number.isFinite(job.nextAt) ? Math.max(job.nextAt, now()) : now(); }
 
   function save() {
     fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });

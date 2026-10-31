@@ -51,3 +51,20 @@ test('retains a transient Gemini failure as a retrying queue item', async () => 
   assert.equal(queue.list()[0].attempts, 2);
   queue.close();
 });
+
+test('reopens persisted failed jobs that no longer have a next retry time', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-web-queue-'));
+  const filePath = path.join(directory, 'messages.json');
+  fs.writeFileSync(filePath, JSON.stringify({
+    version: 1,
+    jobs: [{
+      id: 'failed-job', payload: { text: 'Classify this' }, createdAt: 1, attempts: 1,
+      status: 'failed', finishedAt: 2, lastError: 'Request failed.',
+    }],
+  }));
+
+  const queue = createWebMessageQueue({ filePath, assistant: { async message() { throw new Error('Should not run'); } } });
+  assert.equal(queue.list()[0].status, 'failed');
+  assert.equal(queue.list()[0].text, 'Classify this');
+  queue.close();
+});
