@@ -22,14 +22,14 @@
 
   function startMeter(stream) {
     try {
-      meterContext = new AudioContext();
+      meterContext = new AudioContext(); void meterContext.resume();
       const analyser = meterContext.createAnalyser(); analyser.fftSize = 256;
       meterContext.createMediaStreamSource(stream).connect(analyser);
       const data = new Uint8Array(analyser.fftSize);
       const update = () => {
         analyser.getByteTimeDomainData(data);
         const rms = Math.sqrt(data.reduce((sum, sample) => sum + ((sample - 128) / 128) ** 2, 0) / data.length);
-        audioLevel = Math.min(1, rms * 7);
+        audioLevel = Math.min(1, rms * 20);
         meterFrame = requestAnimationFrame(update);
       };
       update();
@@ -51,7 +51,7 @@
     } catch {}
   }
 
-  function waveHeight(index) { return Math.max(.2, Math.min(1, .25 + audioLevel * [.85, 1.25, 1.6, 1.25, .85][index])); }
+  function waveHeight(index) { return Math.max(.14, Math.min(1, .14 + audioLevel * [.5, .72, 1, .72, .5][index])); }
 
   function nativeDictation() {
     if (recognition) return recognition.stop();
