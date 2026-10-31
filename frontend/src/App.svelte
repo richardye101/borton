@@ -70,9 +70,26 @@
         if (session.ok) { csrf = (await session.json()).csrf; await loadBoot(); await loadAssistantJobs(); }
       } catch (error) { loginError = `Could not restore your session: ${error.message || 'network error'}`; }
     })();
+    const viewport = window.visualViewport;
+    const updateViewport = () => {
+      document.documentElement.style.setProperty('--borton-viewport-height', `${viewport?.height || window.innerHeight}px`);
+      document.documentElement.style.setProperty('--borton-viewport-top', `${viewport?.offsetTop || 0}px`);
+    };
+    updateViewport();
+    viewport?.addEventListener('resize', updateViewport);
+    viewport?.addEventListener('scroll', updateViewport);
     chatPoll = setInterval(() => { if (signedIn && chatOpen) void loadAssistantJobs(); }, 1500);
-    return () => { clearInterval(chatPoll); window.removeEventListener('popstate', applyBrowserRoute); };
+    return () => {
+      clearInterval(chatPoll);
+      window.removeEventListener('popstate', applyBrowserRoute);
+      viewport?.removeEventListener('resize', updateViewport);
+      viewport?.removeEventListener('scroll', updateViewport);
+      document.documentElement.style.removeProperty('--borton-viewport-height');
+      document.documentElement.style.removeProperty('--borton-viewport-top');
+      document.body.classList.remove('chat-open');
+    };
   });
+  $: if (typeof document !== 'undefined') document.body.classList.toggle('chat-open', chatOpen);
   $: accounts = boot?.accounts || [];
   $: categories = boot?.categories || [];
   const chartColors = ['#176b4d', '#3d8f70', '#76b795', '#d2a74c', '#c66a4a', '#7e89bb'];

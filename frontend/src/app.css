@@ -66,3 +66,8 @@
   .chat{inset:0;width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;overflow:hidden}
   .chat .messages,.message-activity{-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain}
 }
+
+@media(max-width:760px){
+  body.chat-open{overflow:hidden;overscroll-behavior:none}
+  .chat{inset:var(--borton-viewport-top,0px) 0 auto auto;height:var(--borton-viewport-height,100dvh);max-height:var(--borton-viewport-height,100dvh)}
+}
