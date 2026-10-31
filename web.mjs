@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createActualWeb } from './actual-web.mjs';
 import { createReceiptExtractor } from './receipt-extractor.mjs';
-import { createAudioTranscriber } from './audio-transcriber.mjs';
+import { createAudioTranscriber, createGroqAudioTranscriber } from './audio-transcriber.mjs';
 import { createWebApplication } from './web-app.mjs';
 import { createWebAgent } from './web-agent.mjs';
 import { createWebMessageQueue } from './web-message-queue.mjs';
@@ -51,7 +51,8 @@ const cardmap = fs.existsSync(path.join(root, 'cardmap.json')) ? JSON.parse(fs.r
 const actual = createActualWeb({ api: actualApi, dataDir, lockPath: path.resolve(root, cfg.actual.dataDir, 'actual.lock'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', owedAccountFormat: cfg.defaults?.owedAccountFormat || 'Owed by {name}', cardmap });
 const assistant = createWebAgent({ api: actualApi, generate: chatGenerate, statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
 const assistantQueue = createWebMessageQueue({ assistant, filePath: path.join(dataDir, 'web-message-queue.json') });
-const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber: createAudioTranscriber({ generate, maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 }), cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant, assistantQueue });
+const transcriber = process.env.GROQ_API_KEY ? createGroqAudioTranscriber({ apiKey: process.env.GROQ_API_KEY, model: cfg.groq?.transcriptionModel || 'whisper-large-v3-turbo', maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 }) : createAudioTranscriber({ generate, maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 });
+const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber, cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant, assistantQueue });
 const auth = createWebAuth({ password: process.env.BORTON_WEB_PASSWORD, sessionSecret: process.env.BORTON_WEB_SESSION_SECRET, secure: web.https === true });
 const server = createWebServer({ auth, app, staticDir: path.join(root, 'web'), allowedRemote: web.allowedRemote || ['127.0.0.1'], trustedRemotes: web.trustedAutoLoginRemote || [], maxUploadBytes: web.maxUploadBytes || 10 * 1024 * 1024 });
 server.listen(web.port || 28456, web.host || '127.0.0.1', () => console.log(`Borton Web listening on http://${web.host || '127.0.0.1'}:${web.port || 28456}`));
