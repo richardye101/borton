@@ -17,3 +17,5 @@
 .row-action{display:inline-grid;place-items:center;width:2rem;height:2rem;padding:0;border-radius:6px;background:#e7f1eb;color:#176b4d;font-size:1.15rem;line-height:1;opacity:0;transition:opacity .12s ease}.transactions tr:hover .row-action,.transactions tr:focus-within .row-action{opacity:1}.row-action:hover,.row-action:focus{background:#d9e9df;outline:0}
 
 .dictation-status{display:block;color:#66766c;font-size:.75rem;font-weight:400}.dictation-status.recording{color:#a22b2b;font-weight:600}.dictation-error{display:block}
+
+.audio-wave{display:inline-flex;align-items:center;gap:2px;height:1rem;margin:0 .2rem;vertical-align:-.18rem}.audio-wave i{display:block;width:2px;height:calc(1rem * var(--level));min-height:2px;border-radius:999px;background:currentColor;transition:height .06s linear}
