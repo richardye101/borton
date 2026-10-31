@@ -34,17 +34,25 @@ const models = [cfg.gemini?.model, ...(cfg.gemini?.fallbackModels || [])].filter
 const chatGenerate = process.env.GROQ_API_KEY
   ? createGroqGenerate({ apiKey: process.env.GROQ_API_KEY, model: process.env.GROQ_MODEL || cfg.groq?.model || 'openai/gpt-oss-20b' })
   : createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY, models });
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const generate = async (parts, responseSchema) => {
   let last = new Error('Gemini is unavailable.');
   for (const model of models) {
-    try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': process.env.GOOGLE_API_KEY }, body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', responseSchema } }), signal: AbortSignal.timeout(60_000) });
-      if (!response.ok) { last = new Error(`Gemini HTTP ${response.status}.`); continue; }
-      const text = (await response.json())?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error('Gemini returned no extraction.');
-      return JSON.parse(text);
-    } catch (error) { last = error; }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-goog-api-key': process.env.GOOGLE_API_KEY }, body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', responseSchema } }), signal: AbortSignal.timeout(60_000) });
+        if (!response.ok) {
+          last = new Error(`Gemini HTTP ${response.status}.`);
+          if (response.status === 429 && attempt === 0) { await wait(1_500); continue; }
+          break;
+        }
+        const text = (await response.json())?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error('Gemini returned no extraction.');
+        return JSON.parse(text);
+      } catch (error) { last = error; break; }
+    }
   }
+  if (/Gemini HTTP 429/.test(last.message)) throw new Error('Receipt scanning is busy. Please try again in a minute.');
   throw last;
 };
 const cardmap = fs.existsSync(path.join(root, 'cardmap.json')) ? JSON.parse(fs.readFileSync(path.join(root, 'cardmap.json'), 'utf8')) : {};

@@ -21,3 +21,39 @@
 .dictation-wave{display:flex;align-items:center;justify-content:center;gap:2px;width:1.25rem;height:1.25rem}.dictation-wave i{display:block;width:2px;height:calc(1rem * var(--level));min-height:2px;border-radius:999px;background:currentColor;transition:height .06s linear}
 
 .chat-photo{display:grid!important;place-items:center}.chat-photo svg{width:1.15rem;height:1.15rem;fill:none;stroke:currentColor;stroke-width:2;stroke-linejoin:round}.chat-error{margin:0 .75rem .4rem;font-size:.78rem}
+
+/* Phone layout */
+@media(max-width:760px){
+  body{min-width:0}
+  .main{padding:.65rem}
+  .card{padding:.75rem;border-radius:12px}
+  .main header{gap:.45rem;min-height:2.45rem;margin-bottom:.75rem}
+  .mobile-nav{flex:1;min-width:0;gap:.15rem}
+  .mobile-nav button{padding:.42rem .45rem;font-size:.8rem;white-space:nowrap}
+  .header-actions{gap:.3rem}
+  .logout-button{display:none}
+  .queue-trigger,.chat-trigger{width:2.25rem;height:2.25rem}
+  .transactions{table-layout:fixed}
+  .transactions th,.transactions td{padding:.5rem .3rem;font-size:.82rem;overflow-wrap:anywhere}
+  .transactions th:nth-child(1){width:23%}
+  .transactions th:nth-child(2){width:35%}
+  .transactions th:nth-child(6){width:25%}
+  .transactions th:nth-child(7){width:17%}
+  .transactions th:nth-child(5),.transactions td:nth-child(5){display:none}
+  .transactions .cell-edit{min-height:2.35rem;padding:.3rem .2rem}
+  .row-action{opacity:1;width:2.15rem;height:2.15rem}
+  .transactions tr.editing{display:grid;grid-template-columns:1fr 1fr;padding:.45rem;background:#f4f8f5}
+  .transactions tr.editing td{display:block!important;padding:.25rem;border:0}
+  .transactions tr.editing td:nth-child(5),.transactions tr.editing td:nth-child(7){grid-column:1/-1}
+  .transactions tr.editing .edit-actions{display:flex!important;justify-content:flex-end;padding-top:.45rem}
+  .transactions tr.editing input,.transactions tr.editing textarea{min-width:0;font-size:16px}
+  .transactions tr.editing textarea{min-height:4.5rem}
+  .transactions tr.editing .picker-control{min-width:0}
+  .edit-error{display:block}
+  .edit-error td{display:block!important}
+  .chat{height:100vh;height:100dvh}
+  .chat-header{padding:calc(.85rem + env(safe-area-inset-top)) .85rem .75rem}
+  .chat-composer{padding:.6rem .65rem calc(.6rem + env(safe-area-inset-bottom))}
+  .chat-composer textarea{font-size:16px}
+  .edit-notice{right:.65rem;bottom:calc(.65rem + env(safe-area-inset-bottom));left:.65rem;max-width:none}
+}
