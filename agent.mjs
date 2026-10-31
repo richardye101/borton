@@ -74,6 +74,74 @@ export function createGeminiGenerate({ apiKey, models, fetchImpl = globalThis.fe
   };
 }
 
+const groqMessages = (contents, system) => {
+  const messages = [{ role: 'system', content: system }];
+  for (const content of contents) {
+    const parts = content.parts || [];
+    const text = parts.filter(part => typeof part.text === 'string').map(part => part.text).join('\n');
+    const calls = parts.filter(part => part.functionCall).map(part => part.functionCall);
+    const responses = parts.filter(part => part.functionResponse).map(part => part.functionResponse);
+    if (calls.length) {
+      messages.push({ role: 'assistant', content: text || null, tool_calls: calls.map((call, index) => ({
+        id: call.id || `call-${index + 1}`,
+        type: 'function',
+        function: { name: call.name, arguments: JSON.stringify(call.args || {}) },
+      })) });
+    } else if (text) {
+      messages.push({ role: content.role === 'model' ? 'assistant' : 'user', content: text });
+    }
+    for (const response of responses) messages.push({
+      role: 'tool',
+      tool_call_id: response.id || response.name,
+      content: JSON.stringify(response.response || {}),
+    });
+  }
+  return messages;
+};
+
+export function createGroqGenerate({ apiKey, model = 'openai/gpt-oss-20b', fetchImpl = globalThis.fetch }) {
+  return async ({ contents, declarations, system, signal }) => {
+    if (signal.aborted) throw new RetryableError('Groq request timed out.');
+    let response;
+    try {
+      response = await fetchImpl('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        signal,
+        body: JSON.stringify({
+          model,
+          messages: groqMessages(contents, system),
+          tools: declarations.map(declaration => ({ type: 'function', function: declaration })),
+          tool_choice: declarations.length ? 'auto' : 'none',
+        }),
+      });
+    } catch (cause) {
+      throw new RetryableError('Groq connection unavailable.', 0, { cause });
+    }
+    if (!response.ok) {
+      const retryDelay = response.status === 429 ? retryAfterMs(response) : 0;
+      const cause = new Error(`${model}: HTTP ${response.status}`);
+      if (response.status === 429 || response.status >= 500) throw new RetryableError(`Groq HTTP ${response.status}.`, retryDelay, { cause });
+      throw new Error(`Groq HTTP ${response.status}.`, { cause });
+    }
+    let data;
+    try { data = await response.json(); }
+    catch { throw new RetryableError('Groq returned an incomplete response.'); }
+    const message = data.choices?.[0]?.message;
+    if (!message || (!message.content && !message.tool_calls?.length)) throw new RetryableError('Groq returned an incomplete response.');
+    const parts = [];
+    if (typeof message.content === 'string' && message.content.trim()) parts.push({ text: message.content });
+    for (const call of message.tool_calls || []) {
+      let args;
+      try { args = JSON.parse(call.function?.arguments || '{}'); }
+      catch { throw new Error('Groq returned invalid tool arguments.'); }
+      if (!call.function?.name || !args || Array.isArray(args) || typeof args !== 'object') throw new Error('Groq returned invalid tool arguments.');
+      parts.push({ functionCall: { id: call.id, name: call.function.name, args } });
+    }
+    return { role: 'model', parts };
+  };
+}
+
 function until(promise,signal) {
   return new Promise((resolve,reject)=>{
     const abort=()=>reject(new Error('The request timed out. Actual has not been changed.'));

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createActualTools, ToolError } from './actual-tools.mjs';
-import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
+import { createAgent, createGeminiGenerate, createGroqGenerate, isAgentRequest, isReceiptEdit } from './agent.mjs';
 import { createRetryQueue, guardActualWrites, RetryableError, QueueStorageError, retryAfterMs } from './retry-queue.mjs';
 import { findLikelyDuplicates, isValidExpenseDate, normalizeReceipts, withPayeeNames } from './receipt-utils.mjs';
 import { createReceiptExtractor, RECEIPT_SCHEMA } from './receipt-extractor.mjs';
@@ -45,6 +45,7 @@ loadEnv(path.join(__dir, '.env'));
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_KEY || cfg.telegram?.token;
 const GEMINI_KEY = process.env.GOOGLE_API_KEY || cfg.gemini?.apiKey;
+const GROQ_KEY = process.env.GROQ_API_KEY;
 const ACTUAL_PASSWORD = process.env.ACTUAL_PASSWORD || cfg.actual?.password
   || (fs.existsSync(`${process.env.HOME}/.config/actual/password`)
       ? fs.readFileSync(`${process.env.HOME}/.config/actual/password`, 'utf8').trim() : '');
@@ -79,7 +80,9 @@ function initAgent({ readOnly = false, planOnly = false } = {}) {
   } });
   if (!readOnly && !planOnly) agentTools = tools;
   return createAgent({ tools,
-    generate: createGeminiGenerate({ apiKey: GEMINI_KEY, models: [...GEMINI_MODELS] }),
+    generate: GROQ_KEY
+      ? createGroqGenerate({ apiKey: GROQ_KEY, model: process.env.GROQ_MODEL || cfg.groq?.model || 'openai/gpt-oss-20b' })
+      : createGeminiGenerate({ apiKey: GEMINI_KEY, models: [...GEMINI_MODELS] }),
     statePath: readOnly || planOnly ? null : path.resolve(__dir, cfg.actual.dataDir, 'agent-state.json'),
     allowedChatId: cfg.telegram.allowedChatId, readOnly, planOnly,
     allowedChatIds: cfg.agent?.relayEnabled === true ? [cfg.telegram.relayChannelId] : [],

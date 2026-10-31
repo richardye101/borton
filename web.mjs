@@ -8,7 +8,7 @@ import { createAudioTranscriber } from './audio-transcriber.mjs';
 import { createWebApplication } from './web-app.mjs';
 import { createWebAgent } from './web-agent.mjs';
 import { createWebMessageQueue } from './web-message-queue.mjs';
-import { createGeminiGenerate } from './agent.mjs';
+import { createGeminiGenerate, createGroqGenerate } from './agent.mjs';
 import { createWebAuth } from './web-auth.mjs';
 import { createWebServer } from './web-server.mjs';
 
@@ -31,6 +31,9 @@ fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 await actualApi.init({ dataDir, serverURL: cfg.actual.serverURL, password });
 await actualApi.downloadBudget(cfg.actual.syncId);
 const models = [cfg.gemini?.model, ...(cfg.gemini?.fallbackModels || [])].filter(Boolean);
+const chatGenerate = process.env.GROQ_API_KEY
+  ? createGroqGenerate({ apiKey: process.env.GROQ_API_KEY, model: process.env.GROQ_MODEL || cfg.groq?.model || 'openai/gpt-oss-20b' })
+  : createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY, models });
 const generate = async (parts, responseSchema) => {
   let last = new Error('Gemini is unavailable.');
   for (const model of models) {
@@ -46,7 +49,7 @@ const generate = async (parts, responseSchema) => {
 };
 const cardmap = fs.existsSync(path.join(root, 'cardmap.json')) ? JSON.parse(fs.readFileSync(path.join(root, 'cardmap.json'), 'utf8')) : {};
 const actual = createActualWeb({ api: actualApi, dataDir, lockPath: path.resolve(root, cfg.actual.dataDir, 'actual.lock'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', owedAccountFormat: cfg.defaults?.owedAccountFormat || 'Owed by {name}', cardmap });
-const assistant = createWebAgent({ api: actualApi, generate: createGeminiGenerate({ apiKey: process.env.GOOGLE_API_KEY, models }), statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
+const assistant = createWebAgent({ api: actualApi, generate: chatGenerate, statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
 const assistantQueue = createWebMessageQueue({ assistant, filePath: path.join(dataDir, 'web-message-queue.json') });
 const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber: createAudioTranscriber({ generate, maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 }), cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant, assistantQueue });
 const auth = createWebAuth({ password: process.env.BORTON_WEB_PASSWORD, sessionSecret: process.env.BORTON_WEB_SESSION_SECRET, secure: web.https === true });

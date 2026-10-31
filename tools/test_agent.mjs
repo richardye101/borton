@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createActualTools, ToolError } from '../actual-tools.mjs';
-import { createAgent, createGeminiGenerate, isAgentRequest, isReceiptEdit } from '../agent.mjs';
+import { createAgent, createGeminiGenerate, createGroqGenerate, isAgentRequest, isReceiptEdit } from '../agent.mjs';
 import { RetryableError } from '../retry-queue.mjs';
 
 const copy=x=>structuredClone(x);
@@ -193,6 +193,20 @@ await test('failed cloud sync reports completion without replaying writes',async
 await test('transport does not expose API secrets in errors',async()=>{
   const g=createGeminiGenerate({apiKey:'secret-key',models:['fake'],fetchImpl:async()=>({ok:false,status:401})});
   await assert.rejects(()=>g({contents:[],declarations:[],system:'test',signal:AbortSignal.timeout(1000)}),e=>!e.message.includes('secret-key'));
+});
+await test('Groq adapter turns a local tool call into the agent tool-call format',async()=>{
+  const groq=createGroqGenerate({apiKey:'secret-key',model:'openai/gpt-oss-20b',fetchImpl:async (url,options)=>{
+    assert.equal(url,'https://api.groq.com/openai/v1/chat/completions');
+    assert.equal(options.headers.Authorization,'Bearer secret-key');
+    const body=JSON.parse(options.body);
+    assert.equal(body.model,'openai/gpt-oss-20b');
+    assert.equal(body.messages[0].role,'system');
+    assert.equal(body.messages[1].role,'user');
+    assert.equal(body.tools[0].function.name,'find_transactions');
+    return {ok:true,json:async()=>({choices:[{finish_reason:'tool_calls',message:{role:'assistant',tool_calls:[{id:'call-1',type:'function',function:{name:'find_transactions',arguments:'{"start":"2026-10-01","end":"2026-10-31"}'}}]}}]})};
+  }});
+  const result=await groq({system:'Use tools.',contents:[{role:'user',parts:[{text:'Show October expenses'}]}],declarations:[{name:'find_transactions',description:'Find expenses',parameters:{type:'object',properties:{start:{type:'string'},end:{type:'string'}}}}],signal:AbortSignal.timeout(1000)});
+  assert.deepEqual(result,{role:'model',parts:[{functionCall:{id:'call-1',name:'find_transactions',args:{start:'2026-10-01',end:'2026-10-31'}}}]});
 });
 await test('opted-in channel date correction is isolated, staged, and applied once',async()=>{
   const f=fakeActual();f.data.transaction[0].date='2026-09-09';
