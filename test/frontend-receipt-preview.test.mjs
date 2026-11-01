@@ -11,7 +11,8 @@ test('chat receipt attachment opens a dismissible image preview without removing
   assert.match(app, /class="receipt-preview-modal"/);
   assert.match(app, /class="chat-input-wrap"/);
   assert.match(css, /width:min\(34rem,calc\(100vw - 2rem\)\)/);
-  assert.match(css, /height:min\(70vh,calc\(100vh - 2rem\)\)/);
+  assert.match(css, /height:min\(70vh,calc\(100vh - 2rem\)\);min-width:0;min-height:0/);
+  assert.match(css, /\.receipt-preview-modal img\{display:block;width:100%;height:100%/);
   assert.match(css, /@media\(hover:hover\)\{\.chat-input-wrap \.chat-attachment>\.secondary\{opacity:0/);
-  assert.match(css, /\.chat-input-wrap\.with-receipt textarea\{min-height:7rem;padding:5\.65rem \.7rem \.65rem\}/);
+  assert.match(css, /\.chat-input-wrap\.with-receipt textarea\{min-height:7rem;padding:6\.15rem \.7rem \.65rem\}/);
 });
