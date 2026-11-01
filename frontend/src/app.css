@@ -83,3 +83,5 @@
 }
 
 .chat-receipt-status{margin:0 .75rem .35rem;color:#66766c;font-size:.78rem}
+
+.chat-attachment{display:flex;align-items:center;gap:.6rem;margin:.6rem .75rem .1rem;padding:.45rem;border:1px solid #dbe2dc;border-radius:9px;background:#f8faf8}.chat-attachment img{width:3rem;height:3rem;object-fit:cover;border-radius:6px;background:#e4ebe6}.chat-attachment>div{display:grid;gap:.12rem;min-width:0;flex:1}.chat-attachment strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.8rem}.chat-attachment small{color:#66766c;font-size:.72rem}.chat-attachment button{display:grid;place-items:center;width:1.9rem;height:1.9rem;padding:0;border-radius:999px;font-size:1.15rem}@media(max-width:760px){.chat-attachment{margin-right:.65rem;margin-left:.65rem}}

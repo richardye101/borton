@@ -24,6 +24,11 @@
   let chatText = '';
   let chatImageInput;
   let receiptLoading = false;
+  let pendingReceipt = null;
+  let pendingReceiptPreview = '';
+  let receiptRetryTimer = null;
+  let receiptRetryAt = null;
+  let receiptRetries = 0;
   let chatPoll = null;
   let hideAmounts = false;
   let summaryPeriod = '90';
@@ -88,6 +93,8 @@
       document.documentElement.style.removeProperty('--borton-viewport-height');
       document.documentElement.style.removeProperty('--borton-viewport-top');
       document.body.classList.remove('chat-open');
+      if (receiptRetryTimer) clearTimeout(receiptRetryTimer);
+      if (pendingReceiptPreview) URL.revokeObjectURL(pendingReceiptPreview);
     };
   });
   $: if (typeof document !== 'undefined') document.body.classList.toggle('chat-open', chatOpen);
@@ -406,6 +413,17 @@
     try { await submitRows(batch); } catch (error) { quickError = error.message; }
   }
 
+  function scheduleReceiptRetry(image) {
+    const delay = Math.min(60_000 * (2 ** Math.min(receiptRetries, 2)), 5 * 60_000);
+    receiptRetries += 1;
+    receiptRetryAt = new Date(Date.now() + delay);
+    if (receiptRetryTimer) clearTimeout(receiptRetryTimer);
+    receiptRetryTimer = setTimeout(() => {
+      receiptRetryTimer = null;
+      if (pendingReceipt === image) void processReceipt(image);
+    }, delay);
+  }
+
   async function processReceipt(image) {
     if (!image || receiptLoading) return;
     receiptLoading = true;
@@ -413,15 +431,37 @@
     try {
       const form = new FormData(); form.append('image', image);
       const data = await request('/api/extract', { csrf, method: 'POST', form });
-      batch = hydrate(data.rows); chatOpen = false; show('add');
-    } catch (error) { quickError = error.message; }
-    finally { receiptLoading = false; }
+      batch = hydrate(data.rows);
+      if (image === pendingReceipt) clearPendingReceipt();
+      chatOpen = false; show('add');
+    } catch (error) {
+      if (image === pendingReceipt && /receipt scanning is busy|gemini http 429/i.test(error.message)) scheduleReceiptRetry(image);
+      else quickError = error.message;
+    } finally { receiptLoading = false; }
   }
 
   async function extractReceipt(event) { await processReceipt(event.currentTarget.elements.image.files[0]); }
 
+  function clearPendingReceipt() {
+    if (receiptRetryTimer) clearTimeout(receiptRetryTimer);
+    if (pendingReceiptPreview) URL.revokeObjectURL(pendingReceiptPreview);
+    receiptRetryTimer = null;
+    receiptRetryAt = null;
+    receiptRetries = 0;
+    pendingReceipt = null;
+    pendingReceiptPreview = '';
+  }
+
+  function stageReceipt(image) {
+    if (!image) return;
+    clearPendingReceipt();
+    quickError = '';
+    pendingReceipt = image;
+    pendingReceiptPreview = URL.createObjectURL(image);
+  }
+
   async function extractChatReceipt(event) {
-    await processReceipt(event.currentTarget.files?.[0]);
+    stageReceipt(event.currentTarget.files?.[0]);
     event.currentTarget.value = '';
   }
 
@@ -445,7 +485,7 @@
     if (!image) return;
     event.preventDefault();
     event.stopPropagation();
-    await processReceipt(image);
+    stageReceipt(image);
   }
 
   async function loadSummary(force = false) {
@@ -508,6 +548,11 @@
     return '';
   }
 
+  async function submitChat() {
+    if (pendingReceipt) { await processReceipt(pendingReceipt); return; }
+    await sendChat();
+  }
+
   async function sendChat() {
     const text = chatText.trim(); if (!text) return;
     try {
@@ -548,6 +593,6 @@
       {/if}
     </section>
     {#if editNotice}<aside class="edit-notice" role="status"><span>{editNotice.text}</span>{#if editNotice.transactionId}<button class="secondary" on:click={viewSavedTransaction}>View transaction</button>{/if}</aside>{/if}
-    {#if chatOpen}<button class="chat-scrim" aria-label="Close chat" on:click={() => chatOpen = false}></button><section class="chat" aria-label="Borton chat"><header class="chat-header"><div><strong>Borton</strong><small>Private budget assistant</small></div><button class="chat-close" on:click={() => chatOpen = false} aria-label="Close chat">×</button></header><nav class="chat-tabs"><button class:active={chatTab === 'chat'} on:click={() => chatTab = 'chat'}>Chat</button><button class:active={chatTab === 'queue'} on:click={() => chatTab = 'queue'}>Activity{#if assistantJobs.filter((job) => ['queued', 'processing', 'retry'].includes(job.status)).length}<span>{assistantJobs.filter((job) => ['queued', 'processing', 'retry'].includes(job.status)).length}</span>{/if}</button></nav>{#if chatTab === 'chat'}<div class="messages">{#each [...assistantJobs].reverse() as job}<article class="chat-thread"><div class="message user">{job.text}</div>{#if job.status === 'complete'}<div class="message assistant">{job.response}</div>{:else}<small class:failed={job.status === 'failed'} class="message-status">{queueLabel(job)}</small>{/if}</article>{:else}<div class="chat-empty"><strong>Ask Borton anything</strong><span>It can check receipts, find duplicates, and stage bulk changes for confirmation.</span></div>{/each}</div>{#if quickError}<output class="error chat-error">{quickError}</output>{/if}{#if receiptLoading}<small class="chat-receipt-status">Reading receipt…</small>{/if}<form class="chat-composer" on:paste|capture={pasteChatReceipt} on:submit|preventDefault={sendChat}><input class="sr-only" bind:this={chatImageInput} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" on:change={extractChatReceipt}><textarea id="chat-message" bind:value={chatText} rows="1" placeholder="Message Borton" on:keydown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendChat(); } }}></textarea><button type="button" class="chat-photo" on:click={() => chatImageInput?.click()} aria-label="Upload receipt photo" title="Upload receipt photo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h4l1.5-2h5L16 7h4v12H4V7Z"/><circle cx="12" cy="13" r="3.5"/></svg></button><DictationButton bind:value={chatText} {csrf} /><button aria-label="Send message" title="Send">↑</button></form>{:else}<div class="message-activity">{#each assistantJobs as job}<article><div><strong>{job.status === 'complete' ? 'Delivered' : queueLabel(job)}</strong><small>{new Date(job.createdAt).toLocaleString()}</small></div><p>{job.text}</p>{#if job.response}<p class="activity-response">{job.response}</p>{/if}</article>{:else}<div class="chat-empty"><strong>No message activity yet</strong><span>Queued and completed web messages will appear here.</span></div>{/each}</div>{/if}</section>{/if}
+    {#if chatOpen}<button class="chat-scrim" aria-label="Close chat" on:click={() => chatOpen = false}></button><section class="chat" aria-label="Borton chat"><header class="chat-header"><div><strong>Borton</strong><small>Private budget assistant</small></div><button class="chat-close" on:click={() => chatOpen = false} aria-label="Close chat">×</button></header><nav class="chat-tabs"><button class:active={chatTab === 'chat'} on:click={() => chatTab = 'chat'}>Chat</button><button class:active={chatTab === 'queue'} on:click={() => chatTab = 'queue'}>Activity{#if assistantJobs.filter((job) => ['queued', 'processing', 'retry'].includes(job.status)).length}<span>{assistantJobs.filter((job) => ['queued', 'processing', 'retry'].includes(job.status)).length}</span>{/if}</button></nav>{#if chatTab === 'chat'}<div class="messages">{#each [...assistantJobs].reverse() as job}<article class="chat-thread"><div class="message user">{job.text}</div>{#if job.status === 'complete'}<div class="message assistant">{job.response}</div>{:else}<small class:failed={job.status === 'failed'} class="message-status">{queueLabel(job)}</small>{/if}</article>{:else}<div class="chat-empty"><strong>Ask Borton anything</strong><span>It can check receipts, find duplicates, and stage bulk changes for confirmation.</span></div>{/each}</div>{#if quickError}<output class="error chat-error">{quickError}</output>{/if}{#if pendingReceipt}<div class="chat-attachment"><img src={pendingReceiptPreview} alt="Receipt preview"><div><strong>{pendingReceipt.name || 'Receipt photo'}</strong><small>{receiptRetryAt ? `Retrying automatically at ${receiptRetryAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Ready to read'}</small></div><button class="secondary" type="button" on:click={clearPendingReceipt} aria-label="Remove receipt" title="Remove receipt">×</button></div>{/if}{#if receiptLoading}<small class="chat-receipt-status">Reading receipt…</small>{/if}<form class="chat-composer" on:paste|capture={pasteChatReceipt} on:submit|preventDefault={submitChat}><input class="sr-only" bind:this={chatImageInput} type="file" accept="image/jpeg,image/png,image/webp,image/heic,image/heif" on:change={extractChatReceipt}><textarea id="chat-message" bind:value={chatText} rows="1" placeholder="Message Borton" on:keydown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitChat(); } }}></textarea><button type="button" class="chat-photo" on:click={() => chatImageInput?.click()} aria-label="Upload receipt photo" title="Upload receipt photo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h4l1.5-2h5L16 7h4v12H4V7Z"/><circle cx="12" cy="13" r="3.5"/></svg></button><DictationButton bind:value={chatText} {csrf} /><button aria-label={pendingReceipt ? 'Read receipt' : 'Send message'} title={pendingReceipt ? 'Read receipt' : 'Send'} disabled={receiptLoading}>↑</button></form>{:else}<div class="message-activity">{#each assistantJobs as job}<article><div><strong>{job.status === 'complete' ? 'Delivered' : queueLabel(job)}</strong><small>{new Date(job.createdAt).toLocaleString()}</small></div><p>{job.text}</p>{#if job.response}<p class="activity-response">{job.response}</p>{/if}</article>{:else}<div class="chat-empty"><strong>No message activity yet</strong><span>Queued and completed web messages will appear here.</span></div>{/each}</div>{/if}</section>{/if}
   </main>
 {/if}
