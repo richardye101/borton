@@ -81,3 +81,5 @@
   .chat-composer{position:fixed;z-index:10;right:0;left:0;top:calc(var(--borton-viewport-top,0px) + var(--borton-viewport-height,100dvh) - 4rem)}
   .chat .messages{padding-bottom:4.75rem}
 }
+
+.chat-receipt-status{margin:0 .75rem .35rem;color:#66766c;font-size:.78rem}
