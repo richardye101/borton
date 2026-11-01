@@ -94,7 +94,7 @@
       document.documentElement.style.removeProperty('--borton-viewport-top');
       document.body.classList.remove('chat-open');
       if (receiptRetryTimer) clearTimeout(receiptRetryTimer);
-      if (pendingReceiptPreview) URL.revokeObjectURL(pendingReceiptPreview);
+      if (pendingReceiptPreview.startsWith('blob:')) URL.revokeObjectURL(pendingReceiptPreview);
     };
   });
   $: if (typeof document !== 'undefined') document.body.classList.toggle('chat-open', chatOpen);
@@ -444,7 +444,7 @@
 
   function clearPendingReceipt() {
     if (receiptRetryTimer) clearTimeout(receiptRetryTimer);
-    if (pendingReceiptPreview) URL.revokeObjectURL(pendingReceiptPreview);
+    if (pendingReceiptPreview.startsWith('blob:')) URL.revokeObjectURL(pendingReceiptPreview);
     receiptRetryTimer = null;
     receiptRetryAt = null;
     receiptRetries = 0;
@@ -457,7 +457,9 @@
     clearPendingReceipt();
     quickError = '';
     pendingReceipt = image;
-    pendingReceiptPreview = URL.createObjectURL(image);
+    const reader = new FileReader();
+    reader.onload = () => { if (pendingReceipt === image) pendingReceiptPreview = String(reader.result || ''); };
+    reader.readAsDataURL(image);
   }
 
   async function extractChatReceipt(event) {
