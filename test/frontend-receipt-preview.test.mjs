@@ -16,3 +16,11 @@ test('chat receipt attachment opens a dismissible image preview without removing
   assert.match(css, /@media\(hover:hover\)\{\.chat-input-wrap \.chat-attachment>\.secondary\{opacity:0/);
   assert.match(css, /\.chat-input-wrap\.with-receipt textarea\{min-height:7rem;padding:6\.15rem \.7rem \.65rem\}/);
 });
+
+test('renders compact connection mapping cards with a secondary disconnect action', async () => {
+  const css = await readFile(new URL('../frontend/src/app.css', import.meta.url), 'utf8');
+  assert.match(css, /\.connections-page\{max-width:70rem/);
+  assert.match(css, /\.connection-map>label\{display:grid;grid-template-columns:minmax\(0,1fr\) minmax\(12rem,18rem\)/);
+  assert.match(css, /\.connection-card>button\{justify-self:start/);
+  assert.match(css, /\.connection-card header>div:last-child button:last-child\{background:transparent/);
+});
