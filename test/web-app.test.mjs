@@ -36,3 +36,17 @@ test('queues web assistant messages and exposes safe message history', async () 
   assert.deepEqual(await app.assistantMessages(), [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]);
   assert.deepEqual(received, [{ text: 'Classify these', context: { page: 'home' } }]);
 });
+
+test('delegates Plaid connection actions without exposing credentials', async () => {
+  const calls = [];
+  const plaid = { connections: async () => ({ configured: true, connections: [] }), linkToken: async () => ({ linkToken: 'short-lived' }), complete: async (payload) => { calls.push(payload); return { id: 'item' }; }, setMappings: async (payload) => payload, sync: async (id) => ({ id, added: 1 }), reconnectToken: async (id) => ({ linkToken: id }), disconnect: async (id) => ({ id, status: 'complete' }) };
+  const app = createWebApplication({ actual: {}, extractor: {}, plaid });
+  assert.deepEqual(await app.plaidConnections(), { configured: true, connections: [] });
+  assert.deepEqual(await app.plaidLinkToken({}), { linkToken: 'short-lived' });
+  assert.deepEqual(await app.plaidComplete({ publicToken: 'public' }), { id: 'item' });
+  assert.deepEqual(calls, [{ publicToken: 'public' }]);
+  assert.deepEqual(await app.plaidMapping({ id: 'item', mappings: [] }), { id: 'item', mappings: [] });
+  assert.deepEqual(await app.plaidSync({ id: 'item' }), { id: 'item', added: 1 });
+  assert.deepEqual(await app.plaidReconnectToken({ id: 'item' }), { linkToken: 'item' });
+  assert.deepEqual(await app.plaidDisconnect({ id: 'item' }), { id: 'item', status: 'complete' });
+});

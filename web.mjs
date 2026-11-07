@@ -11,6 +11,7 @@ import { createWebMessageQueue } from './web-message-queue.mjs';
 import { createGeminiGenerate, createGroqGenerate } from './agent.mjs';
 import { createWebAuth } from './web-auth.mjs';
 import { createWebServer } from './web-server.mjs';
+import { createPlaidSync } from './plaid-sync.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const loadEnv = (file) => {
@@ -57,17 +58,20 @@ const generate = async (parts, responseSchema) => {
 };
 const cardmap = fs.existsSync(path.join(root, 'cardmap.json')) ? JSON.parse(fs.readFileSync(path.join(root, 'cardmap.json'), 'utf8')) : {};
 const actual = createActualWeb({ api: actualApi, dataDir, lockPath: path.resolve(root, cfg.actual.dataDir, 'actual.lock'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', owedAccountFormat: cfg.defaults?.owedAccountFormat || 'Owed by {name}', cardmap });
+const plaid = createPlaidSync({ clientId: process.env.PLAID_CLIENT_ID, secret: process.env.PLAID_SECRET, env: process.env.PLAID_ENV, tokenKey: process.env.PLAID_TOKEN_KEY, statePath: path.join(dataDir, 'plaid-items.json'), actualAccounts: async () => (await actual.bootstrap()).accounts, importTransactions: (rows) => actual.importTransactions(rows) });
 const assistant = createWebAgent({ api: actualApi, generate: chatGenerate, statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
 const assistantQueue = createWebMessageQueue({ assistant, filePath: path.join(dataDir, 'web-message-queue.json') });
 const transcriber = process.env.GROQ_API_KEY ? createGroqAudioTranscriber({ apiKey: process.env.GROQ_API_KEY, model: cfg.groq?.transcriptionModel || 'whisper-large-v3-turbo', maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 }) : createAudioTranscriber({ generate, maxBytes: web.maxAudioBytes || 5 * 1024 * 1024 });
-const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber, cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant, assistantQueue });
+const app = createWebApplication({ actual, extractor: createReceiptExtractor({ generate, maxBytes: web.maxUploadBytes || 10 * 1024 * 1024 }), transcriber, cardmap, fallbackCategory: cfg.defaults?.fallbackCategory || 'General', assistant, assistantQueue, plaid });
 const auth = createWebAuth({ password: process.env.BORTON_WEB_PASSWORD, sessionSecret: process.env.BORTON_WEB_SESSION_SECRET, secure: web.https === true });
 const server = createWebServer({ auth, app, staticDir: path.join(root, 'web'), allowedRemote: web.allowedRemote || ['127.0.0.1'], trustedRemotes: web.trustedAutoLoginRemote || [], maxUploadBytes: web.maxUploadBytes || 10 * 1024 * 1024 });
 server.listen(web.port || 28456, web.host || '127.0.0.1', () => console.log(`Borton Web listening on http://${web.host || '127.0.0.1'}:${web.port || 28456}`));
+const plaidTimer = setInterval(() => { void plaid.syncHealthy(); }, 30 * 60 * 1000);
 let stopping = false;
 const shutdown = () => {
   if (stopping) return;
   stopping = true;
+  clearInterval(plaidTimer);
   assistantQueue.close();
   server.shutdown(() => actual.close().finally(() => process.exit(0)));
 };

@@ -2,7 +2,7 @@ import { normalizeReceipts } from './receipt-utils.mjs';
 
 const clientId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant, assistantQueue } = {}) {
+export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant, assistantQueue, plaid } = {}) {
   if (!actual || !extractor) throw new Error('actual and extractor are required.');
   return {
     bootstrap: () => actual.bootstrap(),
@@ -36,5 +36,12 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
     assistantMessages: () => assistantQueue?.list() || [],
     assistantConfirm: (payload) => assistant?.confirm(payload.planId),
     assistantCancel: (payload) => assistant?.cancel(payload.planId),
+    plaidConnections: () => plaid?.connections() || { configured: false, connections: [], actualAccounts: [] },
+    plaidLinkToken: (payload) => plaid ? plaid.linkToken(payload) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    plaidComplete: (payload) => plaid ? plaid.complete(payload) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    plaidMapping: (payload) => plaid ? plaid.setMappings(payload) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    plaidSync: ({ id }) => plaid ? plaid.sync(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    plaidReconnectToken: ({ id }) => plaid ? plaid.reconnectToken(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    plaidDisconnect: ({ id }) => plaid ? plaid.disconnect(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
   };
 }

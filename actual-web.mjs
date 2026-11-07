@@ -172,6 +172,34 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
     },
     checkDuplicates: duplicateRows,
     async validateBatch({ rows }) { return { rows: await validateRows(rows) }; },
+    importTransactions(rows = []) {
+      return runExclusive(async () => {
+        if (!Array.isArray(rows) || rows.length > 500) throw error('Invalid Plaid import.');
+        await sync();
+        const { accounts, categories, payeeRows } = await maps();
+        const defaultCategory = [...categories.values()].find((category) => !category.hidden && !category.is_income);
+        if (!defaultCategory) throw error('Create a spending category before importing Plaid transactions.');
+        const payeesByName = new Map(payeeRows.map((payee) => [payee.name.toLowerCase(), payee]));
+        const payee = async (name) => {
+          const key = name.toLowerCase(); let found = payeesByName.get(key);
+          if (!found) { found = { id: await api.createPayee({ name }), name }; payeesByName.set(key, found); }
+          return found;
+        };
+        let added = 0; let modified = 0;
+        for (const row of rows) {
+          if (!row || !accounts.get(row.accountId) || accounts.get(row.accountId).closed || !isValidExpenseDate(row.date) || !Number.isSafeInteger(row.amountCents) || !row.importedId || !row.merchant) continue;
+          const existing = (await api.getTransactions(row.accountId, row.date, row.date)).find((transaction) => transaction.imported_id === row.importedId);
+          const foundPayee = await payee(String(row.merchant).trim());
+          if (existing) {
+            if (row.modified && !existing.reconciled) { await api.updateTransaction(existing.id, { date: row.date, amount: row.amountCents, payee: foundPayee.id, cleared: true }); modified += 1; }
+            continue;
+          }
+          await api.addTransactions(row.accountId, [{ account: row.accountId, date: row.date, amount: row.amountCents, payee: foundPayee.id, category: defaultCategory.id, cleared: true, imported_id: row.importedId }], { runTransfers: true }); added += 1;
+        }
+        await api.sync(); lastSync = now();
+        return { added, modified };
+      });
+    },
     editTransaction({ id, merchant, amountCents, date, accountId, categoryId, note = '', splitTransactionIds = [] } = {}) {
       return runExclusive(async () => {
         if (typeof id !== 'string' || !id || !String(merchant || '').trim() || !Number.isSafeInteger(amountCents) || amountCents <= 0 || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Enter valid expense details.');

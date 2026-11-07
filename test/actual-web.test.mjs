@@ -40,6 +40,21 @@ test('returns newest non-transfer transactions and finds likely duplicates', asy
   assert.equal(invalid.rows[0].status, 'invalid');
 });
 
+test('imports Plaid rows idempotently and only changes unreconciled amount details', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'plaid-old', account: 'a1', date: '2026-11-06', amount: -100, payee: 'p1', category: 'c1', notes: 'kept', imported_id: 'plaid-1', reconciled: false }]);
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
+  const result = await web.importTransactions([
+    { importedId: 'plaid-1', accountId: 'a1', date: '2026-11-06', amountCents: -1234, merchant: 'New shop', modified: true, cleared: true },
+    { importedId: 'plaid-2', accountId: 'a1', date: '2026-11-07', amountCents: 456, merchant: 'Refund', cleared: true },
+  ]);
+  assert.deepEqual(result, { added: 1, modified: 1 });
+  assert.deepEqual(api.writes, [
+    { id: 'plaid-old', fields: { date: '2026-11-06', amount: -1234, payee: 'p3', cleared: true } },
+    { account: 'a1', rows: [{ account: 'a1', date: '2026-11-07', amount: 456, payee: 'p4', category: 'c1', cleared: true, imported_id: 'plaid-2' }] },
+  ]);
+});
+
 test('summarizes expense spending by category, account, and month', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const web = createActualWeb({ api: fakeActual(), dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });

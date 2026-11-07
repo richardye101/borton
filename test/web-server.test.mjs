@@ -37,7 +37,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');
   fs.writeFileSync(path.join(staticDir, 'client-state.mjs'), 'export const Borton = true;');
   const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
-  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }), assistantMessages: async () => [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }] };
+  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }), assistantMessages: async () => [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }], plaidConnections: async () => ({ configured: true, connections: [] }), plaidSync: async ({ id }) => ({ id, added: 1 }) };
   await withServer({ auth, app, staticDir, allowedRemote: ['127.0.0.1'] }, async (port) => {
     const page = await request(port);
     assert.equal(page.status, 200);
@@ -45,6 +45,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const summaryPage = await request(port, { path: '/summary' });
     assert.equal(summaryPage.status, 200);
     assert.match(summaryPage.body, /Borton/);
+    assert.equal((await request(port, { path: '/connections' })).status, 200);
     assert.equal(page.headers['cache-control'], 'no-store');
     const module = await request(port, { path: '/client-state.mjs' });
     assert.equal(module.status, 200);
@@ -67,6 +68,8 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.deepEqual(JSON.parse(bootstrap.body), { transactions: [] });
     const assistantMessages = await request(port, { path: '/api/assistant/messages', headers: { cookie } });
     assert.deepEqual(JSON.parse(assistantMessages.body), [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]);
+    assert.deepEqual(JSON.parse((await request(port, { path: '/api/plaid/connections', headers: { cookie } })).body), { configured: true, connections: [] });
+    assert.deepEqual(JSON.parse((await request(port, { method: 'POST', path: '/api/plaid/connections/item-1/sync', headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: '{}' })).body), { id: 'item-1', added: 1 });
     const summary = await request(port, { path: '/api/summary?days=30', headers: { cookie } });
     assert.equal(summary.status, 200);
     assert.deepEqual(JSON.parse(summary.body), { days: 30, totalCents: 1234 });

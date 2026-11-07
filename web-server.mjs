@@ -43,7 +43,7 @@ const allowed = (remote, rule) => {
   });
 };
 const safeStaticPath = (pathname) => {
-  if (pathname === '/' || /^\/(?:home|summary|shared|add|check)$/.test(pathname) || /^\/home\/transactions\/[^/]+$/.test(pathname)) return 'index.html';
+  if (pathname === '/' || /^\/(?:home|summary|shared|connections|add|check)$/.test(pathname) || /^\/home\/transactions\/[^/]+$/.test(pathname)) return 'index.html';
   return pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
 };
 
@@ -65,6 +65,9 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'GET /api/assistant/messages': 'assistantMessages',
     'POST /api/assistant/confirm': 'assistantConfirm',
     'POST /api/assistant/cancel': 'assistantCancel',
+    'GET /api/plaid/connections': 'plaidConnections',
+    'POST /api/plaid/link-token': 'plaidLinkToken',
+    'POST /api/plaid/link-complete': 'plaidComplete',
   };
   const server = http.createServer(async (req, res) => {
     const remote = req.socket.remoteAddress || '';
@@ -107,7 +110,10 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
         const payload = req.method === 'POST' && url.pathname === '/api/extract' ? await readMultipartFile(req, maxUploadBytes, 'Receipt image') : req.method === 'POST' && url.pathname === '/api/transcribe' ? await readMultipartFile(req, 5 * 1024 * 1024, 'Audio recording') : req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
         if (req.method === 'POST' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'Cross-origin request rejected.' });
         if (req.method === 'POST' && !auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
-        const handler = dispatch[`${req.method} ${url.pathname}`];
+        const dynamic = url.pathname.match(/^\/api\/plaid\/connections\/([^/]+)\/(mapping|sync|reconnect-token|disconnect)$/);
+        const dynamicHandlers = { mapping: 'plaidMapping', sync: 'plaidSync', 'reconnect-token': 'plaidReconnectToken', disconnect: 'plaidDisconnect' };
+        const handler = dynamic ? dynamicHandlers[dynamic[2]] : dispatch[`${req.method} ${url.pathname}`];
+        if (dynamic) payload.id = decodeURIComponent(dynamic[1]);
         if (!handler || typeof app[handler] !== 'function') return json(res, 404, { error: 'Not found.' });
         return json(res, 200, await app[handler](payload, session));
       } catch (error) { return json(res, error.statusCode || 400, { error: error.message || 'Request failed.' }); }
@@ -117,7 +123,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     if (!relative || !contentTypes[path.extname(relative)]) return json(res, 404, { error: 'Not found.' });
     try {
       const file = await fs.readFile(path.join(staticDir, relative));
-      res.writeHead(200, { 'Content-Type': contentTypes[path.extname(relative)], 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'" });
+      res.writeHead(200, { 'Content-Type': contentTypes[path.extname(relative)], 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "default-src 'self'; connect-src 'self' https://*.plaid.com; img-src 'self' data:; style-src 'self'; script-src 'self' https://cdn.plaid.com; frame-src https://cdn.plaid.com https://*.plaid.com" });
       res.end(file);
     } catch { json(res, 404, { error: 'Not found.' }); }
   });

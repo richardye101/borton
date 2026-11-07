@@ -1,4 +1,4 @@
-const views = new Set(['home', 'summary', 'shared', 'add', 'check']);
+const views = new Set(['home', 'summary', 'shared', 'connections', 'add', 'check']);
 
 export function routeFromPath(pathname = '/') {
   const transaction = pathname.match(/^\/home\/transactions\/([^/]+)$/);
