@@ -41,3 +41,10 @@ test('lets the completed Reviews view audit and display verified historical impo
   assert.match(app, /Review past imports/);
   assert.match(app, /Already imported/);
 });
+
+test('automatically shows verified historical imports when the open Reviews inbox is empty', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /reviewsStatus === 'open' && !reviewQuery && reviewsData\.length === 0/);
+  assert.match(app, /\/api\/reviews\?status=completed/);
+  assert.match(app, /completed\.some\(\(row\) => row\.historical\)/);
+});
