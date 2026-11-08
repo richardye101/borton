@@ -24,3 +24,8 @@ test('renders compact connection mapping cards with a secondary disconnect actio
   assert.match(css, /\.connection-card>button\{justify-self:start/);
   assert.match(css, /\.connection-card header>div:last-child button:last-child\{background:transparent/);
 });
+
+test('refreshes Connections when Plaid Link exits so controls cannot remain stuck', async () => {
+  const app = await readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /onExit: \(\) => \{ plaidBusy = false; void loadPlaid\(\); \}/);
+});

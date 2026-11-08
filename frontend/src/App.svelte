@@ -199,7 +199,7 @@
     try {
       const { linkToken } = await request(connectionId ? `/api/plaid/connections/${encodeURIComponent(connectionId)}/reconnect-token` : '/api/plaid/link-token', { csrf, method: 'POST', body: {} });
       if (!window.Plaid) await new Promise((resolve, reject) => { const script = document.createElement('script'); script.src = 'https://cdn.plaid.com/link/v2/stable/link-initialize.js'; script.onload = resolve; script.onerror = () => reject(Error('Could not load Plaid Link.')); document.head.append(script); });
-      window.Plaid.create({ token: linkToken, onSuccess: async (publicToken, metadata) => { try { await request('/api/plaid/link-complete', { csrf, method: 'POST', body: { publicToken, metadata, connectionId } }); await loadPlaid(); } catch (error) { plaidError = error.message; } finally { plaidBusy = false; } }, onExit: () => { plaidBusy = false; } }).open();
+      window.Plaid.create({ token: linkToken, onSuccess: async (publicToken, metadata) => { try { await request('/api/plaid/link-complete', { csrf, method: 'POST', body: { publicToken, metadata, connectionId } }); await loadPlaid(); } catch (error) { plaidError = error.message; } finally { plaidBusy = false; } }, onExit: () => { plaidBusy = false; void loadPlaid(); } }).open();
     } catch (error) { plaidError = error.message; plaidBusy = false; }
   }
   async function savePlaidMapping(connection) { try { await request(`/api/plaid/connections/${encodeURIComponent(connection.id)}/mapping`, { csrf, method: 'POST', body: { mappings: connection.accounts.map((account) => ({ plaidAccountId: account.id, actualAccountId: account.actualAccountId })) } }); await loadPlaid(); } catch (error) { plaidError = error.message; } }
