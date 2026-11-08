@@ -40,6 +40,25 @@ test('creates a Canadian transactions Link token and advances cursor only after 
   assert.equal(JSON.parse(await plaid.debugState()).items[0].cursor, 'cursor-2');
 });
 
+test('reads only mapped historical Plaid transactions across result pages', async () => {
+  const statePath = path.join(temp(), 'plaid-items.json'); const calls = [];
+  const plaid = createPlaidSync({ ...config, statePath, now: () => Date.parse('2026-11-08T12:00:00Z'), actualAccounts: async () => [{ id: 'a1', name: 'Visa' }], fetch: async (url, init) => {
+    const body = JSON.parse(init.body); calls.push({ url, body });
+    if (url.endsWith('/item/public_token/exchange')) return response({ access_token: 'access', item_id: 'item-1' });
+    if (url.endsWith('/transactions/get')) return body.options.offset === 0
+      ? response({ total_transactions: 3, transactions: [{ transaction_id: 'one', account_id: 'p1', date: '2026-11-07', amount: 12.34, merchant_name: 'Shop', pending: false }, { transaction_id: 'skip', account_id: 'p2', date: '2026-11-07', amount: 8, merchant_name: 'Other', pending: false }] })
+      : response({ total_transactions: 3, transactions: [{ transaction_id: 'two', account_id: 'p1', date: '2026-11-06', amount: -1.25, merchant_name: 'Refund', pending: false }] });
+    throw new Error('Unexpected request');
+  } });
+  await plaid.complete({ publicToken: 'public', metadata: { institution: { name: 'Bank' }, accounts: [{ id: 'p1', name: 'Visa', type: 'credit' }, { id: 'p2', name: 'Savings', type: 'depository' }] } });
+  await plaid.setMappings({ id: 'item-1', mappings: [{ plaidAccountId: 'p1', actualAccountId: 'a1' }] });
+
+  const result = await plaid.history({ days: 10, pageSize: 2 });
+
+  assert.deepEqual(result, { scanned: 2, rows: [{ importedId: 'one', accountId: 'a1', date: '2026-11-07', amountCents: -1234, merchant: 'Shop', cleared: true, modified: false, institution: 'Bank', account: 'Visa' }, { importedId: 'two', accountId: 'a1', date: '2026-11-06', amountCents: 125, merchant: 'Refund', cleared: true, modified: false, institution: 'Bank', account: 'Visa' }] });
+  assert.deepEqual(calls.filter((call) => call.url.endsWith('/transactions/get')).map((call) => call.body.options), [{ count: 2, offset: 0 }, { count: 2, offset: 2 }]);
+});
+
 test('rejects duplicate Actual mappings before syncing', async () => {
   const plaid = createPlaidSync({ ...config, statePath: path.join(temp(), 'plaid-items.json'), actualAccounts: async () => [{ id: 'a1', name: 'Visa' }], fetch: async (_url, init) => JSON.parse(init.body).public_token ? response({ access_token: 'access', item_id: 'item-1' }) : response({ link_token: 'link' }) });
   await plaid.complete({ publicToken: 'public', metadata: { accounts: [{ id: 'p1', name: 'One', type: 'credit' }, { id: 'p2', name: 'Two', type: 'credit' }] } });

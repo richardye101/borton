@@ -152,6 +152,22 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         .filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
         .map((row) => ({ id: row.id, accountId, date: String(row.date), amountCents: row.amount, merchant: payees.get(row.payee)?.name || row.payee_name || '', importedId: row.imported_id || '' }));
     },
+    async importedMatches(rows = []) {
+      return runExclusive(async () => {
+        if (!Array.isArray(rows) || rows.length > 500) throw error('Invalid historical import audit.');
+        await sync(); const { accounts } = await maps(); const matches = [];
+        const byAccount = new Map();
+        for (const row of rows) if (row?.importedId && accounts.has(row.accountId) && !accounts.get(row.accountId).closed && /^\d{4}-\d{2}-\d{2}$/.test(row.date || '')) {
+          const group = byAccount.get(row.accountId) || []; group.push(row); byAccount.set(row.accountId, group);
+        }
+        for (const [accountId, group] of byAccount) {
+          const wanted = new Map(group.map((row) => [row.importedId, row])); const dates = group.map((row) => row.date).sort();
+          const existing = await api.getTransactions(accountId, dates[0], dates.at(-1));
+          for (const transaction of existing) if (wanted.has(transaction.imported_id)) matches.push({ ...wanted.get(transaction.imported_id), transactionId: transaction.id });
+        }
+        return matches;
+      });
+    },
     async shared() {
       await sync(); const { accounts, payees } = await maps();
       const people = [];

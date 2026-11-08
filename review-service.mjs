@@ -10,6 +10,9 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
       for (const row of rows) prepared.push({ ...row, candidates: rankReviewCandidates(row, await actual.reviewCandidates(row)) });
       return inbox.stagePlaid(prepared);
     },
+    async auditHistoricalImports(rows = []) {
+      return actual.importedMatches(rows);
+    },
     async matchReceipt({ row, receipt } = {}) {
       const accountName = cardmap.byLast4?.[receipt?.card_last4];
       if (!accountName || !receipt?.date || !Number.isFinite(Number(receipt.total))) return { candidates: [] };

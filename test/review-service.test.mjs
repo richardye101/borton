@@ -31,6 +31,16 @@ test('matches a receipt to the mapped account without searching unrelated accoun
   assert.deepEqual(await reviews.matchReceipt({ receipt: { merchant: 'Coffee', date: '2026-11-07', total: 4.5, card_last4: '1234' } }), { accountId: 'a1', account: 'Visa', candidates: [{ id: 'actual-1', confidence: 'strong', daysApart: 1, evidence: { sameAmount: true, merchant: 'contains' } }] });
 });
 
+test('keeps only verified same-account historical imports for audit staging', async () => {
+  const inbox = { list: () => [] };
+  const actual = {
+    importedMatches: async (rows) => rows.filter((row) => row.importedId === 'kept').map((row) => ({ ...row, transactionId: 'actual-1' })),
+  };
+  const reviews = createReviewService({ actual, inbox });
+
+  assert.deepEqual(await reviews.auditHistoricalImports([{ importedId: 'kept', accountId: 'a1' }, { importedId: 'other', accountId: 'a2' }]), [{ importedId: 'kept', accountId: 'a1', transactionId: 'actual-1' }]);
+});
+
 test('attaches a receipt to an approved Actual candidate without changing the transaction', async () => {
   const resolved = [];
   const inbox = { list: () => [{ id: 'receipt:one', source: 'receipt', candidates: [{ id: 'actual-1', confidence: 'strong' }] }], resolve: (id, resolution) => { resolved.push({ id, resolution }); return { id, status: 'completed', resolution }; } };

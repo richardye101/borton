@@ -9,8 +9,12 @@ const postedRows = (item, changes) => [...changes.added, ...changes.modified].fi
   const account = item.accounts.find((candidate) => candidate.id === row.account_id);
   return { importedId: row.transaction_id, accountId: account.actualAccountId, date: row.date, amountCents: -Math.round(Number(row.amount || 0) * 100), merchant: String(row.merchant_name || row.name || 'Plaid transaction').trim(), cleared: true, modified: changes.modified.some((candidate) => candidate.transaction_id === row.transaction_id) };
 });
+const historicalRows = (item, rows) => rows.filter((row) => !row.pending && item.accounts.some((account) => account.id === row.account_id && account.actualAccountId)).map((row) => {
+  const account = item.accounts.find((candidate) => candidate.id === row.account_id);
+  return { importedId: row.transaction_id, accountId: account.actualAccountId, date: row.date, amountCents: -Math.round(Number(row.amount || 0) * 100), merchant: String(row.merchant_name || row.name || 'Plaid transaction').trim(), cleared: true, modified: false, institution: item.institution || 'Connected bank', account: account.name || 'Account' };
+});
 
-export function createPlaidSync({ clientId = '', secret = '', env = '', tokenKey = '', statePath, actualAccounts = async () => [], importTransactions = async () => {}, fetch: fetcher = globalThis.fetch } = {}) {
+export function createPlaidSync({ clientId = '', secret = '', env = '', tokenKey = '', statePath, actualAccounts = async () => [], importTransactions = async () => {}, fetch: fetcher = globalThis.fetch, now = Date.now } = {}) {
   const key = asKey(tokenKey);
   const configured = Boolean(clientId && secret && env === 'production' && key && statePath && fetcher);
   const base = 'https://production.plaid.com';
@@ -67,6 +71,19 @@ export function createPlaidSync({ clientId = '', secret = '', env = '', tokenKey
         }
         item.cursor = cursor; item.lastSyncedAt = new Date().toISOString(); item.lastError = ''; item.status = 'ready'; item.removedCount = (item.removedCount || 0) + removed; save(state); return { id: item.id, added, modified, removed };
       } catch (cause) { item.lastError = cause.message; if (/ITEM_LOGIN_REQUIRED|reconnect/i.test(cause.message)) item.status = 'reconnect_needed'; save(state); throw cause; }
+    },
+    async history({ days = 180, pageSize = 500 } = {}) {
+      requireConfigured(); const windowDays = Math.min(Math.max(Number(days) || 180, 1), 730); const count = Math.min(Math.max(Number(pageSize) || 500, 1), 500);
+      const endDate = new Date(now()).toISOString().slice(0, 10); const startDate = new Date(Number(now()) - (windowDays - 1) * 86_400_000).toISOString().slice(0, 10); const rows = [];
+      for (const item of load().items.filter((candidate) => candidate.status === 'ready' && candidate.accounts.some((account) => account.actualAccountId))) {
+        let offset = 0; let total = Infinity;
+        while (offset < total) {
+          const result = await call('/transactions/get', { access_token: decrypt(item.accessToken), start_date: startDate, end_date: endDate, options: { count, offset } });
+          rows.push(...historicalRows(item, result.transactions || [])); total = Number(result.total_transactions || 0); offset += count;
+          if (!(result.transactions || []).length) break;
+        }
+      }
+      return { scanned: rows.length, rows };
     },
     async reconnectToken(id) { return this.linkToken({ connectionId: id }); },
     async disconnect(id) { const { state, item } = find(id); await call('/item/remove', { access_token: decrypt(item.accessToken) }); state.items = state.items.filter((candidate) => candidate !== item); save(state); return { id, status: 'complete' }; },
