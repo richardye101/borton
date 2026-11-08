@@ -24,6 +24,12 @@ test('routes Reviews as a first-class page', () => {
   assert.equal(pathForRoute('reviews'), '/reviews');
 });
 
+test('keeps Reviews actions out of the title area', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /class="reviews-heading"/);
+  assert.match(app, /class="reviews-tools"/);
+});
+
 test('shows an action-oriented empty state for Reviews instead of an empty table', async () => {
   const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
   const css = await fs.readFile(new URL('../frontend/src/app.css', import.meta.url), 'utf8');
