@@ -26,8 +26,10 @@ test('routes Reviews as a first-class page', () => {
 
 test('shows an action-oriented empty state for Reviews instead of an empty table', async () => {
   const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  const css = await fs.readFile(new URL('../frontend/src/app.css', import.meta.url), 'utf8');
   assert.match(app, /filteredReviews\(\)\.length/);
   assert.match(app, /All caught up/);
   assert.match(app, /show\('connections'\)/);
   assert.match(app, /on:change=\{uploadReviewReceipts\}/);
+  assert.match(css, /\.reviews-empty-state\{[^}]*grid-column:2/);
 });
