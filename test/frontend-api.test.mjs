@@ -37,6 +37,16 @@ test('opens a completed review’s matched Actual transaction and exposes its de
   assert.match(app, /Matched Actual transaction/);
   assert.match(app, /function editMatchedReviewTransaction/);
   assert.match(app, /Open & edit/);
+  assert.match(app, /class="review-detail-facts"/);
+  assert.match(app, /<dt>Account<\/dt><dd>\{reviewDetail\.account\}/);
+  assert.match(app, /<dt>Category<\/dt><dd>\{reviewDetail\.category/);
+});
+
+test('can queue a transaction for review later without changing its note', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /\/api\/reviews\/later/);
+  assert.match(app, /Review later/);
+  assert.match(app, /Waiting for repayment/);
 });
 
 test('shows an action-oriented empty state for Reviews instead of an empty table', async () => {

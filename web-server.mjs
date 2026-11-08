@@ -70,6 +70,7 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'POST /api/plaid/link-complete': 'plaidComplete',
     'GET /api/reviews': 'reviews',
     'POST /api/reviews/audit-history': 'auditReviewHistory',
+    'POST /api/reviews/later': 'stageReviewLater',
     'POST /api/reviews/receipts': 'uploadReceipts',
   };
   const server = http.createServer(async (req, res) => {

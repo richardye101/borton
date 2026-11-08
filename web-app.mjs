@@ -50,6 +50,7 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
     plaidDisconnect: ({ id }) => plaid ? plaid.disconnect(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     reviews: (query) => reviews ? reviews.list(query) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
     resolveReview: (payload) => reviews ? reviews.resolve(payload) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
+    stageReviewLater: (payload) => reviews ? reviews.stageManual(payload) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
     uploadReceipts: ({ files = [] }) => reviews ? { rows: reviews.stageReceipts(files) } : Promise.reject(Object.assign(new Error('Receipt uploads are unavailable on this server.'), { statusCode: 503 })),
   };
 }

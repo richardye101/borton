@@ -203,9 +203,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       return runExclusive(async () => {
         if (!Array.isArray(rows) || rows.length > 500) throw error('Invalid Plaid import.');
         await sync();
-        const { accounts, categories, payeeRows } = await maps();
-        const defaultCategory = [...categories.values()].find((category) => !category.hidden && !category.is_income);
-        if (!defaultCategory) throw error('Create a spending category before importing Plaid transactions.');
+        const { accounts, payeeRows } = await maps();
         const payeesByName = new Map(payeeRows.map((payee) => [payee.name.toLowerCase(), payee]));
         const payee = async (name) => {
           const key = name.toLowerCase(); let found = payeesByName.get(key);
@@ -221,7 +219,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
             if (row.modified && !existing.reconciled) { await api.updateTransaction(existing.id, { date: row.date, amount: row.amountCents, payee: foundPayee.id, cleared: true }); modified += 1; }
             continue;
           }
-          await api.addTransactions(row.accountId, [{ account: row.accountId, date: row.date, amount: row.amountCents, payee: foundPayee.id, category: defaultCategory.id, cleared: true, imported_id: row.importedId }], { runTransfers: true }); added += 1;
+          await api.addTransactions(row.accountId, [{ account: row.accountId, date: row.date, amount: row.amountCents, payee: foundPayee.id, cleared: true, imported_id: row.importedId }], { runTransfers: true }); added += 1;
         }
         await api.sync(); lastSync = now();
         return { added, modified };

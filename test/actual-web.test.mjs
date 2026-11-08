@@ -51,7 +51,7 @@ test('imports Plaid rows idempotently and only changes unreconciled amount detai
   assert.deepEqual(result, { added: 1, modified: 1 });
   assert.deepEqual(api.writes, [
     { id: 'plaid-old', fields: { date: '2026-11-06', amount: -1234, payee: 'p3', cleared: true } },
-    { account: 'a1', rows: [{ account: 'a1', date: '2026-11-07', amount: 456, payee: 'p4', category: 'c1', cleared: true, imported_id: 'plaid-2' }] },
+    { account: 'a1', rows: [{ account: 'a1', date: '2026-11-07', amount: 456, payee: 'p4', cleared: true, imported_id: 'plaid-2' }] },
   ]);
 });
 
