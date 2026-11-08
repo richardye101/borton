@@ -42,6 +42,19 @@ test('keeps only verified same-account historical imports for audit staging', as
   assert.deepEqual(staged, [{ importedId: 'kept', accountId: 'a1', transactionId: 'actual-1' }]);
 });
 
+test('audits historical imports in Actual-safe pages', async () => {
+  const calls = [];
+  const inbox = { list: () => [], stageHistoricalPlaid: (rows) => ({ staged: rows.length, existing: 0 }) };
+  const actual = {
+    importedMatches: async (rows) => { calls.push(rows.length); return rows.map((row) => ({ ...row, transactionId: `actual-${row.importedId}` })); },
+  };
+  const reviews = createReviewService({ actual, inbox });
+  const rows = Array.from({ length: 501 }, (_, index) => ({ importedId: String(index), accountId: 'a1' }));
+
+  assert.deepEqual(await reviews.auditHistoricalImports(rows), { scanned: 501, matched: 501, staged: 501, existing: 0 });
+  assert.deepEqual(calls, [500, 1]);
+});
+
 test('attaches a receipt to an approved Actual candidate without changing the transaction', async () => {
   const resolved = [];
   const inbox = { list: () => [{ id: 'receipt:one', source: 'receipt', candidates: [{ id: 'actual-1', confidence: 'strong' }] }], resolve: (id, resolution) => { resolved.push({ id, resolution }); return { id, status: 'completed', resolution }; } };

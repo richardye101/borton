@@ -11,7 +11,8 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
       return inbox.stagePlaid(prepared);
     },
     async auditHistoricalImports(rows = []) {
-      const matches = await actual.importedMatches(rows);
+      const matches = [];
+      for (let index = 0; index < rows.length; index += 500) matches.push(...await actual.importedMatches(rows.slice(index, index + 500)));
       return { scanned: rows.length, matched: matches.length, ...inbox.stageHistoricalPlaid(matches) };
     },
     async matchReceipt({ row, receipt } = {}) {
