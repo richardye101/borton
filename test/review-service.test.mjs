@@ -55,6 +55,16 @@ test('audits historical imports in Actual-safe pages', async () => {
   assert.deepEqual(calls, [500, 1]);
 });
 
+test('never applies a completed historical audit record to Actual again', async () => {
+  let actualWrites = 0;
+  const inbox = { list: () => [{ id: 'plaid:old', source: 'plaid', status: 'completed', historical: true }] };
+  const actual = { applyReview: async () => { actualWrites += 1; } };
+  const reviews = createReviewService({ actual, inbox });
+
+  await assert.rejects(() => reviews.resolve({ id: 'plaid:old', resolution: { action: 'import' } }), /Completed reviews cannot be changed/);
+  assert.equal(actualWrites, 0);
+});
+
 test('attaches a receipt to an approved Actual candidate without changing the transaction', async () => {
   const resolved = [];
   const inbox = { list: () => [{ id: 'receipt:one', source: 'receipt', candidates: [{ id: 'actual-1', confidence: 'strong' }] }], resolve: (id, resolution) => { resolved.push({ id, resolution }); return { id, status: 'completed', resolution }; } };

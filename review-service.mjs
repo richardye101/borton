@@ -26,6 +26,7 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
     },
     async resolve({ id, resolution } = {}) {
       const row = find(id); if (!row) throw new Error('Review not found.');
+      if (row.status === 'completed' || row.historical) throw new Error('Completed reviews cannot be changed.');
       if (row.source === 'receipt') {
         if (resolution?.action !== 'attach' || !row.candidates?.some((candidate) => candidate.id === resolution.transactionId) || String(resolution.transactionId).startsWith('plaid:')) throw new Error('Choose an approved Actual transaction for this receipt.');
         return inbox.resolve(id, { ...resolution, status: 'complete' });
