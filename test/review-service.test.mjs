@@ -72,3 +72,13 @@ test('attaches a receipt to an approved Actual candidate without changing the tr
   assert.deepEqual(await reviews.resolve({ id: 'receipt:one', resolution: { action: 'attach', transactionId: 'actual-1' } }), { id: 'receipt:one', status: 'completed', resolution: { action: 'attach', transactionId: 'actual-1', status: 'complete' } });
   assert.deepEqual(resolved, [{ id: 'receipt:one', resolution: { action: 'attach', transactionId: 'actual-1', status: 'complete' } }]);
 });
+
+test('stages a review-later reminder from the real transaction without editing Actual', async () => {
+  const staged = []; const actual = {
+    async findTransactions({ transactionId }) { assert.equal(transactionId, 'actual-1'); return [{ id: 'actual-1', date: '2026-11-08', merchant: 'Corner Store', account: 'Visa', amountCents: 4250 }]; },
+  };
+  const inbox = { stageManual: (row) => { staged.push(row); return { staged: 1, existing: 0, row }; }, list: () => [] };
+  const reviews = createReviewService({ actual, inbox });
+  assert.deepEqual(await reviews.stageManual({ transactionId: 'actual-1', note: 'Waiting for a repayment.' }), { staged: 1, existing: 0, row: { transactionId: 'actual-1', date: '2026-11-08', merchant: 'Corner Store', account: 'Visa', amountCents: 4250, note: 'Waiting for a repayment.' } });
+  assert.deepEqual(staged, [{ transactionId: 'actual-1', date: '2026-11-08', merchant: 'Corner Store', account: 'Visa', amountCents: 4250, note: 'Waiting for a repayment.' }]);
+});

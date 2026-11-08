@@ -15,6 +15,12 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
       for (let index = 0; index < rows.length; index += 500) matches.push(...await actual.importedMatches(rows.slice(index, index + 500)));
       return { scanned: rows.length, matched: matches.length, ...inbox.stageHistoricalPlaid(matches) };
     },
+    async stageManual({ transactionId, note = '' } = {}) {
+      if (!transactionId) throw new Error('Choose a transaction to review later.');
+      const row = (await actual.findTransactions({ transactionId }))[0];
+      if (!row) throw new Error('That transaction is no longer available.');
+      return inbox.stageManual({ transactionId: row.id, date: row.date, merchant: row.merchant, account: row.account, amountCents: row.amountCents, note });
+    },
     async matchReceipt({ row, receipt } = {}) {
       const accountName = cardmap.byLast4?.[receipt?.card_last4];
       if (!accountName || !receipt?.date || !Number.isFinite(Number(receipt.total))) return { candidates: [] };
@@ -30,6 +36,10 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
       if (row.source === 'receipt') {
         if (resolution?.action !== 'attach' || !row.candidates?.some((candidate) => candidate.id === resolution.transactionId) || String(resolution.transactionId).startsWith('plaid:')) throw new Error('Choose an approved Actual transaction for this receipt.');
         return inbox.resolve(id, { ...resolution, status: 'complete' });
+      }
+      if (row.source === 'manual') {
+        if (resolution?.action !== 'complete') throw new Error('Review-later items can only be marked complete.');
+        return inbox.resolve(id, { action: 'complete', status: 'complete' });
       }
       if (row.source !== 'plaid') throw new Error('Review source is not supported.');
       const result = await actual.applyReview({ ...row, resolution });

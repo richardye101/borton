@@ -35,6 +35,19 @@ test('records verified historical imports as completed without replacing an open
   assert.deepEqual(inbox.list({ status: 'completed' }).map(({ status, historical, resolution, candidates }) => ({ status, historical, resolution, candidates })), [{ status: 'completed', historical: true, resolution: { action: 'already_imported', transactionId: 'actual-1', status: 'complete' }, candidates: [{ id: 'actual-1', confidence: 'exact', daysApart: 0, evidence: { sameImportId: true } }] }]);
 });
 
+test('keeps a review-later reminder linked to its transaction until it is completed', () => {
+  const directory = temp(); const filePath = path.join(directory, 'reviews.json');
+  const inbox = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 1000 });
+  const input = { transactionId: 'actual-1', date: '2026-11-08', merchant: 'Corner Store', account: 'Visa', amountCents: 4250, note: 'Waiting for Tia to pay back her share.' };
+  const staged = inbox.stageManual(input);
+  assert.equal(staged.staged, 1);
+  assert.deepEqual(inbox.stageManual(input), { staged: 0, existing: 1, row: staged.row });
+  assert.deepEqual(createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 2000 }).list().map(({ source, status, transactionId, note }) => ({ source, status, transactionId, note })), [{ source: 'manual', status: 'later', transactionId: 'actual-1', note: 'Waiting for Tia to pay back her share.' }]);
+  inbox.resolve(staged.row.id, { action: 'complete', status: 'complete' });
+  assert.equal(inbox.list().length, 0);
+  assert.equal(inbox.list({ status: 'completed' })[0].resolution.action, 'complete');
+});
+
 test('keeps receipt image bytes private while making them available to the worker', () => {
   const directory = temp(); const filePath = path.join(directory, 'reviews.json');
   const inbox = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 1000 });

@@ -75,6 +75,13 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
       if (staged) save();
       return { staged, existing };
     },
+    stageManual(input = {}) {
+      if (!input.transactionId || !/^\d{4}-\d{2}-\d{2}$/.test(input.date || '') || !Number.isSafeInteger(input.amountCents) || !String(input.merchant || '').trim()) throw new Error('Choose a valid transaction to review later.');
+      const found = state.reviews.find((row) => row.source === 'manual' && row.transactionId === input.transactionId && row.status !== 'completed');
+      if (found) return { staged: 0, existing: 1, row: publicRow(found) };
+      const row = { id: `manual:${crypto.randomUUID()}`, source: 'manual', status: 'later', transactionId: String(input.transactionId), date: input.date, merchant: String(input.merchant).trim(), account: String(input.account || ''), amountCents: input.amountCents, note: String(input.note || '').trim(), candidates: [], createdAt: now(), updatedAt: now(), audit: [] };
+      state.reviews.push(row); save(); return { staged: 1, existing: 0, row: publicRow(row) };
+    },
     stageReceipt(file = {}) {
       const bytes = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || '');
       if (!bytes.length || !file.mime) throw new Error('Receipt image is required.');
