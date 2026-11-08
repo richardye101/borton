@@ -23,8 +23,17 @@ test('stages a Plaid row once and survives an inbox reload', () => {
   assert.deepEqual(inbox.stagePlaid([row]), { staged: 1, existing: 0 });
   assert.deepEqual(inbox.stagePlaid([row]), { staged: 0, existing: 1 });
   const reloaded = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 2000 });
-  assert.deepEqual(reloaded.list().map(({ source, status, merchant, importedId, candidates }) => ({ source, status, merchant, importedId, candidates })), [{ source: 'plaid', status: 'match', merchant: 'Uniqlo', importedId: 'plaid-1', candidates: [{ id: 'existing', confidence: 'strong', daysApart: 2 }] }]);
+  assert.deepEqual(reloaded.list().map(({ source, status, merchant, importedId, candidates, suggestion }) => ({ source, status, merchant, importedId, candidates, suggestion })), [{ source: 'plaid', status: 'match', merchant: 'Uniqlo', importedId: 'plaid-1', candidates: [{ id: 'existing', confidence: 'strong', daysApart: 2 }], suggestion: { status: 'queued', attempts: 0, nextAt: 1000, lastError: '' } }]);
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
+});
+
+test('recovers an interrupted category suggestion as queued work', () => {
+  const directory = temp(); const filePath = path.join(directory, 'reviews.json');
+  const inbox = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 1000 });
+  inbox.stagePlaid([{ importedId: 'plaid-1', accountId: 'a1', date: '2026-10-21', amountCents: -5628, merchant: 'Uniqlo' }]);
+  inbox.startSuggestion('plaid:plaid-1');
+  const recovered = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 2000 });
+  assert.deepEqual(recovered.list()[0].suggestion, { status: 'queued', attempts: 1, nextAt: 2000, lastError: 'Processing interrupted; retrying.' });
 });
 
 test('records verified historical imports as completed without replacing an open review', () => {

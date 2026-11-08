@@ -42,10 +42,20 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
   };
   const status = (row) => row.candidates?.length ? 'match' : 'new';
   const publicRow = (row) => clone(row);
+  const suggestionRow = (id) => {
+    const row = state.reviews.find((entry) => entry.id === id);
+    if (!row || !['plaid', 'legacy_import'].includes(row.source)) throw new Error('Import review not found.');
+    return row;
+  };
   let recovered = false;
   for (const row of state.reviews) {
     if (row.source === 'receipt' && row.status === 'processing') {
       Object.assign(row, { status: 'retrying', lastError: 'Processing interrupted; retrying.', nextAt: now(), updatedAt: now() });
+      recovered = true;
+    }
+    if (['plaid', 'legacy_import'].includes(row.source) && row.suggestion?.status === 'processing') {
+      Object.assign(row.suggestion, { status: 'queued', lastError: 'Processing interrupted; retrying.', nextAt: now() });
+      row.updatedAt = now();
       recovered = true;
     }
   }
@@ -59,7 +69,7 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
         const id = `plaid:${input.importedId}`;
         const found = state.reviews.find((row) => row.id === id);
         if (found) { existing += 1; continue; }
-        state.reviews.push({ id, source: 'plaid', status: status(input), importedId: input.importedId, accountId: input.accountId, account: String(input.account || ''), institution: String(input.institution || ''), date: input.date, amountCents: input.amountCents, merchant: String(input.merchant).trim(), candidates: clone(input.candidates || []), createdAt: now(), updatedAt: now(), audit: [] }); staged += 1;
+        state.reviews.push({ id, source: 'plaid', status: status(input), importedId: input.importedId, accountId: input.accountId, account: String(input.account || ''), institution: String(input.institution || ''), date: input.date, amountCents: input.amountCents, merchant: String(input.merchant).trim(), candidates: clone(input.candidates || []), suggestion: { status: 'queued', attempts: 0, nextAt: now(), lastError: '' }, createdAt: now(), updatedAt: now(), audit: [] }); staged += 1;
       }
       if (staged) save();
       return { staged, existing };
@@ -112,6 +122,32 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
     failReceipt(id, error) {
       const row = state.reviews.find((entry) => entry.id === id); if (!row || row.source !== 'receipt') throw new Error('Receipt review not found.');
       Object.assign(row, { status: 'failed', lastError: String(error || ''), nextAt: null, updatedAt: now() }); save(); return publicRow(row);
+    },
+    startSuggestion(id) {
+      const row = suggestionRow(id);
+      if (!row.suggestion || !['queued', 'retrying'].includes(row.suggestion.status)) throw new Error('Category suggestion is not queued.');
+      Object.assign(row.suggestion, { status: 'processing', attempts: (row.suggestion.attempts || 0) + 1, lastError: '', nextAt: null });
+      row.updatedAt = now(); save(); return publicRow(row);
+    },
+    completeSuggestion(id, suggestion = {}) {
+      const row = suggestionRow(id);
+      Object.assign(row.suggestion, { status: 'ready', categoryId: String(suggestion.categoryId || ''), category: String(suggestion.category || ''), confidence: String(suggestion.confidence || ''), reason: String(suggestion.reason || ''), nextAt: null, lastError: '' });
+      row.updatedAt = now(); save(); return publicRow(row);
+    },
+    retrySuggestion(id, error, nextAt) {
+      const row = suggestionRow(id);
+      Object.assign(row.suggestion, { status: 'retrying', lastError: String(error || ''), nextAt });
+      row.updatedAt = now(); save(); return publicRow(row);
+    },
+    failSuggestion(id, error) {
+      const row = suggestionRow(id);
+      Object.assign(row.suggestion, { status: 'unavailable', lastError: String(error || ''), nextAt: null });
+      row.updatedAt = now(); save(); return publicRow(row);
+    },
+    queueSuggestion(id) {
+      const row = suggestionRow(id);
+      Object.assign(row, { suggestion: { ...(row.suggestion || {}), status: 'queued', attempts: row.suggestion?.attempts || 0, lastError: '', nextAt: now() }, updatedAt: now() });
+      save(); return publicRow(row);
     },
     resolve(id, decision) {
       const row = state.reviews.find((entry) => entry.id === id); if (!row) throw new Error('Review not found.');
