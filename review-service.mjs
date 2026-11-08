@@ -17,6 +17,13 @@ export function createReviewService({ actual, inbox, receiptQueue, categorySugge
       for (let index = 0; index < rows.length; index += 500) matches.push(...await actual.importedMatches(rows.slice(index, index + 500)));
       return { scanned: rows.length, matched: matches.length, ...inbox.stageHistoricalPlaid(matches) };
     },
+    async resetImportedTuitionCategory({ dryRun = false } = {}) {
+      const result = await actual.resetImportedTuitionCategory({ dryRun });
+      if (dryRun) return { count: result.rows.length };
+      const staged = inbox.stageLegacyImports(result.rows);
+      if (staged.staged) categorySuggestions?.enqueue(result.rows);
+      return staged;
+    },
     async stageManual({ transactionId, note = '' } = {}) {
       if (!transactionId) throw new Error('Choose a transaction to review later.');
       const row = (await actual.findTransactions({ transactionId }))[0];
@@ -42,6 +49,11 @@ export function createReviewService({ actual, inbox, receiptQueue, categorySugge
       if (row.source === 'manual') {
         if (resolution?.action !== 'complete') throw new Error('Review-later items can only be marked complete.');
         return inbox.resolve(id, { action: 'complete', status: 'complete' });
+      }
+      if (row.source === 'legacy_import') {
+        if (resolution?.action === 'ignore') return inbox.resolve(id, { action: 'ignore', status: 'complete' });
+        const result = await actual.applyLegacyReview({ ...row, resolution });
+        return inbox.resolve(id, { ...resolution, ...result });
       }
       if (row.source !== 'plaid') throw new Error('Review source is not supported.');
       const result = await actual.applyReview({ ...row, resolution });

@@ -68,6 +68,30 @@ test('applies reviewed merges, imports, and ignores explicitly', async () => {
   assert.equal(api.writes.length, writes);
 });
 
+test('clears only imported Tuition transactions and preserves their details for review', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([
+    { id: 'plaid-tuition', account: 'a1', date: '2026-11-02', amount: -2000, payee: 'p1', category: 'tuition', notes: 'keep this note', imported_id: 'plaid-tuition' },
+    { id: 'manual-tuition', account: 'a1', date: '2026-11-02', amount: -3000, payee: 'p1', category: 'tuition', notes: 'do not touch' },
+  ]);
+  api.getCategories = async () => [{ id: 'c1', name: 'Groceries', hidden: false }, { id: 'tuition', name: 'Tuition', hidden: false }];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
+  const result = await web.resetImportedTuitionCategory();
+  assert.deepEqual(api.writes, [{ id: 'plaid-tuition', fields: { category: null } }]);
+  assert.deepEqual(result.rows, [{ transactionId: 'plaid-tuition', importedId: 'plaid-tuition', accountId: 'a1', account: 'Visa', date: '2026-11-02', amountCents: -2000, merchant: 'Corner Store', note: 'keep this note', categoryTargetIds: ['plaid-tuition'] }]);
+});
+
+test('previews the Tuition correction without writing and reapplies a reviewed category and note', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'plaid-tuition', account: 'a1', date: '2026-11-02', amount: -2000, payee: 'p1', category: 'tuition', imported_id: 'plaid-tuition' }]);
+  api.getCategories = async () => [{ id: 'c1', name: 'Groceries', hidden: false }, { id: 'tuition', name: 'Tuition', hidden: false }];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
+  assert.equal((await web.resetImportedTuitionCategory({ dryRun: true })).rows.length, 1);
+  assert.deepEqual(api.writes, []);
+  assert.deepEqual(await web.applyLegacyReview({ transactionId: 'plaid-tuition', importedId: 'plaid-tuition', accountId: 'a1', categoryTargetIds: ['plaid-tuition'], resolution: { action: 'import', categoryId: 'c1', note: 'Transit' } }), { status: 'complete', transactionId: 'plaid-tuition' });
+  assert.deepEqual(api.writes, [{ id: 'plaid-tuition', fields: { category: 'c1', notes: 'Transit' } }]);
+});
+
 test('returns same-account review candidates even when they have an older imported id', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual([{ id: 'foreign-import', account: 'a1', date: '2026-10-21', amount: -5628, payee: 'p1', category: 'c1', imported_id: 'old-source' }, { id: 'other-account', account: 'a2', date: '2026-10-21', amount: -5628, payee: 'p1', category: 'c1' }]);

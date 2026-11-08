@@ -33,6 +33,22 @@ test('sends the owner-selected category and note only with an import decision', 
   assert.deepEqual(writes[0].resolution, { action: 'import', categoryId: 'food', note: 'Dinner with Tia' });
 });
 
+test('stages cleared legacy imports for review without deleting them', async () => {
+  const staged = []; const queued = [];
+  const actual = { async resetImportedTuitionCategory() { return { rows: [{ transactionId: 'actual-1', importedId: 'plaid-1', accountId: 'a1', date: '2026-11-02', amountCents: -2000, merchant: 'Metrolinx' }] }; } };
+  const inbox = { stageLegacyImports(rows) { staged.push(...rows); return { staged: rows.length, existing: 0 }; } };
+  const reviews = createReviewService({ actual, inbox, categorySuggestions: { enqueue: (rows) => queued.push(...rows) } });
+  assert.deepEqual(await reviews.resetImportedTuitionCategory(), { staged: 1, existing: 0 });
+  assert.deepEqual(staged, [{ transactionId: 'actual-1', importedId: 'plaid-1', accountId: 'a1', date: '2026-11-02', amountCents: -2000, merchant: 'Metrolinx' }]);
+  assert.deepEqual(queued, staged);
+});
+
+test('only counts the Tuition correction on a dry run', async () => {
+  const actual = { async resetImportedTuitionCategory({ dryRun }) { assert.equal(dryRun, true); return { rows: [{ transactionId: 'actual-1' }] }; } };
+  const reviews = createReviewService({ actual, inbox: {} });
+  assert.deepEqual(await reviews.resetImportedTuitionCategory({ dryRun: true }), { count: 1 });
+});
+
 test('matches a receipt to the mapped account without searching unrelated accounts', async () => {
   const actual = {
     async bootstrap() { return { accounts: [{ id: 'a1', name: 'Visa' }, { id: 'a2', name: 'Other card' }] }; },

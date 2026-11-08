@@ -253,6 +253,45 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         return { status: 'complete', transactionId: created?.id || null };
       });
     },
+    resetImportedTuitionCategory({ dryRun = false } = {}) {
+      return runExclusive(async () => {
+        await sync(true);
+        const { accounts, categories, payees } = await maps();
+        const tuition = [...categories.values()].find((category) => String(category.name || '').trim().toLowerCase() === 'tuition');
+        if (!tuition) return { rows: [] };
+        const rows = [];
+        for (const account of accounts.values()) {
+          const transactions = await api.getTransactions(account.id, '1900-01-01', '2099-12-31');
+          for (const transaction of transactions) {
+            if (!transaction.imported_id) continue;
+            const categoryTargetIds = [transaction.category === tuition.id ? transaction.id : null, ...(transaction.subtransactions || []).filter((line) => line.category === tuition.id).map((line) => line.id)].filter(Boolean);
+            if (!categoryTargetIds.length) continue;
+            rows.push({ transactionId: transaction.id, importedId: transaction.imported_id, accountId: transaction.account, account: account.name || '', date: String(transaction.date), amountCents: transaction.amount, merchant: payees.get(transaction.payee)?.name || transaction.payee_name || '', note: transaction.notes || '', categoryTargetIds });
+            if (!dryRun) for (const id of categoryTargetIds) await api.updateTransaction(id, { category: null });
+          }
+        }
+        if (!dryRun && rows.length) { await api.sync(); lastSync = now(); }
+        return { rows };
+      });
+    },
+    applyLegacyReview(review = {}) {
+      return runExclusive(async () => {
+        const resolution = review.resolution || {};
+        if (resolution.action !== 'import' || !review.transactionId || !review.importedId || !review.accountId) throw error('Choose a valid review decision.');
+        await sync();
+        const { accounts, categories } = await maps();
+        const account = accounts.get(review.accountId);
+        const category = categories.get(String(resolution.categoryId || ''));
+        if (!account || account.closed || !category || category.hidden || category.is_income) throw error('Choose a valid expense category.');
+        const transaction = (await api.getTransactions(account.id, '1900-01-01', '2099-12-31')).find((row) => row.id === review.transactionId && row.imported_id === review.importedId);
+        if (!transaction) throw error('That imported transaction is no longer available.');
+        const targets = Array.isArray(review.categoryTargetIds) && review.categoryTargetIds.length ? review.categoryTargetIds : [transaction.id];
+        for (const id of targets) await api.updateTransaction(id, { category: category.id, ...(id === transaction.id ? { notes: String(resolution.note || '').trim() } : {}) });
+        if (!targets.includes(transaction.id)) await api.updateTransaction(transaction.id, { notes: String(resolution.note || '').trim() });
+        await api.sync(); lastSync = now();
+        return { status: 'complete', transactionId: transaction.id };
+      });
+    },
     editTransaction({ id, merchant, amountCents, date, accountId, categoryId, note = '', splitTransactionIds = [] } = {}) {
       return runExclusive(async () => {
         if (typeof id !== 'string' || !id || !String(merchant || '').trim() || !Number.isSafeInteger(amountCents) || amountCents <= 0 || !isValidExpenseDate(date, zonedDate(now(), timezone))) throw error('Enter valid expense details.');

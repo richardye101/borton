@@ -46,6 +46,7 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
       const history = await plaid.history(); const result = await reviews.auditHistoricalImports(history.rows);
       return { ...result, scanned: history.scanned };
     },
+    resetImportedTuitionCategory: (payload) => reviews ? reviews.resetImportedTuitionCategory(payload) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
     plaidReconnectToken: ({ id }) => plaid ? plaid.reconnectToken(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidDisconnect: ({ id }) => plaid ? plaid.disconnect(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     reviews: (query) => reviews ? reviews.list(query) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),

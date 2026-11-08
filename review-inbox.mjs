@@ -74,6 +74,17 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
       if (staged) save();
       return { staged, existing };
     },
+    stageLegacyImports(rows = []) {
+      let staged = 0; let existing = 0;
+      for (const input of rows) {
+        if (!input?.transactionId || !input.importedId || !input.accountId || !input.date || !Number.isSafeInteger(input.amountCents) || !String(input.merchant || '').trim()) continue;
+        const id = `legacy:${input.transactionId}`;
+        if (state.reviews.some((row) => row.id === id)) { existing += 1; continue; }
+        state.reviews.push({ id, source: 'legacy_import', status: 'new', transactionId: input.transactionId, importedId: input.importedId, accountId: input.accountId, account: String(input.account || ''), institution: '', date: input.date, amountCents: input.amountCents, merchant: String(input.merchant).trim(), note: String(input.note || '').trim(), categoryTargetIds: clone(input.categoryTargetIds || []), candidates: clone(input.candidates || []), suggestion: { status: 'queued', attempts: 0, nextAt: now(), lastError: '' }, createdAt: now(), updatedAt: now(), audit: [] }); staged += 1;
+      }
+      if (staged) save();
+      return { staged, existing };
+    },
     stageHistoricalPlaid(rows = []) {
       let staged = 0; let existing = 0;
       for (const input of rows) {
