@@ -141,6 +141,17 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
       return { currency, syncedAt: new Date(lastSync).toISOString(), accounts: [...accounts.values()].filter((row) => !row.closed).map((row) => ({ id: row.id, name: row.name, owner: accountOwner(row.name) || null })), categories: [...categories.values()].filter((row) => !row.hidden && !row.is_income).map((row) => ({ id: row.id, name: row.name })), transactions: rows };
     },
     findTransactions: transactions,
+    async reviewCandidates({ accountId, date } = {}) {
+      if (typeof accountId !== 'string' || !accountId || !/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return [];
+      await sync(); const { accounts, payees } = await maps();
+      const account = accounts.get(accountId); if (!account || account.closed) return [];
+      const center = Date.parse(`${date}T12:00:00Z`); if (!Number.isFinite(center)) return [];
+      const start = new Date(center - 21 * DAY_MS).toISOString().slice(0, 10);
+      const end = new Date(center + 21 * DAY_MS).toISOString().slice(0, 10);
+      return (await api.getTransactions(accountId, start, end))
+        .filter((row) => !row.transfer_id && !payees.get(row.payee)?.transfer_acct)
+        .map((row) => ({ id: row.id, accountId, date: String(row.date), amountCents: row.amount, merchant: payees.get(row.payee)?.name || row.payee_name || '', importedId: row.imported_id || '' }));
+    },
     async shared() {
       await sync(); const { accounts, payees } = await maps();
       const people = [];

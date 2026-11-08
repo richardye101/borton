@@ -17,3 +17,8 @@ test('routes Connections as a first-class page', () => {
   assert.deepEqual(routeFromPath('/connections'), { view: 'connections', transactionId: '' });
   assert.equal(pathForRoute('connections'), '/connections');
 });
+
+test('routes Reviews as a first-class page', () => {
+  assert.deepEqual(routeFromPath('/reviews'), { view: 'reviews', transactionId: '' });
+  assert.equal(pathForRoute('reviews'), '/reviews');
+});

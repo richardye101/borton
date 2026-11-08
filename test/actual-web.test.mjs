@@ -68,6 +68,15 @@ test('applies reviewed merges, imports, and ignores explicitly', async () => {
   assert.equal(api.writes.length, writes);
 });
 
+test('returns same-account review candidates even when they have an older imported id', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'foreign-import', account: 'a1', date: '2026-10-21', amount: -5628, payee: 'p1', category: 'c1', imported_id: 'old-source' }, { id: 'other-account', account: 'a2', date: '2026-10-21', amount: -5628, payee: 'p1', category: 'c1' }]);
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });
+  const candidates = await web.reviewCandidates({ accountId: 'a1', importedId: 'new-source', date: '2026-10-23', amountCents: -5628, merchant: 'Corner Store' });
+  assert.deepEqual(candidates.find((row) => row.id === 'foreign-import'), { id: 'foreign-import', accountId: 'a1', date: '2026-10-21', amountCents: -5628, merchant: 'Corner Store', importedId: 'old-source' });
+  assert.equal(candidates.some((row) => row.id === 'other-account'), false);
+});
+
 test('summarizes expense spending by category, account, and month', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const web = createActualWeb({ api: fakeActual(), dataDir: dir, now: () => Date.parse('2026-10-24T12:00:00Z') });

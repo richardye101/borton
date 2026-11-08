@@ -37,7 +37,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
   fs.writeFileSync(path.join(staticDir, 'index.html'), '<main>Borton</main>');
   fs.writeFileSync(path.join(staticDir, 'client-state.mjs'), 'export const Borton = true;');
   const auth = createWebAuth({ password: 'password', sessionSecret: 'secret secret secret secret' });
-  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }), assistantMessages: async () => [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }], plaidConnections: async () => ({ configured: true, connections: [] }), plaidSync: async ({ id }) => ({ id, added: 1 }) };
+  const app = { bootstrap: async () => ({ transactions: [] }), summary: async (query) => ({ days: Number(query.days), totalCents: 1234 }), transcribe: async ({ buffer, mime }) => ({ text: `${mime}:${buffer.toString()}` }), editTransaction: async (payload) => ({ status: 'complete', id: payload.id }), assistantMessages: async () => [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }], plaidConnections: async () => ({ configured: true, connections: [] }), plaidSync: async ({ id }) => ({ id, added: 1 }), reviews: async (query) => [{ id: 'plaid:one', status: query.status }], resolveReview: async ({ id, resolution }) => ({ id, status: 'completed', resolution }), uploadReceipts: async ({ files }) => ({ rows: files.map((file) => ({ mime: file.mime, bytes: file.buffer.length })) }) };
   await withServer({ auth, app, staticDir, allowedRemote: ['127.0.0.1'] }, async (port) => {
     const page = await request(port);
     assert.equal(page.status, 200);
@@ -46,6 +46,7 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     assert.equal(summaryPage.status, 200);
     assert.match(summaryPage.body, /Borton/);
     assert.equal((await request(port, { path: '/connections' })).status, 200);
+    assert.equal((await request(port, { path: '/reviews' })).status, 200);
     assert.equal(page.headers['cache-control'], 'no-store');
     const module = await request(port, { path: '/client-state.mjs' });
     assert.equal(module.status, 200);
@@ -69,6 +70,8 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const assistantMessages = await request(port, { path: '/api/assistant/messages', headers: { cookie } });
     assert.deepEqual(JSON.parse(assistantMessages.body), [{ id: 'job-1', text: 'Classify these', status: 'complete', response: 'Plan ready' }]);
     assert.deepEqual(JSON.parse((await request(port, { path: '/api/plaid/connections', headers: { cookie } })).body), { configured: true, connections: [] });
+    assert.deepEqual(JSON.parse((await request(port, { path: '/api/reviews?status=open', headers: { cookie } })).body), [{ id: 'plaid:one', status: 'open' }]);
+    assert.deepEqual(JSON.parse((await request(port, { method: 'POST', path: '/api/reviews/plaid%3Aone/resolve', headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: JSON.stringify({ resolution: { action: 'ignore' } }) })).body), { id: 'plaid:one', status: 'completed', resolution: { action: 'ignore' } });
     assert.deepEqual(JSON.parse((await request(port, { method: 'POST', path: '/api/plaid/connections/item-1/sync', headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, body: '{}' })).body), { id: 'item-1', added: 1 });
     const summary = await request(port, { path: '/api/summary?days=30', headers: { cookie } });
     assert.equal(summary.status, 200);
@@ -83,6 +86,10 @@ test('serves static assets and guards API routes with login, session and CSRF', 
     const transcript = await request(port, { method: 'POST', path: '/api/transcribe', headers: { cookie, 'x-csrf-token': csrf, 'content-type': `multipart/form-data; boundary=${boundary}` }, body: audioBody });
     assert.equal(transcript.status, 200);
     assert.deepEqual(JSON.parse(transcript.body), { text: 'audio/webm:spoken note' });
+    const receiptBoundary = 'borton-receipt-boundary';
+    const receiptBody = `--${receiptBoundary}\r\nContent-Disposition: form-data; name="receipt"; filename="receipt.png"\r\nContent-Type: image/png\r\n\r\nreceipt bytes\r\n--${receiptBoundary}--\r\n`;
+    const receipt = await request(port, { method: 'POST', path: '/api/reviews/receipts', headers: { cookie, 'x-csrf-token': csrf, 'content-type': `multipart/form-data; boundary=${receiptBoundary}` }, body: receiptBody });
+    assert.deepEqual(JSON.parse(receipt.body), { rows: [{ mime: 'image/png', bytes: 13 }] });
     assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
     assert.equal((await request(port, { method: 'POST', path: '/api/duplicates', headers: { cookie, 'content-type': 'application/json', 'x-csrf-token': csrf, origin: 'http://evil.example' }, body: '{}' })).status, 403);
     assert.equal(bootstrap.headers['cache-control'], 'no-store');

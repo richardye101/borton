@@ -55,3 +55,11 @@ test('marks an image with no extractable receipt as failed', async () => {
   assert.equal(row.status, 'failed');
   assert.equal(row.lastError, 'No receipt found.');
 });
+
+test('adds match evidence supplied for a successful receipt scan', async () => {
+  const row = { id: 'receipt:matched', status: 'queued', mime: 'image/png', nextAt: 0 };
+  const inbox = { list: () => [row], readReceipt: () => ({ buffer: Buffer.from('receipt'), mime: 'image/png' }), startReceipt: () => Object.assign(row, { status: 'processing' }), completeReceipt: (id, extraction) => Object.assign(row, extraction), retryReceipt: assert.fail, failReceipt: assert.fail, cleanup: () => ({ removed: 0 }) };
+  const queue = createReceiptReviewQueue({ inbox, minIntervalMs: 0, autoStart: false, matchReceipt: async ({ receipt }) => ({ accountId: 'a1', account: 'Visa', candidates: [{ id: 'actual-1', confidence: 'strong' }], note: receipt.merchant }), extractor: { async extractImage() { return { receipts: [{ merchant: 'Coffee', total: 4.5, date: '2026-11-07' }] }; } } });
+  await queue.run();
+  assert.deepEqual(row, { id: 'receipt:matched', status: 'processing', mime: 'image/png', nextAt: 0, merchant: 'Coffee', total: 4.5, date: '2026-11-07', amountCents: 450, accountId: 'a1', account: 'Visa', candidates: [{ id: 'actual-1', confidence: 'strong' }], note: 'Coffee' });
+});

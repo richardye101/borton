@@ -43,7 +43,7 @@ const allowed = (remote, rule) => {
   });
 };
 const safeStaticPath = (pathname) => {
-  if (pathname === '/' || /^\/(?:home|summary|shared|connections|add|check)$/.test(pathname) || /^\/home\/transactions\/[^/]+$/.test(pathname)) return 'index.html';
+  if (pathname === '/' || /^\/(?:home|summary|shared|connections|reviews|add|check)$/.test(pathname) || /^\/home\/transactions\/[^/]+$/.test(pathname)) return 'index.html';
   return pathname.startsWith('/') && !pathname.includes('..') ? pathname.slice(1) : null;
 };
 
@@ -68,6 +68,8 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
     'GET /api/plaid/connections': 'plaidConnections',
     'POST /api/plaid/link-token': 'plaidLinkToken',
     'POST /api/plaid/link-complete': 'plaidComplete',
+    'GET /api/reviews': 'reviews',
+    'POST /api/reviews/receipts': 'uploadReceipts',
   };
   const server = http.createServer(async (req, res) => {
     const remote = req.socket.remoteAddress || '';
@@ -107,13 +109,15 @@ export function createWebServer({ auth, app = {}, staticDir, allowedRemote = [],
       const session = auth.verifySession(req.headers.cookie);
       if (!session) return json(res, 401, { error: 'Sign in required.' });
       try {
-        const payload = req.method === 'POST' && url.pathname === '/api/extract' ? await readMultipartFile(req, maxUploadBytes, 'Receipt image') : req.method === 'POST' && url.pathname === '/api/transcribe' ? await readMultipartFile(req, 5 * 1024 * 1024, 'Audio recording') : req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
+        const payload = req.method === 'POST' && url.pathname === '/api/extract' ? await readMultipartFile(req, maxUploadBytes, 'Receipt image') : req.method === 'POST' && url.pathname === '/api/transcribe' ? await readMultipartFile(req, 5 * 1024 * 1024, 'Audio recording') : req.method === 'POST' && url.pathname === '/api/reviews/receipts' ? { files: [await readMultipartFile(req, maxUploadBytes, 'Receipt image')] } : req.method === 'POST' ? await readJson(req) : Object.fromEntries(url.searchParams);
         if (req.method === 'POST' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) return json(res, 403, { error: 'Cross-origin request rejected.' });
         if (req.method === 'POST' && !auth.verifyCsrf(auth.issueCsrf(session), req.headers['x-csrf-token'])) return json(res, 403, { error: 'Invalid CSRF token.' });
         const dynamic = url.pathname.match(/^\/api\/plaid\/connections\/([^/]+)\/(mapping|sync|reconnect-token|disconnect)$/);
+        const reviewDynamic = url.pathname.match(/^\/api\/reviews\/([^/]+)\/resolve$/);
         const dynamicHandlers = { mapping: 'plaidMapping', sync: 'plaidSync', 'reconnect-token': 'plaidReconnectToken', disconnect: 'plaidDisconnect' };
-        const handler = dynamic ? dynamicHandlers[dynamic[2]] : dispatch[`${req.method} ${url.pathname}`];
+        const handler = dynamic ? dynamicHandlers[dynamic[2]] : reviewDynamic ? 'resolveReview' : dispatch[`${req.method} ${url.pathname}`];
         if (dynamic) payload.id = decodeURIComponent(dynamic[1]);
+        if (reviewDynamic) payload.id = decodeURIComponent(reviewDynamic[1]);
         if (!handler || typeof app[handler] !== 'function') return json(res, 404, { error: 'Not found.' });
         return json(res, 200, await app[handler](payload, session));
       } catch (error) { return json(res, error.statusCode || 400, { error: error.message || 'Request failed.' }); }

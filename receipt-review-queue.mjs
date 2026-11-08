@@ -2,7 +2,7 @@ import { normalizeReceipts } from './receipt-utils.mjs';
 
 const retryable = (error) => /429|busy|timeout|503/i.test(String(error?.message || ''));
 
-export function createReceiptReviewQueue({ inbox, extractor, now = Date.now, minIntervalMs = 20_000, autoStart = true } = {}) {
+export function createReceiptReviewQueue({ inbox, extractor, matchReceipt = async () => ({}), now = Date.now, minIntervalMs = 20_000, autoStart = true } = {}) {
   if (!inbox || !extractor?.extractImage) throw new Error('inbox and extractor are required.');
   let running = null; let lastStart = -Infinity; let timer = null; let closed = false;
   const nextDelay = () => {
@@ -33,7 +33,7 @@ export function createReceiptReviewQueue({ inbox, extractor, now = Date.now, min
           const image = inbox.readReceipt(row.id);
           const result = await extractor.extractImage(image.buffer, image.mime);
           const receipt = normalizeReceipts(result)[0];
-          inbox.completeReceipt(row.id, receipt ? { ...receipt, amountCents: Math.round(receipt.total * 100), candidates: [] } : { status: 'failed', lastError: 'No receipt found.' });
+          inbox.completeReceipt(row.id, receipt ? { ...receipt, amountCents: Math.round(receipt.total * 100), candidates: [], ...await matchReceipt({ row, receipt }) } : { status: 'failed', lastError: 'No receipt found.' });
         } catch (error) {
           if (retryable(error)) inbox.retryReceipt(row.id, error.message, now() + Math.max(60_000, error.retryAfterMs || 0));
           else inbox.failReceipt(row.id, error.message);

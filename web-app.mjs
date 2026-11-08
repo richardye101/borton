@@ -2,7 +2,7 @@ import { normalizeReceipts } from './receipt-utils.mjs';
 
 const clientId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant, assistantQueue, plaid } = {}) {
+export function createWebApplication({ actual, extractor, transcriber, cardmap = {}, fallbackCategory = 'General', assistant, assistantQueue, plaid, reviews } = {}) {
   if (!actual || !extractor) throw new Error('actual and extractor are required.');
   return {
     bootstrap: () => actual.bootstrap(),
@@ -43,5 +43,8 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
     plaidSync: ({ id }) => plaid ? plaid.sync(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidReconnectToken: ({ id }) => plaid ? plaid.reconnectToken(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidDisconnect: ({ id }) => plaid ? plaid.disconnect(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    reviews: (query) => reviews ? reviews.list(query) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
+    resolveReview: (payload) => reviews ? reviews.resolve(payload) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),
+    uploadReceipts: ({ files = [] }) => reviews ? { rows: reviews.stageReceipts(files) } : Promise.reject(Object.assign(new Error('Receipt uploads are unavailable on this server.'), { statusCode: 503 })),
   };
 }
