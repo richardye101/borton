@@ -26,3 +26,35 @@ test('stages a Plaid row once and survives an inbox reload', () => {
   assert.deepEqual(reloaded.list().map(({ source, status, merchant, importedId, candidates }) => ({ source, status, merchant, importedId, candidates })), [{ source: 'plaid', status: 'match', merchant: 'Uniqlo', importedId: 'plaid-1', candidates: [{ id: 'existing', confidence: 'strong', daysApart: 2 }] }]);
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
 });
+
+test('keeps receipt image bytes private while making them available to the worker', () => {
+  const directory = temp(); const filePath = path.join(directory, 'reviews.json');
+  const inbox = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 1000 });
+  const staged = inbox.stageReceipt({ buffer: Buffer.from('private receipt'), mime: 'image/png' });
+  assert.equal('buffer' in staged, false);
+  const image = inbox.readReceipt(staged.id);
+  assert.deepEqual({ buffer: image.buffer, mime: image.mime }, { buffer: Buffer.from('private receipt'), mime: 'image/png' });
+  assert.equal(fs.statSync(image.path).mode & 0o777, 0o600);
+  assert.deepEqual(inbox.cleanup(), { removed: 0 });
+});
+
+test('retains terminal receipt extraction failures instead of reopening them as new', () => {
+  const directory = temp(); const inbox = createReviewInbox({ filePath: path.join(directory, 'reviews.json'), receiptDir: path.join(directory, 'receipts'), now: () => 1000 });
+  const staged = inbox.stageReceipt({ buffer: Buffer.from('empty'), mime: 'image/png' });
+  const completed = inbox.completeReceipt(staged.id, { status: 'failed', lastError: 'No receipt found.' });
+  assert.equal(completed.status, 'failed');
+  assert.equal(completed.lastError, 'No receipt found.');
+});
+
+test('removes receipt image bytes after thirty days without losing review metadata', () => {
+  let time = 1000; const directory = temp(); const inbox = createReviewInbox({ filePath: path.join(directory, 'reviews.json'), receiptDir: path.join(directory, 'receipts'), now: () => time });
+  const staged = inbox.stageReceipt({ buffer: Buffer.from('delete later'), mime: 'image/png' });
+  const imagePath = inbox.readReceipt(staged.id).path;
+  time += 30 * 86_400_000;
+  assert.deepEqual(inbox.cleanup(), { removed: 1 });
+  assert.equal(fs.existsSync(imagePath), false);
+  const retained = inbox.list({ status: 'all' }).find((row) => row.id === staged.id);
+  assert.equal(retained.imagePath, undefined);
+  assert.equal(retained.imageExpiredAt, time);
+  assert.equal(retained.hash, staged.hash);
+});

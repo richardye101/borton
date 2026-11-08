@@ -42,6 +42,14 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
   };
   const status = (row) => row.candidates?.length ? 'match' : 'new';
   const publicRow = (row) => clone(row);
+  let recovered = false;
+  for (const row of state.reviews) {
+    if (row.source === 'receipt' && row.status === 'processing') {
+      Object.assign(row, { status: 'retrying', lastError: 'Processing interrupted; retrying.', nextAt: now(), updatedAt: now() });
+      recovered = true;
+    }
+  }
+  if (recovered) save();
   save();
   return {
     stagePlaid(rows = []) {
@@ -66,13 +74,26 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
       const row = { id, source: 'receipt', status: 'queued', imagePath, mime: file.mime, hash, createdAt: now(), updatedAt: now(), expiresAt: now() + 30 * DAY, candidates: [], audit: [] };
       state.reviews.push(row); save(); return publicRow(row);
     },
+    readReceipt(id) {
+      const row = state.reviews.find((entry) => entry.id === id);
+      if (!row || row.source !== 'receipt' || !row.imagePath || !fs.existsSync(row.imagePath)) throw new Error('Receipt image is no longer available.');
+      return { buffer: fs.readFileSync(row.imagePath), mime: row.mime, path: row.imagePath };
+    },
+    startReceipt(id) {
+      const row = state.reviews.find((entry) => entry.id === id); if (!row || row.source !== 'receipt') throw new Error('Receipt review not found.');
+      Object.assign(row, { status: 'processing', lastError: '', nextAt: null, updatedAt: now() }); save(); return publicRow(row);
+    },
     completeReceipt(id, extraction = {}) {
       const row = state.reviews.find((entry) => entry.id === id); if (!row || row.source !== 'receipt') throw new Error('Receipt review not found.');
-      Object.assign(row, clone(extraction), { status: status(extraction), updatedAt: now() }); save(); return publicRow(row);
+      Object.assign(row, clone(extraction), { status: extraction.status === 'failed' ? 'failed' : status(extraction), updatedAt: now() }); save(); return publicRow(row);
     },
     retryReceipt(id, error, nextAt) {
       const row = state.reviews.find((entry) => entry.id === id); if (!row || row.source !== 'receipt') throw new Error('Receipt review not found.');
       Object.assign(row, { status: 'retrying', lastError: String(error || ''), nextAt, updatedAt: now() }); save(); return publicRow(row);
+    },
+    failReceipt(id, error) {
+      const row = state.reviews.find((entry) => entry.id === id); if (!row || row.source !== 'receipt') throw new Error('Receipt review not found.');
+      Object.assign(row, { status: 'failed', lastError: String(error || ''), nextAt: null, updatedAt: now() }); save(); return publicRow(row);
     },
     resolve(id, decision) {
       const row = state.reviews.find((entry) => entry.id === id); if (!row) throw new Error('Review not found.');
