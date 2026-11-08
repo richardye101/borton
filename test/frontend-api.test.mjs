@@ -30,6 +30,14 @@ test('keeps Reviews actions out of the title area', async () => {
   assert.match(app, /class="reviews-tools"/);
 });
 
+test('opens a completed review’s matched Actual transaction and exposes its details', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /function matchedReviewTransactionId/);
+  assert.match(app, /\/api\/transactions\?transactionId=/);
+  assert.match(app, /Matched Actual transaction/);
+  assert.match(app, /Open & edit/);
+});
+
 test('shows an action-oriented empty state for Reviews instead of an empty table', async () => {
   const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
   const css = await fs.readFile(new URL('../frontend/src/app.css', import.meta.url), 'utf8');
