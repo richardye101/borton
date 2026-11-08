@@ -35,6 +35,7 @@ test('opens a completed review’s matched Actual transaction and exposes its de
   assert.match(app, /function matchedReviewTransactionId/);
   assert.match(app, /\/api\/transactions\?transactionId=/);
   assert.match(app, /Matched Actual transaction/);
+  assert.match(app, /function editMatchedReviewTransaction/);
   assert.match(app, /Open & edit/);
 });
 

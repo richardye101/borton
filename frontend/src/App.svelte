@@ -183,7 +183,7 @@
     routeTransactionId = transactionId;
     const path = pathForRoute(next, transactionId);
     window.history[replace ? 'replaceState' : 'pushState']({}, '', path);
-    void applyView(next, transactionId);
+    return applyView(next, transactionId);
   }
 
   async function applyView(next, transactionId = '') {
@@ -222,6 +222,16 @@
     try { reviewDetail = (await request(`/api/transactions?transactionId=${encodeURIComponent(transactionId)}`, { csrf }))[0] || null; if (!reviewDetail) reviewDetailError = 'The matched transaction is no longer available.'; }
     catch (error) { reviewDetailError = error.message; }
     finally { reviewDetailLoading = false; }
+  }
+  async function editMatchedReviewTransaction() {
+    if (!reviewDetail?.id) return;
+    await show('home', { transactionId: reviewDetail.id });
+    const row = transactions.find((candidate) => candidate.id === reviewDetail.id);
+    if (row) await editTransaction(row);
+  }
+  function handleReviewDetailEdit(event) {
+    if (!(event.target instanceof Element) || !event.target.closest('.review-detail-actions button')) return;
+    event.preventDefault(); event.stopPropagation(); void editMatchedReviewTransaction();
   }
   async function auditHistoricalReviews() { if (reviewAuditing) return; reviewAuditing = true; reviewsError = ''; reviewAuditNotice = ''; try { const result = await request('/api/reviews/audit-history', { csrf, method: 'POST', body: {} }); reviewsStatus = 'completed'; reviewAuditNotice = result.staged ? `${result.staged} verified historical imports added.` : result.existing ? 'Historical imports are already shown.' : 'No verified historical imports found.'; await loadReviews(); } catch (error) { reviewsError = error.message; } finally { reviewAuditing = false; } }
   async function resolveReview(row, action, transactionId = '') { try { await request(`/api/reviews/${encodeURIComponent(row.id)}/resolve`, { csrf, method: 'POST', body: { resolution: { action, ...(transactionId ? { transactionId } : {}) } } }); await loadReviews(); await loadBoot(); } catch (error) { reviewsError = error.message; } }
@@ -620,7 +630,7 @@
   }
 </script>
 
-<svelte:window on:keydown|capture={handleEditShortcut} on:paste={pasteChatReceipt} />
+<svelte:window on:keydown|capture={handleEditShortcut} on:paste={pasteChatReceipt} on:click|capture={handleReviewDetailEdit} />
 
 {#if !signedIn}
   <main class="login-shell">
