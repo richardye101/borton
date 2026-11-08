@@ -49,6 +49,14 @@ test('can queue a transaction for review later without changing its note', async
   assert.match(app, /Waiting for repayment/);
 });
 
+test('offers Review later from ordinary Home and Summary transaction rows', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /function openReviewLater\(row\)/);
+  assert.match(app, /class="review-later-modal"/);
+  assert.match(app, /<dialog class="review-later-modal" open aria-modal="true"/);
+  assert.equal((app.match(/aria-label="Review later"/g) || []).length, 2);
+});
+
 test('shows an action-oriented empty state for Reviews instead of an empty table', async () => {
   const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
   const css = await fs.readFile(new URL('../frontend/src/app.css', import.meta.url), 'utf8');
