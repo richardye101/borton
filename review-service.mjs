@@ -18,10 +18,11 @@ export function createReviewService({ actual, inbox, receiptQueue, categorySugge
       return { scanned: rows.length, matched: matches.length, ...inbox.stageHistoricalPlaid(matches) };
     },
     async resetImportedTuitionCategory({ dryRun = false } = {}) {
-      const result = await actual.resetImportedTuitionCategory({ dryRun });
-      if (dryRun) return { count: result.rows.length };
-      const staged = inbox.stageLegacyImports(result.rows);
-      if (staged.staged) categorySuggestions?.enqueue(result.rows);
+      const preview = await actual.resetImportedTuitionCategory({ dryRun: true });
+      if (dryRun) return { count: preview.rows.length };
+      const staged = inbox.stageLegacyImports(preview.rows);
+      if (staged.staged) categorySuggestions?.enqueue(preview.rows);
+      await actual.resetImportedTuitionCategory({ transactionIds: preview.rows.map((row) => row.transactionId) });
       return staged;
     },
     async stageManual({ transactionId, note = '' } = {}) {

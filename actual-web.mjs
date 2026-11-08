@@ -6,6 +6,7 @@ import { withActualLock } from './actual-lock.mjs';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const JOURNAL_TTL = DAY_MS;
 const unique = (rows) => [...new Map(rows.map((row) => [row.id, row])).values()];
+const isExternalImport = (id) => typeof id === 'string' && id && !/^(?:borton-(?:web|split)-|bot-|agent-)/i.test(id);
 const normalize = (row, payees, accounts, categories, owedAccountPerson) => {
   const splitTransactionIds = (row.subtransactions || []).map((line) => line.id).filter((id) => typeof id === 'string');
   const splitLines = (row.subtransactions || []).map((line) => {
@@ -253,8 +254,10 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         return { status: 'complete', transactionId: created?.id || null };
       });
     },
-    resetImportedTuitionCategory({ dryRun = false } = {}) {
+    resetImportedTuitionCategory({ dryRun = false, transactionIds } = {}) {
       return runExclusive(async () => {
+        if (transactionIds != null && (!Array.isArray(transactionIds) || transactionIds.some((id) => typeof id !== 'string' || !id))) throw error('Invalid review migration targets.');
+        const targets = transactionIds ? new Set(transactionIds) : null;
         await sync(true);
         const { accounts, categories, payees } = await maps();
         const tuition = [...categories.values()].find((category) => String(category.name || '').trim().toLowerCase() === 'tuition');
@@ -263,7 +266,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         for (const account of accounts.values()) {
           const transactions = await api.getTransactions(account.id, '1900-01-01', '2099-12-31');
           for (const transaction of transactions) {
-            if (!transaction.imported_id) continue;
+            if (!isExternalImport(transaction.imported_id) || (targets && !targets.has(transaction.id))) continue;
             const categoryTargetIds = [transaction.category === tuition.id ? transaction.id : null, ...(transaction.subtransactions || []).filter((line) => line.category === tuition.id).map((line) => line.id)].filter(Boolean);
             if (!categoryTargetIds.length) continue;
             rows.push({ transactionId: transaction.id, importedId: transaction.imported_id, accountId: transaction.account, account: account.name || '', date: String(transaction.date), amountCents: transaction.amount, merchant: payees.get(transaction.payee)?.name || transaction.payee_name || '', note: transaction.notes || '', categoryTargetIds });
@@ -286,8 +289,9 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         const transaction = (await api.getTransactions(account.id, '1900-01-01', '2099-12-31')).find((row) => row.id === review.transactionId && row.imported_id === review.importedId);
         if (!transaction) throw error('That imported transaction is no longer available.');
         const targets = Array.isArray(review.categoryTargetIds) && review.categoryTargetIds.length ? review.categoryTargetIds : [transaction.id];
-        for (const id of targets) await api.updateTransaction(id, { category: category.id, ...(id === transaction.id ? { notes: String(resolution.note || '').trim() } : {}) });
-        if (!targets.includes(transaction.id)) await api.updateTransaction(transaction.id, { notes: String(resolution.note || '').trim() });
+        const update = async (id, fields) => { const result = await api.updateTransaction(id, fields); if (Array.isArray(result) && !result.length) throw error('Actual could not update this transaction.'); };
+        for (const id of targets) await update(id, { category: category.id, ...(id === transaction.id ? { notes: String(resolution.note || '').trim() } : {}) });
+        if (!targets.includes(transaction.id)) await update(transaction.id, { notes: String(resolution.note || '').trim() });
         await api.sync(); lastSync = now();
         return { status: 'complete', transactionId: transaction.id };
       });

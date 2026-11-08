@@ -73,6 +73,7 @@ test('clears only imported Tuition transactions and preserves their details for 
   const api = fakeActual([
     { id: 'plaid-tuition', account: 'a1', date: '2026-11-02', amount: -2000, payee: 'p1', category: 'tuition', notes: 'keep this note', imported_id: 'plaid-tuition' },
     { id: 'manual-tuition', account: 'a1', date: '2026-11-02', amount: -3000, payee: 'p1', category: 'tuition', notes: 'do not touch' },
+    { id: 'borton-tuition', account: 'a1', date: '2026-11-02', amount: -4000, payee: 'p1', category: 'tuition', notes: 'do not touch', imported_id: 'borton-web-local-row' },
   ]);
   api.getCategories = async () => [{ id: 'c1', name: 'Groceries', hidden: false }, { id: 'tuition', name: 'Tuition', hidden: false }];
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
@@ -90,6 +91,15 @@ test('previews the Tuition correction without writing and reapplies a reviewed c
   assert.deepEqual(api.writes, []);
   assert.deepEqual(await web.applyLegacyReview({ transactionId: 'plaid-tuition', importedId: 'plaid-tuition', accountId: 'a1', categoryTargetIds: ['plaid-tuition'], resolution: { action: 'import', categoryId: 'c1', note: 'Transit' } }), { status: 'complete', transactionId: 'plaid-tuition' });
   assert.deepEqual(api.writes, [{ id: 'plaid-tuition', fields: { category: 'c1', notes: 'Transit' } }]);
+});
+
+test('leaves a legacy review open when Actual rejects its category update', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
+  const api = fakeActual([{ id: 'plaid-tuition', account: 'a1', date: '2026-11-02', amount: -2000, payee: 'p1', category: null, imported_id: 'plaid-tuition' }]);
+  api.getCategories = async () => [{ id: 'c1', name: 'Groceries', hidden: false }];
+  api.updateTransaction = async () => [];
+  const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
+  await assert.rejects(() => web.applyLegacyReview({ transactionId: 'plaid-tuition', importedId: 'plaid-tuition', accountId: 'a1', resolution: { action: 'import', categoryId: 'c1' } }), /Actual could not update this transaction/);
 });
 
 test('returns same-account review candidates even when they have an older imported id', async () => {

@@ -35,12 +35,14 @@ test('sends the owner-selected category and note only with an import decision', 
 
 test('stages cleared legacy imports for review without deleting them', async () => {
   const staged = []; const queued = [];
-  const actual = { async resetImportedTuitionCategory() { return { rows: [{ transactionId: 'actual-1', importedId: 'plaid-1', accountId: 'a1', date: '2026-11-02', amountCents: -2000, merchant: 'Metrolinx' }] }; } };
+  const calls = []; const rows = [{ transactionId: 'actual-1', importedId: 'plaid-1', accountId: 'a1', date: '2026-11-02', amountCents: -2000, merchant: 'Metrolinx' }];
+  const actual = { async resetImportedTuitionCategory(options) { calls.push(options); return { rows }; } };
   const inbox = { stageLegacyImports(rows) { staged.push(...rows); return { staged: rows.length, existing: 0 }; } };
   const reviews = createReviewService({ actual, inbox, categorySuggestions: { enqueue: (rows) => queued.push(...rows) } });
   assert.deepEqual(await reviews.resetImportedTuitionCategory(), { staged: 1, existing: 0 });
   assert.deepEqual(staged, [{ transactionId: 'actual-1', importedId: 'plaid-1', accountId: 'a1', date: '2026-11-02', amountCents: -2000, merchant: 'Metrolinx' }]);
   assert.deepEqual(queued, staged);
+  assert.deepEqual(calls, [{ dryRun: true }, { transactionIds: ['actual-1'] }]);
 });
 
 test('only counts the Tuition correction on a dry run', async () => {
