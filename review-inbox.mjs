@@ -64,6 +64,17 @@ export function createReviewInbox({ filePath, receiptDir, now = Date.now } = {})
       if (staged) save();
       return { staged, existing };
     },
+    stageHistoricalPlaid(rows = []) {
+      let staged = 0; let existing = 0;
+      for (const input of rows) {
+        if (!input?.importedId || !input.accountId || !input.transactionId || !input.date || !Number.isSafeInteger(input.amountCents) || !String(input.merchant || '').trim()) continue;
+        const id = `plaid:${input.importedId}`;
+        if (state.reviews.some((row) => row.id === id)) { existing += 1; continue; }
+        state.reviews.push({ id, source: 'plaid', status: 'completed', historical: true, importedId: input.importedId, accountId: input.accountId, account: String(input.account || ''), institution: String(input.institution || ''), date: input.date, amountCents: input.amountCents, merchant: String(input.merchant).trim(), candidates: [{ id: input.transactionId, confidence: 'exact', daysApart: 0, evidence: { sameImportId: true } }], resolution: { action: 'already_imported', transactionId: input.transactionId, status: 'complete' }, createdAt: now(), updatedAt: now(), audit: [{ at: now(), decision: { action: 'already_imported', transactionId: input.transactionId, status: 'complete' } }] }); staged += 1;
+      }
+      if (staged) save();
+      return { staged, existing };
+    },
     stageReceipt(file = {}) {
       const bytes = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || '');
       if (!bytes.length || !file.mime) throw new Error('Receipt image is required.');

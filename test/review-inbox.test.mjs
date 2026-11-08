@@ -27,6 +27,14 @@ test('stages a Plaid row once and survives an inbox reload', () => {
   assert.equal(fs.statSync(filePath).mode & 0o777, 0o600);
 });
 
+test('records verified historical imports as completed without replacing an open review', () => {
+  const directory = temp(); const inbox = createReviewInbox({ filePath: path.join(directory, 'reviews.json'), receiptDir: path.join(directory, 'receipts'), now: () => 1000 });
+  const row = { importedId: 'plaid-1', accountId: 'a1', account: 'Visa', date: '2026-10-21', amountCents: -5628, merchant: 'Uniqlo', institution: 'Wealthsimple', transactionId: 'actual-1' };
+  assert.deepEqual(inbox.stageHistoricalPlaid([row]), { staged: 1, existing: 0 });
+  assert.deepEqual(inbox.stageHistoricalPlaid([row]), { staged: 0, existing: 1 });
+  assert.deepEqual(inbox.list({ status: 'completed' }).map(({ status, historical, resolution, candidates }) => ({ status, historical, resolution, candidates })), [{ status: 'completed', historical: true, resolution: { action: 'already_imported', transactionId: 'actual-1', status: 'complete' }, candidates: [{ id: 'actual-1', confidence: 'exact', daysApart: 0, evidence: { sameImportId: true } }] }]);
+});
+
 test('keeps receipt image bytes private while making them available to the worker', () => {
   const directory = temp(); const filePath = path.join(directory, 'reviews.json');
   const inbox = createReviewInbox({ filePath, receiptDir: path.join(directory, 'receipts'), now: () => 1000 });

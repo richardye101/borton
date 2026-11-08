@@ -32,13 +32,14 @@ test('matches a receipt to the mapped account without searching unrelated accoun
 });
 
 test('keeps only verified same-account historical imports for audit staging', async () => {
-  const inbox = { list: () => [] };
+  const staged = []; const inbox = { list: () => [], stageHistoricalPlaid: (rows) => { staged.push(...rows); return { staged: rows.length, existing: 0 }; } };
   const actual = {
     importedMatches: async (rows) => rows.filter((row) => row.importedId === 'kept').map((row) => ({ ...row, transactionId: 'actual-1' })),
   };
   const reviews = createReviewService({ actual, inbox });
 
-  assert.deepEqual(await reviews.auditHistoricalImports([{ importedId: 'kept', accountId: 'a1' }, { importedId: 'other', accountId: 'a2' }]), [{ importedId: 'kept', accountId: 'a1', transactionId: 'actual-1' }]);
+  assert.deepEqual(await reviews.auditHistoricalImports([{ importedId: 'kept', accountId: 'a1' }, { importedId: 'other', accountId: 'a2' }]), { scanned: 2, matched: 1, staged: 1, existing: 0 });
+  assert.deepEqual(staged, [{ importedId: 'kept', accountId: 'a1', transactionId: 'actual-1' }]);
 });
 
 test('attaches a receipt to an approved Actual candidate without changing the transaction', async () => {

@@ -53,14 +53,17 @@ test('delegates Plaid connection actions without exposing credentials', async ()
 
 test('exposes staged reviews and receipt uploads without bypassing the review queue', async () => {
   const calls = [];
+  const plaid = { history: async () => ({ scanned: 2, rows: [{ importedId: 'one' }, { importedId: 'two' }] }) };
   const reviews = {
     list: (query) => [{ id: 'plaid:one', query }],
     resolve: async (payload) => { calls.push(['resolve', payload]); return { id: payload.id, status: 'completed' }; },
     stageReceipts: (files) => { calls.push(['receipts', files]); return [{ id: 'receipt:one' }]; },
+    auditHistoricalImports: async (rows) => { calls.push(['audit', rows]); return { matched: 1, staged: 1, existing: 0 }; },
   };
-  const app = createWebApplication({ actual: {}, extractor: {}, reviews });
+  const app = createWebApplication({ actual: {}, extractor: {}, reviews, plaid });
   assert.deepEqual(await app.reviews({ status: 'open' }), [{ id: 'plaid:one', query: { status: 'open' } }]);
   assert.deepEqual(await app.resolveReview({ id: 'plaid:one', resolution: { action: 'ignore' } }), { id: 'plaid:one', status: 'completed' });
   assert.deepEqual(await app.uploadReceipts({ files: [{ buffer: Buffer.from('image'), mime: 'image/png' }] }), { rows: [{ id: 'receipt:one' }] });
-  assert.deepEqual(calls, [['resolve', { id: 'plaid:one', resolution: { action: 'ignore' } }], ['receipts', [{ buffer: Buffer.from('image'), mime: 'image/png' }]]]);
+  assert.deepEqual(await app.auditReviewHistory(), { scanned: 2, matched: 1, staged: 1, existing: 0 });
+  assert.deepEqual(calls, [['resolve', { id: 'plaid:one', resolution: { action: 'ignore' } }], ['receipts', [{ buffer: Buffer.from('image'), mime: 'image/png' }]], ['audit', [{ importedId: 'one' }, { importedId: 'two' }]]]);
 });

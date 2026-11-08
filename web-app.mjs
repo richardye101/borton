@@ -41,6 +41,11 @@ export function createWebApplication({ actual, extractor, transcriber, cardmap =
     plaidComplete: (payload) => plaid ? plaid.complete(payload) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidMapping: (payload) => plaid ? plaid.setMappings(payload) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidSync: ({ id }) => plaid ? plaid.sync(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
+    async auditReviewHistory() {
+      if (!plaid || !reviews) throw Object.assign(new Error('Historical reviews are unavailable on this server.'), { statusCode: 503 });
+      const history = await plaid.history(); const result = await reviews.auditHistoricalImports(history.rows);
+      return { ...result, scanned: history.scanned };
+    },
     plaidReconnectToken: ({ id }) => plaid ? plaid.reconnectToken(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     plaidDisconnect: ({ id }) => plaid ? plaid.disconnect(id) : Promise.reject(Object.assign(new Error('Plaid is not configured on this server.'), { statusCode: 503 })),
     reviews: (query) => reviews ? reviews.list(query) : Promise.reject(Object.assign(new Error('Reviews are unavailable on this server.'), { statusCode: 503 })),

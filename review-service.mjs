@@ -11,7 +11,8 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
       return inbox.stagePlaid(prepared);
     },
     async auditHistoricalImports(rows = []) {
-      return actual.importedMatches(rows);
+      const matches = await actual.importedMatches(rows);
+      return { scanned: rows.length, matched: matches.length, ...inbox.stageHistoricalPlaid(matches) };
     },
     async matchReceipt({ row, receipt } = {}) {
       const accountName = cardmap.byLast4?.[receipt?.card_last4];

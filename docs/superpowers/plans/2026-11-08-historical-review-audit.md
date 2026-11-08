@@ -41,10 +41,10 @@
 - Modify: `review-inbox.mjs`, `web-app.mjs`, `web-server.mjs`
 - Test: `test/review-inbox.test.mjs`, `test/web-app.test.mjs`, `test/web-server.test.mjs`
 
-- [ ] Write failing tests for idempotent completed audit rows and the protected audit endpoint.
-- [ ] Run targeted tests and verify they fail.
-- [ ] Implement inbox persistence and `POST /api/reviews/audit-history`.
-- [ ] Run targeted tests and verify they pass.
+- [x] Write failing tests for idempotent completed audit rows and the protected audit endpoint.
+- [x] Run targeted tests and verify they fail.
+- [x] Implement inbox persistence and `POST /api/reviews/audit-history`.
+- [x] Run targeted tests and verify they pass.
 
 ### Task 3: Make historical records discoverable in Reviews
 
