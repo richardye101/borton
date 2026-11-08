@@ -25,7 +25,7 @@ test('renders compact connection mapping cards with a secondary disconnect actio
   assert.match(css, /\.connection-card header>div:last-child button:last-child\{background:transparent/);
 });
 
-test('refreshes Connections when Plaid Link exits so controls cannot remain stuck', async () => {
+test('shows Plaid Link exit errors while refreshing Connections', async () => {
   const app = await readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
-  assert.match(app, /onExit: \(\) => \{ plaidBusy = false; void loadPlaid\(\); \}/);
+  assert.match(app, /onExit: \(error, metadata\) => \{ if \(error\) plaidError = `\$\{error\.error_code \|\| 'PLAID_LINK_ERROR'\}: \$\{error\.display_message \|\| error\.error_message \|\| 'Plaid could not connect to this institution\.'\}`; plaidBusy = false; void loadPlaid\(\); \}/);
 });
