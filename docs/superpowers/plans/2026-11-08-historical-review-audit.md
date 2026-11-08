@@ -51,7 +51,7 @@
 **Files:**
 - Modify: `frontend/src/App.svelte`, `test/frontend-api.test.mjs`
 
-- [ ] Write a failing source-level test for the Completed review control and audit action.
-- [ ] Run the test and verify it fails.
-- [ ] Add a completed-view audit button with a concise result message.
-- [ ] Run `npm run build` and `npm test` and verify they pass.
+- [x] Write a failing source-level test for the Completed review control and audit action.
+- [x] Run the test and verify it fails.
+- [x] Add a completed-view audit button with a concise result message.
+- [x] Run `npm run build` and `npm test` and verify they pass.

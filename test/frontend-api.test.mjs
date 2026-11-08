@@ -33,3 +33,11 @@ test('shows an action-oriented empty state for Reviews instead of an empty table
   assert.match(app, /on:change=\{uploadReviewReceipts\}/);
   assert.match(css, /\.reviews-empty-state\{[^}]*grid-column:2/);
 });
+
+test('lets the completed Reviews view audit and display verified historical imports', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /auditHistoricalReviews/);
+  assert.match(app, /\/api\/reviews\/audit-history/);
+  assert.match(app, /Review past imports/);
+  assert.match(app, /Already imported/);
+});
