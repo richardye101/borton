@@ -45,3 +45,18 @@ test('rejects duplicate Actual mappings before syncing', async () => {
   await plaid.complete({ publicToken: 'public', metadata: { accounts: [{ id: 'p1', name: 'One', type: 'credit' }, { id: 'p2', name: 'Two', type: 'credit' }] } });
   await assert.rejects(() => plaid.setMappings({ id: 'item-1', mappings: [{ plaidAccountId: 'p1', actualAccountId: 'a1' }, { plaidAccountId: 'p2', actualAccountId: 'a1' }] }), /more than once/i);
 });
+
+test('keeps every account selected in Link for mapping', async () => {
+  const plaid = createPlaidSync({ ...config, statePath: path.join(temp(), 'plaid-items.json'), actualAccounts: async () => [], fetch: async (_url, init) => JSON.parse(init.body).public_token ? response({ access_token: 'access', item_id: 'item-1' }) : response({ link_token: 'link' }) });
+  const connection = await plaid.complete({ publicToken: 'public', metadata: { accounts: [{ id: 'checking', name: 'Chequing', type: 'depository', subtype: 'checking' }, { id: 'loc', name: 'Line of credit', type: 'loan', subtype: 'line of credit' }, { id: 'card', name: 'Card', type: 'credit', subtype: 'credit card' }] } });
+  assert.deepEqual(connection.accounts.map((account) => account.id), ['checking', 'loc', 'card']);
+});
+
+test('reconnect Link lets the owner revise selected accounts', async () => {
+  const calls = []; const plaid = createPlaidSync({ ...config, statePath: path.join(temp(), 'plaid-items.json'), actualAccounts: async () => [], fetch: async (url, init) => { calls.push({ url, body: JSON.parse(init.body) }); return init && JSON.parse(init.body).public_token ? response({ access_token: 'access', item_id: 'item-1' }) : response({ link_token: 'link' }); } });
+  await plaid.complete({ publicToken: 'public', metadata: { accounts: [{ id: 'old', name: 'Card', type: 'credit' }] } });
+  await plaid.reconnectToken('item-1');
+  assert.deepEqual(calls.at(-1).body.update, { account_selection_enabled: true });
+  const updated = await plaid.complete({ connectionId: 'item-1', metadata: { accounts: [{ id: 'deposit', name: 'Chequing', type: 'depository' }] } });
+  assert.deepEqual(updated.accounts.map((account) => account.id), ['deposit']);
+});

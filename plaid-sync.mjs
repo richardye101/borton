@@ -35,15 +35,19 @@ export function createPlaidSync({ clientId = '', secret = '', env = '', tokenKey
     async connections() { return { configured, connections: configured ? load().items.map(publicItem) : [], actualAccounts: configured ? await actualAccounts() : [] }; },
     async linkToken({ connectionId = '' } = {}) {
       const access = connectionId ? decrypt(find(connectionId).item.accessToken) : '';
-      const result = await call('/link/token/create', { client_name: 'Borton', language: 'en', country_codes: ['CA'], products: ['transactions'], user: { client_user_id: 'borton-owner' }, ...(access ? { access_token: access } : {}) });
+      const result = await call('/link/token/create', { client_name: 'Borton', language: 'en', country_codes: ['CA'], products: ['transactions'], user: { client_user_id: 'borton-owner' }, ...(access ? { access_token: access, update: { account_selection_enabled: true } } : {}) });
       return { linkToken: result.link_token };
     },
     async complete({ publicToken, metadata = {}, connectionId = '' } = {}) {
-      requireConfigured(); if (!publicToken || typeof publicToken !== 'string') throw error('Plaid did not return a Link token.');
-      if (connectionId) { const { state, item } = find(connectionId); item.status = 'ready'; item.lastError = ''; save(state); return publicItem(item); }
+      requireConfigured(); if (!connectionId && (!publicToken || typeof publicToken !== 'string')) throw error('Plaid did not return a Link token.');
+      if (connectionId) {
+        const { state, item } = find(connectionId); const mappings = new Map(item.accounts.map((account) => [account.id, account.actualAccountId]));
+        item.accounts = (metadata.accounts || []).map((account) => ({ id: account.id, name: account.name || account.official_name || 'Account', mask: account.mask || '', type: account.type || '', actualAccountId: mappings.get(account.id) || '' }));
+        item.status = item.accounts.some((account) => account.actualAccountId) ? 'ready' : 'needs_mapping'; item.lastError = ''; save(state); return publicItem(item);
+      }
       const result = await call('/item/public_token/exchange', { public_token: publicToken }); const state = load();
-      const item = { id: result.item_id, accessToken: encrypt(result.access_token), institution: metadata.institution?.name || 'Connected bank', status: 'needs_mapping', lastSyncedAt: null, lastError: '', removedCount: 0, cursor: '', accounts: (metadata.accounts || []).filter((account) => ['checking', 'savings', 'credit'].includes(account.type)).map((account) => ({ id: account.id, name: account.name || account.official_name || 'Account', mask: account.mask || '', type: account.type, actualAccountId: '' })) };
-      if (!item.accounts.length) throw error('Choose at least one checking, savings, or credit account in Plaid Link.');
+      const item = { id: result.item_id, accessToken: encrypt(result.access_token), institution: metadata.institution?.name || 'Connected bank', status: 'needs_mapping', lastSyncedAt: null, lastError: '', removedCount: 0, cursor: '', accounts: (metadata.accounts || []).map((account) => ({ id: account.id, name: account.name || account.official_name || 'Account', mask: account.mask || '', type: account.type || '', actualAccountId: '' })) };
+      if (!item.accounts.length) throw error('Choose at least one account in Plaid Link.');
       state.items.push(item); save(state); return publicItem(item);
     },
     async setMappings({ id, mappings = [] } = {}) {
