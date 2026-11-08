@@ -21,6 +21,18 @@ test('stages Plaid imports with candidate evidence and applies explicit decision
   assert.deepEqual(resolved, [{ id: 'plaid:new', resolution: { action: 'merge', transactionId: 'actual-1', status: 'complete' } }]);
 });
 
+test('sends the owner-selected category and note only with an import decision', async () => {
+  const writes = [];
+  const actual = { async applyReview(row) { writes.push(row); return { status: 'complete', transactionId: 'actual-1' }; } };
+  const inbox = {
+    list: () => [{ id: 'plaid:new', source: 'plaid', importedId: 'new', accountId: 'a1', date: '2026-10-23', amountCents: -5628, merchant: 'Uniqlo' }],
+    resolve: (id, resolution) => ({ id, resolution }),
+  };
+  const reviews = createReviewService({ actual, inbox });
+  await reviews.resolve({ id: 'plaid:new', resolution: { action: 'import', categoryId: 'food', note: 'Dinner with Tia' } });
+  assert.deepEqual(writes[0].resolution, { action: 'import', categoryId: 'food', note: 'Dinner with Tia' });
+});
+
 test('matches a receipt to the mapped account without searching unrelated accounts', async () => {
   const actual = {
     async bootstrap() { return { accounts: [{ id: 'a1', name: 'Visa' }, { id: 'a2', name: 'Other card' }] }; },

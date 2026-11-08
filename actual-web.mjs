@@ -231,7 +231,7 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
         if (!['merge', 'import', 'ignore'].includes(action) || typeof review.importedId !== 'string' || !review.importedId) throw error('Choose a valid review decision.');
         if (action === 'ignore') return { status: 'complete', transactionId: null };
         await sync();
-        const { accounts, payeeRows } = await maps();
+        const { accounts, categories, payeeRows } = await maps();
         const account = accounts.get(review.accountId);
         if (!account || account.closed) throw error('Choose a valid account.');
         if (action === 'merge') {
@@ -243,9 +243,11 @@ export function createActualWeb({ api, dataDir, lockPath = path.join(dataDir, 'a
           return { status: 'complete', transactionId: found.id };
         }
         if (!isValidExpenseDate(review.date) || !Number.isSafeInteger(review.amountCents) || !String(review.merchant || '').trim()) throw error('Review transaction details are invalid.');
+        const category = categories.get(String(resolution.categoryId || ''));
+        if (!category || category.hidden || category.is_income) throw error('Choose a valid expense category.');
         const name = String(review.merchant).trim(); let payee = payeeRows.find((row) => row.name.toLowerCase() === name.toLowerCase());
         if (!payee) payee = { id: await api.createPayee({ name }), name };
-        await api.addTransactions(account.id, [{ account: account.id, date: review.date, amount: review.amountCents, payee: payee.id, cleared: true, imported_id: review.importedId }], { runTransfers: true });
+        await api.addTransactions(account.id, [{ account: account.id, date: review.date, amount: review.amountCents, payee: payee.id, category: category.id, notes: String(resolution.note || '').trim(), cleared: true, imported_id: review.importedId }], { runTransfers: true });
         await api.sync(); lastSync = now();
         const created = (await api.getTransactions(account.id, review.date, review.date)).find((row) => row.imported_id === review.importedId);
         return { status: 'complete', transactionId: created?.id || null };

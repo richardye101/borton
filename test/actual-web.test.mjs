@@ -59,10 +59,10 @@ test('applies reviewed merges, imports, and ignores explicitly', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'borton-actual-web-'));
   const api = fakeActual([{ id: 'existing', account: 'a1', date: '2026-10-21', amount: -5628, payee: 'p1', category: 'c1', notes: 'keep me', imported_id: 'old-source' }]);
   const web = createActualWeb({ api, dataDir: dir, now: () => Date.parse('2026-11-07T12:00:00Z') });
-  assert.deepEqual(await web.applyReview({ importedId: 'plaid-match', accountId: 'a1', date: '2026-10-21', amountCents: -5628, merchant: 'Uniqlo', resolution: { action: 'merge', transactionId: 'existing' } }), { status: 'complete', transactionId: 'existing' });
+  assert.deepEqual(await web.applyReview({ importedId: 'plaid-match', accountId: 'a1', date: '2026-10-21', amountCents: -5628, merchant: 'Uniqlo', resolution: { action: 'merge', transactionId: 'existing', categoryId: 'c1', note: 'Do not overwrite.' } }), { status: 'complete', transactionId: 'existing' });
   assert.deepEqual(api.writes.at(-1), { id: 'existing', fields: { imported_id: 'plaid-match', cleared: true } });
-  assert.deepEqual(await web.applyReview({ importedId: 'plaid-new', accountId: 'a1', date: '2026-10-22', amountCents: -200, merchant: 'New shop', resolution: { action: 'import' } }), { status: 'complete', transactionId: 'created-2-0' });
-  assert.deepEqual(api.writes.at(-1), { account: 'a1', rows: [{ account: 'a1', date: '2026-10-22', amount: -200, payee: 'p3', cleared: true, imported_id: 'plaid-new' }] });
+  assert.deepEqual(await web.applyReview({ importedId: 'plaid-new', accountId: 'a1', date: '2026-10-22', amountCents: -200, merchant: 'New shop', resolution: { action: 'import', categoryId: 'c1', note: 'Dinner with Tia' } }), { status: 'complete', transactionId: 'created-2-0' });
+  assert.deepEqual(api.writes.at(-1), { account: 'a1', rows: [{ account: 'a1', date: '2026-10-22', amount: -200, payee: 'p3', category: 'c1', notes: 'Dinner with Tia', cleared: true, imported_id: 'plaid-new' }] });
   const writes = api.writes.length;
   assert.deepEqual(await web.applyReview({ importedId: 'plaid-ignore', accountId: 'a1', resolution: { action: 'ignore' } }), { status: 'complete', transactionId: null });
   assert.equal(api.writes.length, writes);
