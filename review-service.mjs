@@ -1,6 +1,6 @@
 import { rankReviewCandidates } from './review-inbox.mjs';
 
-export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} } = {}) {
+export function createReviewService({ actual, inbox, receiptQueue, categorySuggestions, cardmap = {} } = {}) {
   if (!actual || !inbox) throw new Error('actual and inbox are required.');
   const find = (id) => inbox.list({ status: 'all' }).find((row) => row.id === id);
   return {
@@ -8,7 +8,9 @@ export function createReviewService({ actual, inbox, receiptQueue, cardmap = {} 
     async stagePlaid(rows = []) {
       const prepared = [];
       for (const row of rows) prepared.push({ ...row, candidates: rankReviewCandidates(row, await actual.reviewCandidates(row)) });
-      return inbox.stagePlaid(prepared);
+      const result = inbox.stagePlaid(prepared);
+      if (result.staged) categorySuggestions?.enqueue(prepared);
+      return result;
     },
     async auditHistoricalImports(rows = []) {
       const matches = [];

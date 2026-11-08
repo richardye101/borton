@@ -88,3 +88,17 @@ test('keeps the Reviews table and empty state reactive to loaded rows', async ()
   assert.match(app, /#each displayedReviews as row/);
   assert.match(app, /displayedReviews\.length === 0/);
 });
+
+test('shows a staged AI suggestion and lets the owner choose category and note before import', async () => {
+  const app = await fs.readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /Suggested category/);
+  assert.match(app, /Import with changes/);
+  assert.match(app, /categoryId: category\.id/);
+  assert.match(app, /reviewDraft\.note/);
+});
+
+test('wires a category suggestion queue without directly importing Plaid transactions', async () => {
+  const runtime = await fs.readFile(new URL('../web.mjs', import.meta.url), 'utf8');
+  assert.match(runtime, /createCategorySuggestionQueue/);
+  assert.match(runtime, /importTransactions: \(rows\) => reviews\.stagePlaid\(rows\)/);
+});

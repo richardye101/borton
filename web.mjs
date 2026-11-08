@@ -14,6 +14,7 @@ import { createWebServer } from './web-server.mjs';
 import { createPlaidSync } from './plaid-sync.mjs';
 import { createReviewInbox } from './review-inbox.mjs';
 import { createReceiptReviewQueue } from './receipt-review-queue.mjs';
+import { createCategorySuggestionQueue } from './category-suggestion-queue.mjs';
 import { createReviewService } from './review-service.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -65,7 +66,12 @@ const receiptExtractor = createReceiptExtractor({ generate, maxBytes: web.maxUpl
 const inbox = createReviewInbox({ filePath: path.join(dataDir, 'reviews.json'), receiptDir: path.join(dataDir, 'review-receipts') });
 let reviews;
 const receiptQueue = createReceiptReviewQueue({ inbox, extractor: receiptExtractor, matchReceipt: (input) => reviews.matchReceipt(input) });
-reviews = createReviewService({ actual, inbox, receiptQueue, cardmap });
+const categorySuggestions = createCategorySuggestionQueue({
+  inbox,
+  categories: async () => (await actual.bootstrap()).categories,
+  suggest: (input) => generate([{ text: `Choose the single best category from the allowed list for this imported transaction. Use only an exact allowed category name. Return a short reason.\n${JSON.stringify(input)}` }], { type: 'OBJECT', properties: { category: { type: 'STRING' }, confidence: { type: 'STRING' }, reason: { type: 'STRING' } }, required: ['category', 'confidence', 'reason'] }),
+});
+reviews = createReviewService({ actual, inbox, receiptQueue, categorySuggestions, cardmap });
 const plaid = createPlaidSync({ clientId: process.env.PLAID_CLIENT_ID, secret: process.env.PLAID_SECRET, env: process.env.PLAID_ENV, tokenKey: process.env.PLAID_TOKEN_KEY, statePath: path.join(dataDir, 'plaid-items.json'), actualAccounts: async () => (await actual.bootstrap()).accounts, importTransactions: (rows) => reviews.stagePlaid(rows) });
 const assistant = createWebAgent({ api: actualApi, generate: chatGenerate, statePath: path.join(dataDir, 'web-agent-state.json'), currency: cfg.defaults?.currency || 'CAD', timezone: cfg.agent?.timezone || 'America/Toronto', lock: actual.runExclusive });
 const assistantQueue = createWebMessageQueue({ assistant, filePath: path.join(dataDir, 'web-message-queue.json') });
@@ -83,6 +89,7 @@ const shutdown = () => {
   clearInterval(plaidTimer);
   clearInterval(receiptCleanupTimer);
   receiptQueue.close();
+  categorySuggestions.close();
   assistantQueue.close();
   server.shutdown(() => actual.close().finally(() => process.exit(0)));
 };
