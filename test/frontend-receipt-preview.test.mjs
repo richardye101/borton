@@ -29,3 +29,13 @@ test('shows Plaid Link exit errors while refreshing Connections', async () => {
   const app = await readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
   assert.match(app, /onExit: \(error, metadata\) => \{ if \(error\) plaidError = `\$\{error\.error_code \|\| 'PLAID_LINK_ERROR'\}: \$\{error\.display_message \|\| error\.error_message \|\| 'Plaid could not connect to this institution\.'\}`; plaidBusy = false; void loadPlaid\(\); \}/);
 });
+
+test('tracks the connection currently syncing without using the Link busy state', async () => {
+  const app = await readFile(new URL('../frontend/src/App.svelte', import.meta.url), 'utf8');
+  assert.match(app, /let plaidSyncing = new Set\(\);/);
+  assert.match(app, /if \(isPlaidSyncing\(connection\.id\)\) return;/);
+  assert.match(app, /plaidSyncing = new Set\(plaidSyncing\)\.add\(connection\.id\);/);
+  assert.doesNotMatch(app, /async function syncPlaid\(connection\) \{ try \{ plaidBusy/);
+  assert.match(app, /disabled=\{isPlaidSyncing\(connection\.id\) \|\| !connection\.accounts\.some\(\(account\) => account\.actualAccountId\)\}/);
+  assert.match(app, /on:click=\{\(\) => savePlaidMapping\(connection\)\} disabled=\{isPlaidSyncing\(connection\.id\)\}/);
+});
